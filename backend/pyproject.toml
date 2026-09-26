@@ -1,0 +1,27 @@
+[project]
+name = "stock_flow_backend"
+version = "1.0.0"
+description = "Comprehensive B2B order management platform designed specifically for apparel and textile businesses"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "celery>=5.6.3",
+    "django~=5.2.14",
+    "django-cors-headers~=4.9.0",
+    "django-extensions~=4.1",
+    "django-rest-passwordreset~=1.5.0",
+    "djangorestframework~=3.16.1",
+    "djangorestframework-simplejwt~=5.5.1",
+    "drf-spectacular~=0.29.0",
+    "gunicorn~=23.0.0",
+    "kombu>=5.6.2",
+    "cryptography>=48.0.0",
+    "firebase-admin>=6.6.0",
+    "pillow~=12.2.0",
+    "psycopg2-binary~=2.9.11",
+    "pyjwt~=2.10.1",
+    "python-decouple~=3.8",
+    "pywebpush>=2.3.0",
+    "redis>=7.4.0",
+    "whitenoise~=6.8.2",
+]

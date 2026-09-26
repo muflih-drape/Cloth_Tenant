@@ -1,0 +1,3 @@
+"use client";
+
+export { default } from "@/app/(agent-order)/agent/order/new/[id]/[qr]/page";

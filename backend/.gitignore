@@ -1,0 +1,45 @@
+# Django
+db.sqlite3
+media/
+local_settings.py
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+build/
+develop-eggs/
+dist/
+.env
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+.venv/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+# IDE/Editor Config
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Specific
+.DS_Store
+Thumbs.db
+
+.env.prod
+
+.env.dev
+
+# Firebase service-account (secret — never commit)
+firebase-service-account.json
