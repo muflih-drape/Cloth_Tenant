@@ -154,7 +154,7 @@ CELERY_BEAT_SCHEDULE = {
         "schedule": crontab(hour=0, minute=0),
     },
     "purge-archived-items-daily": {
-        "task": "apps.items.tasks.purge_archived_items_task",
+        "task": "apps.items.tasks.purge_archived_fabrics_task",
         "schedule": crontab(hour=1, minute=0),
     },
 }
@@ -280,27 +280,31 @@ GST_RATE = config("GST_RATE", default=5, cast=float)
 # Admin-created draft orders expire after this many hours.
 ADMIN_DRAFT_EXPIRY_HOURS = config("ADMIN_DRAFT_EXPIRY_HOURS", default=24, cast=int)
 
-# Items are considered "archived" once they have been out of stock for this
-# many days (matches the /api/items/archived/ cutoff).
+# Fabrics are considered "archived" once every variant has been out of stock
+# for this many days (matches the /api/items/archived/ cutoff).
 ARCHIVE_AFTER_DAYS = config("ARCHIVE_AFTER_DAYS", default=30, cast=int)
 
-# Archived items are permanently (soft) deleted once they have been archived
-# for this many more days. Total: ARCHIVE_AFTER_DAYS + ARCHIVED_ITEM_RETENTION_DAYS.
-ARCHIVED_ITEM_RETENTION_DAYS = config(
-    "ARCHIVED_ITEM_RETENTION_DAYS", default=30, cast=int
+# Archived fabrics are permanently (soft) deleted once they have been archived
+# for this many more days. Total: ARCHIVE_AFTER_DAYS + ARCHIVED_FABRIC_RETENTION_DAYS.
+ARCHIVED_FABRIC_RETENTION_DAYS = config(
+    "ARCHIVED_FABRIC_RETENTION_DAYS", default=30, cast=int
 )
 
-# Master switch for the scheduled archived-item purge.
-ARCHIVED_ITEM_PURGE_ENABLED = config(
-    "ARCHIVED_ITEM_PURGE_ENABLED", default=True, cast=bool
+# Master switch for the scheduled archived-fabric purge.
+ARCHIVED_FABRIC_PURGE_ENABLED = config(
+    "ARCHIVED_FABRIC_PURGE_ENABLED", default=True, cast=bool
 )
 
-# How many archived items to process per purge run.
-ARCHIVED_ITEM_PURGE_BATCH = config("ARCHIVED_ITEM_PURGE_BATCH", default=500, cast=int)
+# How many archived fabrics to process per purge run.
+ARCHIVED_FABRIC_PURGE_BATCH = config(
+    "ARCHIVED_FABRIC_PURGE_BATCH", default=500, cast=int
+)
 
-# Incremental item sync for the mobile Inventory screen.
-ITEM_SYNC_MAX_AGE_DAYS = config("ITEM_SYNC_MAX_AGE_DAYS", default=14, cast=int)
-ITEM_SYNC_MAX_DELTA_ITEMS = config("ITEM_SYNC_MAX_DELTA_ITEMS", default=500, cast=int)
+# Incremental fabric sync for the mobile Inventory screen.
+FABRIC_SYNC_MAX_AGE_DAYS = config("FABRIC_SYNC_MAX_AGE_DAYS", default=14, cast=int)
+FABRIC_SYNC_MAX_DELTA_FABRICS = config(
+    "FABRIC_SYNC_MAX_DELTA_FABRICS", default=500, cast=int
+)
 
 TIME_ZONE = "Asia/Kolkata"
 LOGGING = {

@@ -1,159 +1,17 @@
 "use client";
 
-import React, { useState, useCallback, useMemo } from "react";
+import React, { useCallback, useMemo, useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
-import { itemApi } from "@/lib/api/item";
-import { UIItem } from "@/types/item";
-import { ItemStockEntry } from "@/types/item";
+import { fabricApi } from "@/lib/api/item";
+import { formatMeters } from "@/types/item";
+import {
+  computeInventorySummary,
+  matchesStockFilter,
+  type StockFilter,
+  type FabricSummaryRow,
+} from "@/lib/utils/inventorySummary";
 import { ArrowBigLeft } from "lucide-react";
-
-export const SIZE_RANGE_PIECE_COUNT: Record<string, number> = {
-  "20-38": 10,
-  "20-36": 9,
-  "26-38": 7,
-  "20-30": 6,
-  "26-36": 6,
-  "32-38": 4,
-  "32-36": 3,
-  "S,M,L,XL,XXL": 5,
-  "S,M,L,XL": 4,
-  "M,L,XL,XXL": 4,
-  "M,L,XL": 3,
-};
-
-const SINGLE_SIZE_PIECE_COUNT: Record<string, number> = {
-  S: 1,
-  M: 1,
-  L: 1,
-  XL: 1,
-  XXL: 1,
-  "38": 1,
-  "32-36": 3,
-  "26-30": 3,
-  "20-24": 3,
-};
-
-function getPieceCount(sizeRange: string): number {
-  if (SIZE_RANGE_PIECE_COUNT[sizeRange] !== undefined) {
-    return SIZE_RANGE_PIECE_COUNT[sizeRange];
-  }
-  if (SINGLE_SIZE_PIECE_COUNT[sizeRange] !== undefined) {
-    return SINGLE_SIZE_PIECE_COUNT[sizeRange];
-  }
-  return sizeRange.split(",").length;
-}
-
-interface ItemSummary {
-  id: number;
-  name: string;
-  type: string;
-  price: string;
-  variantCount: number;
-  totalStock: number;
-  totalUnits: number;
-  totalPrice: number; // totalUnits × price
-}
-
-interface ComputedSummary {
-  totalStock: number;
-  totalUnits: number;
-  totalPrice: number;
-  gentsStock: number;
-  gentsUnits: number;
-  gentsPrice: number;
-  kidsStock: number;
-  kidsUnits: number;
-  kidsPrice: number;
-  itemSummaries: ItemSummary[];
-}
-
-function normalizeAdminItem(item: ItemStockEntry): UIItem {
-  return {
-    id: item.id,
-    name: item.name,
-    type: item.type,
-    price: item.price,
-    variants: item.variants.map((v) => ({
-      id: v.id,
-      image: v.image,
-      qr_code: v.qr_code,
-      sizes: v.sizes,
-    })),
-  };
-}
-
-// Only the part before a "-" is used for sorting purposes.
-// e.g. "1040-02" sorts as "1040".
-function getSortName(name: string): string {
-  return name.split("-")[0];
-}
-
-function computeSummary(items: UIItem[]): ComputedSummary {
-  let totalStock = 0;
-  let totalUnits = 0;
-  let totalPrice = 0;
-  let gentsStock = 0;
-  let gentsUnits = 0;
-  let gentsPrice = 0;
-  let kidsStock = 0;
-  let kidsUnits = 0;
-  let kidsPrice = 0;
-
-  const itemSummaries: ItemSummary[] = items.map((item) => {
-    let itemStock = 0;
-    let itemUnits = 0;
-    const unitPrice = parseFloat(item.price);
-
-    for (const variant of item.variants) {
-      for (const sizeEntry of variant.sizes) {
-        const pieces = getPieceCount(sizeEntry.size_range);
-        itemStock += sizeEntry.stock;
-        itemUnits += sizeEntry.stock * pieces;
-      }
-    }
-
-    const itemPrice = itemUnits * unitPrice;
-
-    totalStock += itemStock;
-    totalUnits += itemUnits;
-    totalPrice += itemPrice;
-
-    if (item.type === "gents") {
-      gentsStock += itemStock;
-      gentsUnits += itemUnits;
-      gentsPrice += itemPrice;
-    } else if (item.type === "kids") {
-      kidsStock += itemStock;
-      kidsUnits += itemUnits;
-      kidsPrice += itemPrice;
-    }
-
-    return {
-      id: item.id,
-      name: item.name,
-      type: item.type,
-      price: item.price,
-      variantCount: item.variants.length,
-      totalStock: itemStock,
-      totalUnits: itemUnits,
-      totalPrice: itemPrice,
-    };
-  });
-
-  return {
-    totalStock,
-    totalUnits,
-    totalPrice,
-    gentsStock,
-    gentsUnits,
-    gentsPrice,
-    kidsStock,
-    kidsUnits,
-    kidsPrice,
-    itemSummaries,
-  };
-}
 
 function formatCurrency(value: number): string {
   return new Intl.NumberFormat("en-IN", {
@@ -165,17 +23,15 @@ function formatCurrency(value: number): string {
 
 function StatCard({
   label,
-  stock,
-  units,
-  price,
+  meters,
+  value,
+  detail,
 }: {
   label: string;
-  stock: number;
-  units: number;
-  price: number;
+  meters: number;
+  value: number;
+  detail?: string;
 }) {
-  const avg = stock > 0 ? (units / stock).toFixed(1) : "0";
-
   return (
     <div className="rounded-2xl border border-gray-100 bg-white p-6 shadow-sm">
       <p className="mb-4 text-xs font-semibold uppercase tracking-widest text-gray-400">
@@ -184,70 +40,53 @@ function StatCard({
       <div className="flex items-end justify-between gap-4">
         <div>
           <p className="text-4xl font-bold tabular-nums text-gray-900">
-            {stock.toLocaleString()}
+            {formatMeters(meters)}
           </p>
-          <p className="mt-1 text-sm text-gray-500">stock sets</p>
+          <p className="mt-1 text-sm text-gray-500">metres in stock</p>
         </div>
         <div className="text-right">
           <p className="text-3xl font-bold tabular-nums text-gray-900">
-            {units.toLocaleString()}
+            {formatCurrency(value)}
           </p>
-          <p className="mt-1 text-sm text-gray-500">total units</p>
+          <p className="mt-1 text-sm text-gray-500">stock value</p>
         </div>
       </div>
-      {/* Total Price row */}
-      <div className="mt-4 rounded-lg bg-gray-50 px-3 py-2 flex items-center justify-between">
-        <span className="text-xs text-gray-400 font-medium">Total Value</span>
-        <span className="text-sm font-bold tabular-nums text-gray-800">
-          {formatCurrency(price)}
-        </span>
-      </div>
-      <div className="mt-3 flex items-center gap-2">
-        <div className="h-1.5 flex-1 rounded-full bg-gray-100">
-          <div
-            className="h-1.5 rounded-full bg-black"
-            style={{
-              width: `${Math.min(100, parseFloat(avg) * 10)}%`,
-              opacity: 0.35,
-            }}
-          />
-        </div>
-        <span className="text-xs tabular-nums text-gray-400">
-          ×{avg} avg pcs/set
-        </span>
-      </div>
+      {detail && <p className="mt-4 text-xs text-gray-400">{detail}</p>}
     </div>
   );
 }
 
-type SortKey = "name" | "type" | "totalUnits" | "totalPrice";
-type TypeFilter = "all" | "gents" | "kids";
+type SortKey = "name" | "totalStock" | "totalValue";
 
-function SortIcon({ active, asc }: { active: boolean; asc: boolean }) {
-  return (
-    <span className={`ml-1 ${active ? "opacity-70" : "opacity-20"}`}>
-      {active ? (asc ? "" : "") : ""}
-    </span>
-  );
+const FILTERS: { key: StockFilter; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "inStock", label: "In stock" },
+  { key: "low", label: "Low" },
+  { key: "out", label: "Sold out" },
+];
+
+function SortIcon({ active }: { active: boolean }) {
+  return <span className={`ml-1 ${active ? "opacity-70" : "opacity-20"}`}>↕</span>;
 }
 
 const Summary: React.FC = () => {
-  const { isAuthenticated, business } = useAuth();
+  const { isAuthenticated } = useAuth();
   const router = useRouter();
 
-  const [data, setData] = useState<UIItem[]>([]);
+  const [data, setData] = useState<Awaited<
+    ReturnType<typeof fabricApi.getStockList>
+  >>([]);
   const [loading, setLoading] = useState(true);
 
   const [sortKey, setSortKey] = useState<SortKey>("name");
   const [sortAsc, setSortAsc] = useState(false);
-  const [typeFilter, setTypeFilter] = useState<TypeFilter>("all");
+  const [stockFilter, setStockFilter] = useState<StockFilter>("all");
 
   const fetchData = useCallback(async () => {
     try {
-      const result = await itemApi.getStockList();
-      setData(result.map(normalizeAdminItem));
+      setData(await fabricApi.getStockList());
     } catch (e) {
-      console.error("Error fetching items:", e);
+      console.error("Error fetching fabrics:", e);
     } finally {
       setLoading(false);
     }
@@ -261,39 +100,28 @@ const Summary: React.FC = () => {
     fetchData();
   }, [isAuthenticated, router, fetchData]);
 
-  const summary = useMemo(() => computeSummary(data), [data]);
+  const summary = useMemo(() => computeInventorySummary(data), [data]);
 
   const sortedItems = useMemo(() => {
-    const filtered = (
-      typeFilter === "all"
-        ? summary.itemSummaries
-        : summary.itemSummaries.filter((i) => i.type === typeFilter)
-    ).filter((i) => i.totalStock !== 0); // hide items with zero stock sets
+    const filtered = summary.fabricSummaries.filter((row) =>
+      matchesStockFilter(row, stockFilter),
+    );
 
-    return [...filtered].sort((a, b) => {
+    return [...filtered].sort((a: FabricSummaryRow, b: FabricSummaryRow) => {
       if (sortKey === "name") {
-        const an = getSortName(a.name);
-        const bn = getSortName(b.name);
-        const cmp = an.localeCompare(bn, undefined, { numeric: true });
+        const cmp = a.name.localeCompare(b.name, undefined, { numeric: true });
         return sortAsc ? cmp : -cmp;
       }
-
       const av = a[sortKey];
       const bv = b[sortKey];
-      if (typeof av === "string" && typeof bv === "string") {
-        return sortAsc ? av.localeCompare(bv) : bv.localeCompare(av);
-      }
-      return sortAsc
-        ? (av as number) - (bv as number)
-        : (bv as number) - (av as number);
+      return sortAsc ? av - bv : bv - av;
     });
-  }, [summary, sortKey, sortAsc, typeFilter]);
+  }, [summary, sortKey, sortAsc, stockFilter]);
 
   const filteredTotals = useMemo(
     () => ({
       stock: sortedItems.reduce((s, i) => s + i.totalStock, 0),
-      units: sortedItems.reduce((s, i) => s + i.totalUnits, 0),
-      price: sortedItems.reduce((s, i) => s + i.totalPrice, 0),
+      value: sortedItems.reduce((s, i) => s + i.totalValue, 0),
     }),
     [sortedItems],
   );
@@ -303,19 +131,6 @@ const Summary: React.FC = () => {
     else {
       setSortKey(key);
       setSortAsc(false);
-    }
-  };
-
-  // Dedicated toggle for the "Total Pieces: Low → High" filter button
-  const isUnitsAscActive = sortKey === "totalUnits" && sortAsc;
-  const toggleUnitsAscFilter = () => {
-    if (isUnitsAscActive) {
-      // turn it off, go back to default name sort
-      setSortKey("name");
-      setSortAsc(false);
-    } else {
-      setSortKey("totalUnits");
-      setSortAsc(true);
     }
   };
 
@@ -342,69 +157,57 @@ const Summary: React.FC = () => {
           <h1 className="mt-1 text-2xl font-bold text-black">
             Inventory Summary
           </h1>
+          <p className="mt-2 text-sm text-gray-500">
+            Physical metres on the rolls, valued at each fabric&apos;s rate per
+            metre.
+          </p>
         </div>
 
         {/* Stat Cards */}
         <div className="mb-8 grid gap-4 sm:grid-cols-3">
-          {business != "kids" && business != "gents" && (
-            <StatCard
-              label="All Items"
-              stock={summary.totalStock}
-              units={summary.totalUnits}
-              price={summary.totalPrice}
-            />
-          )}
-          {business != "kids" && (
-            <StatCard
-              label="Gents"
-              stock={summary.gentsStock}
-              units={summary.gentsUnits}
-              price={summary.gentsPrice}
-            />
-          )}
-          {business != "gents" && (
-            <StatCard
-              label="Kids"
-              stock={summary.kidsStock}
-              units={summary.kidsUnits}
-              price={summary.kidsPrice}
-            />
-          )}
+          <StatCard
+            label="All Fabrics"
+            meters={summary.totalStock}
+            value={summary.totalValue}
+            detail={`${summary.fabricCount} fabrics tracked`}
+          />
+          <StatCard
+            label="Needs Restock"
+            meters={summary.fabricSummaries
+              .filter((r) => r.lowStockVariants > 0)
+              .reduce((s, r) => s + r.totalStock, 0)}
+            value={summary.fabricSummaries
+              .filter((r) => r.lowStockVariants > 0)
+              .reduce((s, r) => s + r.totalValue, 0)}
+            detail={`${summary.lowStockCount} fabrics with a low colour`}
+          />
+          <StatCard
+            label="Sold Out"
+            meters={0}
+            value={0}
+            detail={`${summary.outOfStockCount} fabrics with no stock left`}
+          />
         </div>
 
         {/* Table Controls */}
         <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
           <h2 className="text-sm font-semibold uppercase tracking-widest text-gray-500">
-            Per-Item Breakdown
+            Per-Fabric Breakdown
           </h2>
           <div className="flex flex-wrap gap-2">
-            {/* Total pieces ascending filter button */}
-            <button
-              onClick={toggleUnitsAscFilter}
-              className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
-                isUnitsAscActive
-                  ? "bg-black text-white"
-                  : "border border-gray-200 bg-white text-gray-500 hover:bg-gray-100"
-              }`}
-            >
-              Total Pieces: Low → High
-            </button>
-
-            {business != "kids" &&
-              business != "gents" &&
-              (["all", "gents", "kids"] as const).map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setTypeFilter(t)}
-                  className={`rounded-full px-3 py-1 text-xs font-semibold capitalize transition-colors ${
-                    typeFilter === t
-                      ? "bg-black text-white"
-                      : "border border-gray-200 bg-white text-gray-500 hover:bg-gray-100"
-                  }`}
-                >
-                  {t}
-                </button>
-              ))}
+            {FILTERS.map((f) => (
+              <button
+                key={f.key}
+                onClick={() => setStockFilter(f.key)}
+                className={`rounded-full px-3 py-1 text-xs font-semibold transition-colors ${
+                  stockFilter === f.key
+                    ? "bg-black text-white"
+                    : "border border-gray-200 bg-white text-gray-500 hover:bg-gray-100"
+                }`}
+              >
+                {f.label}
+              </button>
+            ))}
           </div>
         </div>
 
@@ -418,38 +221,31 @@ const Summary: React.FC = () => {
                     className="cursor-pointer px-5 py-3 hover:text-gray-700"
                     onClick={() => handleSort("name")}
                   >
-                    Item <SortIcon active={sortKey === "name"} asc={sortAsc} />
+                    Fabric <SortIcon active={sortKey === "name"} />
                   </th>
-                  <th
-                    className="cursor-pointer px-5 py-3 hover:text-gray-700"
-                    onClick={() => handleSort("type")}
-                  >
-                    Type <SortIcon active={sortKey === "type"} asc={sortAsc} />
-                  </th>
+                  <th className="px-5 py-3 text-right">Rate</th>
                   <th
                     className="cursor-pointer px-5 py-3 text-right hover:text-gray-700"
-                    onClick={() => handleSort("totalUnits")}
+                    onClick={() => handleSort("totalStock")}
                   >
-                    Total Pieces{" "}
-                    <SortIcon active={sortKey === "totalUnits"} asc={sortAsc} />
+                    Metres{" "}
+                    <SortIcon active={sortKey === "totalStock"} />
                   </th>
-                  <th className="px-5 py-3 text-center">Variants</th>
+                  <th className="px-5 py-3 text-center">Colours</th>
                   <th
                     className="cursor-pointer px-5 py-3 text-right hover:text-gray-700"
-                    onClick={() => handleSort("totalPrice")}
+                    onClick={() => handleSort("totalValue")}
                   >
-                    Total Value{" "}
-                    <SortIcon active={sortKey === "totalPrice"} asc={sortAsc} />
+                    Stock Value <SortIcon active={sortKey === "totalValue"} />
                   </th>
                 </tr>
               </thead>
 
               <tbody className="divide-y divide-gray-50">
                 {sortedItems.map((item, idx) => {
-                  const typeColor =
-                    item.type === "gents"
-                      ? "bg-sky-100 text-sky-700"
-                      : "bg-amber-100 text-amber-700";
+                  const soldOut =
+                    item.outOfStockVariants === item.variantCount &&
+                    item.variantCount > 0;
 
                   return (
                     <tr
@@ -461,21 +257,27 @@ const Summary: React.FC = () => {
                       <td className="px-5 py-3.5 font-mono font-semibold text-gray-800">
                         {item.name}
                       </td>
-                      <td className="px-5 py-3.5">
-                        <span
-                          className={`inline-block rounded-full px-2.5 py-0.5 text-xs font-semibold capitalize ${typeColor}`}
-                        >
-                          {item.type}
-                        </span>
+                      <td className="px-5 py-3.5 text-right tabular-nums text-gray-600">
+                        ₹{item.pricePerMeter.toLocaleString("en-IN")}/m
                       </td>
                       <td className="px-5 py-3.5 text-right tabular-nums text-gray-700">
-                        {item.totalUnits.toLocaleString()}
+                        {formatMeters(item.totalStock)}
+                        {soldOut && (
+                          <span className="ml-2 rounded-full bg-rose-100 px-2 py-0.5 text-[10px] font-semibold text-rose-600">
+                            sold out
+                          </span>
+                        )}
+                        {!soldOut && item.lowStockVariants > 0 && (
+                          <span className="ml-2 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-semibold text-amber-700">
+                            {item.lowStockVariants} low
+                          </span>
+                        )}
                       </td>
                       <td className="px-5 py-3.5 text-center text-gray-500">
                         {item.variantCount}
                       </td>
                       <td className="px-5 py-3.5 text-right font-bold tabular-nums text-gray-900">
-                        {formatCurrency(item.totalPrice)}
+                        {formatCurrency(item.totalValue)}
                       </td>
                     </tr>
                   );
@@ -485,14 +287,14 @@ const Summary: React.FC = () => {
               <tfoot>
                 <tr className="border-t-2 border-gray-200 bg-gray-50 font-semibold">
                   <td className="px-5 py-3.5 text-gray-700" colSpan={2}>
-                    Total ({sortedItems.length} items)
+                    Total ({sortedItems.length} fabrics)
                   </td>
                   <td className="px-5 py-3.5 text-right tabular-nums text-gray-800">
-                    {filteredTotals.units.toLocaleString()}
+                    {formatMeters(filteredTotals.stock)}
                   </td>
                   <td className="px-5 py-3.5 text-center tabular-nums text-gray-800" />
                   <td className="px-5 py-3.5 text-right tabular-nums text-gray-900">
-                    {formatCurrency(filteredTotals.price)}
+                    {formatCurrency(filteredTotals.value)}
                   </td>
                 </tr>
               </tfoot>
@@ -500,23 +302,11 @@ const Summary: React.FC = () => {
           </div>
         </div>
 
-        {/* Size Range Legend */}
-        <div className="mt-6 rounded-xl border border-gray-100 bg-white p-4 shadow-sm">
-          <p className="mb-2 text-xs font-semibold uppercase tracking-widest text-gray-400">
-            Size Range → Piece Count Reference
-          </p>
-          <div className="flex flex-wrap gap-2">
-            {Object.entries(SIZE_RANGE_PIECE_COUNT).map(([range, count]) => (
-              <span
-                key={range}
-                className="rounded-lg border border-gray-100 bg-gray-50 px-3 py-1 font-mono text-xs text-gray-600"
-              >
-                <span className="font-semibold text-black">{range}</span> →{" "}
-                {count} pcs
-              </span>
-            ))}
-          </div>
-        </div>
+        <p className="mt-6 text-xs text-gray-400">
+          Stock value is physical metres on the rolls × the fabric&apos;s rate per
+          metre. Outstanding order demand and packed-but-undispatched metres are
+          not deducted here.
+        </p>
       </div>
     </div>
   );

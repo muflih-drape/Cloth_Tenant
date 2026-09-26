@@ -8,16 +8,42 @@ from collections import defaultdict
 from django.db import transaction
 
 from apps.accounts.permissions import (
+    IsAdmin,
     IsAdminOrSelfAgent,
-    admin_business,
     check_admin_pin,
 )
-from apps.items.models import ItemVariant
+from apps.items.models import FabricVariant
 from apps.notification.utils import notify_user_safely
 from apps.orders.models import Order
 
 from .models import Agent, AgentItem
-from .serializers import AgentItemListSerializer, AgentSerializer
+from .serializers import AgentFabricListSerializer, AgentSerializer
+
+
+def _assigned_fabrics(agent, request):
+    """Group an agent's assigned variants by parent fabric, in stable order."""
+    qs = (
+        agent.assigned_items.select_related("variant__fabric")
+        .filter(variant__fabric__is_deleted=False)
+        .order_by("-id")
+    )
+    groups = defaultdict(list)
+    for assignment in qs:
+        groups[assignment.variant.fabric_id].append(assignment)
+
+    return [
+        AgentFabricListSerializer.from_assigned_variants(
+            assignments[0].variant.fabric, assignments, request
+        )
+        for assignments in groups.values()
+    ]
+
+
+def _may_manage(request, agent):
+    """Admins may see any agent's catalogue; agents only their own."""
+    if request.user.role == "ADMIN":
+        return True
+    return agent.user_id == request.user.id
 
 
 class AgentViewSet(ModelViewSet):
@@ -90,33 +116,22 @@ class AgentDetail(APIView):
 
 
 class AgentItemsView(APIView):
-    permission_classes = [IsAdminOrSelfAgent]
+    """The fabrics an agent is allowed to sell.
+
+    Reads are open to the agent themselves and to admins. Writes are admin-only:
+    an agent must not be able to widen their own catalogue.
+    """
+
+    def get_permissions(self):
+        if self.request.method == "GET":
+            return [IsAdminOrSelfAgent()]
+        return [IsAdmin()]
 
     def get(self, request, agent_id):
         agent = get_object_or_404(Agent, id=agent_id)
-        biz = admin_business(request.user)
-        qs = (
-            agent.assigned_items
-            .select_related("variant__item")
-            .prefetch_related("variant__sizes")
-        )
-        if biz:
-            qs = qs.filter(variant__item__type=biz)
-        qs = qs.order_by('-id')
-
-        item_groups = defaultdict(list)
-        for ai in qs:
-            item_groups[ai.variant.item_id].append(ai)
-
-        result = []
-        for item_id, agent_items in item_groups.items():
-            item_obj = agent_items[0].variant.item
-            result.append(
-                AgentItemListSerializer.from_assigned_variants(
-                    item_obj, agent_items, request
-                )
-            )
-        return Response(result)
+        if not _may_manage(request, agent):
+            return Response({"error": "Unauthorized"}, status=status.HTTP_403_FORBIDDEN)
+        return Response(_assigned_fabrics(agent, request))
 
     def post(self, request, agent_id):
         agent = get_object_or_404(Agent, id=agent_id)
@@ -128,7 +143,6 @@ class AgentItemsView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        biz = admin_business(request.user)
         existing_qs = agent.assigned_items.all()
         existing_variant_ids = set(
             existing_qs.values_list("variant_id", flat=True)
@@ -143,73 +157,45 @@ class AgentItemsView(APIView):
         assigned_count = 0
         for variant_id in ids_to_add:
             try:
-                if biz:
-                    variant = ItemVariant.objects.get(id=variant_id, item__type=biz)
-                else:
-                    variant = ItemVariant.objects.get(id=variant_id)
-                AgentItem.objects.create(agent=agent, variant=variant)
-                assigned_count += 1
-            except ItemVariant.DoesNotExist:
-                pass
-
-        qs = (
-            agent.assigned_items
-            .select_related("variant__item")
-            .prefetch_related("variant__sizes")
-            .all()
-        )
-        item_groups = defaultdict(list)
-        for ai in qs:
-            item_groups[ai.variant.item_id].append(ai)
-
-        result = []
-        for item_id, agent_items in item_groups.items():
-            item_obj = agent_items[0].variant.item
-            result.append(
-                AgentItemListSerializer.from_assigned_variants(
-                    item_obj, agent_items, request
+                variant = FabricVariant.objects.get(
+                    id=variant_id, fabric__is_deleted=False
                 )
-            )
+            except FabricVariant.DoesNotExist:
+                continue
+            AgentItem.objects.create(agent=agent, variant=variant)
+            assigned_count += 1
+
+        result = _assigned_fabrics(agent, request)
 
         if assigned_count > 0:
             notify_user_safely(
                 agent.user_id,
-                "Items Assigned",
-                f"{assigned_count} item{'s' if assigned_count > 1 else ''} have been assigned to you",
+                "Fabrics Assigned",
+                f"{assigned_count} fabric{'s' if assigned_count > 1 else ''} "
+                "have been assigned to you",
             )
 
         return Response(result)
 
     def delete(self, request, agent_id):
         agent = get_object_or_404(Agent, id=agent_id)
-        biz = admin_business(request.user)
-        
-        qs = agent.assigned_items.all()
-        if biz:
-            qs = qs.filter(variant__item__type=biz)
-            
-        qs.delete()
+        agent.assigned_items.all().delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 class AgentItemDetailView(APIView):
-    permission_classes = [IsAdminOrSelfAgent]
+    permission_classes = [IsAdmin()]
 
     def delete(self, request, agent_id, variant_id):
         agent = get_object_or_404(Agent, id=agent_id)
         agent_item = get_object_or_404(
             AgentItem, agent=agent, variant_id=variant_id
         )
-
-        biz = admin_business(request.user)
-        if biz and agent_item.variant.item.type != biz:
-            return Response({"error": "Not found"}, status=404)
-
         agent_item.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class AgentItemTransferView(APIView):
-    permission_classes = [IsAdminOrSelfAgent]
+    permission_classes = [IsAdmin()]
 
     def post(self, request, agent_id):
         source_agent = get_object_or_404(Agent, id=agent_id)
@@ -229,15 +215,11 @@ class AgentItemTransferView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        biz = admin_business(request.user)
         source_items = source_agent.assigned_items.all()
-        
-        if biz:
-            source_items = source_items.filter(variant__item__type=biz)
-            
+
         if not source_items.exists():
             return Response(
-                {"message": "No items to transfer."},
+                {"message": "No fabrics to transfer."},
                 status=status.HTTP_200_OK
             )
             
@@ -257,18 +239,19 @@ class AgentItemTransferView(APIView):
         if assigned_count > 0:
             notify_user_safely(
                 target_agent.user_id,
-                "Items Transferred",
-                f"{assigned_count} item{'s' if assigned_count > 1 else ''} have been transferred to you",
+                "Fabrics Transferred",
+                f"{assigned_count} fabric{'s' if assigned_count > 1 else ''} "
+                "have been transferred to you",
             )
 
         return Response(
-            {"message": "Items successfully transferred."},
+            {"message": "Fabrics successfully transferred."},
             status=status.HTTP_200_OK
         )
 
 
 class AgentItemCopyView(APIView):
-    permission_classes = [IsAdminOrSelfAgent]
+    permission_classes = [IsAdmin()]
 
     def post(self, request, agent_id):
         source_agent = get_object_or_404(Agent, id=agent_id)
@@ -288,15 +271,11 @@ class AgentItemCopyView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        biz = admin_business(request.user)
         source_items = source_agent.assigned_items.all()
-        
-        if biz:
-            source_items = source_items.filter(variant__item__type=biz)
-            
+
         if not source_items.exists():
             return Response(
-                {"message": "No items to copy."},
+                {"message": "No fabrics to copy."},
                 status=status.HTTP_200_OK
             )
             
@@ -314,11 +293,12 @@ class AgentItemCopyView(APIView):
         if assigned_count > 0:
             notify_user_safely(
                 target_agent.user_id,
-                "Items Copied",
-                f"{assigned_count} item{'s' if assigned_count > 1 else ''} have been copied to you",
+                "Fabrics Copied",
+                f"{assigned_count} fabric{'s' if assigned_count > 1 else ''} "
+                "have been copied to you",
             )
 
         return Response(
-            {"message": "Items successfully copied."},
+            {"message": "Fabrics successfully copied."},
             status=status.HTTP_200_OK
         )

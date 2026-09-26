@@ -1,20 +1,25 @@
 "use client";
 
+import { formatMeters } from "@/types/item";
+
 interface StockBadgeProps {
   total: number;
-  sizeGroups?: string[];
+  /** Unit suffix after the figure. Cloth is metres; orders use none. */
+  unit?: string;
   showLabel?: boolean;
+  lowThreshold?: number;
   size?: "sm" | "md" | "lg";
 }
 
 export default function StockBadge({
   total,
-  sizeGroups,
+  unit,
   showLabel = true,
+  lowThreshold = 50,
   size = "md",
 }: StockBadgeProps) {
-  const isZero = total === 0;
-  const isLow = total > 0 && total <= 10;
+  const isZero = total <= 0;
+  const isLow = total > 0 && total <= lowThreshold;
 
   const colorClass = isZero
     ? "text-red-500"
@@ -36,21 +41,15 @@ export default function StockBadge({
 
   return (
     <div className="text-right">
-      <div className="flex items-center justify-end gap-2">
+      <div className="flex items-center justify-end gap-1">
         <span className={`font-black ${sizeClasses[size]} ${colorClass}`}>
-          {total}
+          {formatMeters(total)}
+          {unit ? ` ${unit}` : ""}
         </span>
         {showLabel && (
-          <span className={`text-gray-400 ${labelSizeClasses[size]}`}>
-            Stock
-          </span>
+          <span className={`text-gray-400 ${labelSizeClasses[size]}`}>in stock</span>
         )}
       </div>
-      {sizeGroups && sizeGroups.length > 0 && (
-        <p className={`text-gray-400 ${labelSizeClasses[size]} mt-0.5`}>
-          {sizeGroups.join(" • ")}
-        </p>
-      )}
     </div>
   );
 }

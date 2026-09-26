@@ -4,8 +4,8 @@ import { useCallback, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import { PDFDocument, degrees } from "pdf-lib";
 
-import { itemApi } from "@/lib/api/item";
-import type { ItemQRResponse, ItemVariant } from "@/types/item";
+import { fabricApi } from "@/lib/api/item";
+import type { FabricQRResponse, FabricVariant } from "@/types/item";
 
 import { pdf } from "@react-pdf/renderer";
 import { QRLabelPdf } from "@/components/pages/items/qr/QRLabelPdf";
@@ -19,10 +19,9 @@ import { variantColorLabel } from "@/lib/colorLabel";
 type QRPrintItem = {
     id: number;
     name: string;
-    type: string;
-    price: string;
+    price_per_meter: string;
     image: string | null;
-    variants: ItemVariant[];
+    variants: FabricVariant[];
 };
 
 export default function QRPrintPageContent() {
@@ -50,35 +49,26 @@ export default function QRPrintPageContent() {
         const fetchData = async () => {
             try {
                 if (itemId) {
-                    const data = await itemApi.getOne(Number(itemId));
-                    const variants = data.variants.map((v) => ({
-                        id: v.id,
-                        qr_code: v.qr_code,
-                        image: v.image,
-                        sizes: v.sizes,
-                        display_order: v.display_order,
-                    }));
+                    const data = await fabricApi.getOne(Number(itemId));
                     const parsedItem: QRPrintItem = {
                         id: data.id,
                         name: data.name,
-                        type: data.type || "gents",
-                        price: data.price,
-                        image: variants[0]?.image || null,
-                        variants,
+                        price_per_meter: data.price_per_meter,
+                        image: data.variants[0]?.image || null,
+                        variants: data.variants,
                     };
                     await prepareItem(parsedItem);
                 } else if (qrId) {
-                  const data: ItemQRResponse = await itemApi.byqr(qrId);
+                    const data: FabricQRResponse = await fabricApi.byQr(qrId);
                     const matchedVariant =
                         data.variants.find((v) => v.qr_code === qrId) ||
                         data.variants[0];
-                  const parsedItem: QRPrintItem = {
+                    const parsedItem: QRPrintItem = {
                         id: data.id,
                         name: data.name,
-                        type: "gents",
-                        price: data.price,
+                        price_per_meter: data.price_per_meter,
                         image: matchedVariant?.image || null,
-                        variants: [matchedVariant],
+                        variants: matchedVariant ? [matchedVariant] : [],
                     };
                     await prepareItem(parsedItem);
                 }
@@ -245,7 +235,7 @@ export default function QRPrintPageContent() {
                                     className="mt-3"
                                 />
                                 <p className="text-[24px] font-extrabold">
-                                    Rs. {Number(item.price).toFixed(2)}
+                                    Rs. {Number(item.price_per_meter).toFixed(2)}/m
                                 </p>
                             </div>
                         ))}

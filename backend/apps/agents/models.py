@@ -31,13 +31,15 @@ class Agent(models.Model):
 
 
 class AgentItem(models.Model):
+    """A fabric variant an agent is allowed to sell."""
+
     agent = models.ForeignKey(
         Agent,
         related_name="assigned_items",
         on_delete=models.CASCADE
     )
     variant = models.ForeignKey(
-        "items.ItemVariant",
+        "items.FabricVariant",
         related_name="assigned_agents",
         on_delete=models.CASCADE,
     )
@@ -47,4 +49,4 @@ class AgentItem(models.Model):
         unique_together = ("agent", "variant")
 
     def __str__(self):
-        return f"{self.agent.user.username} - {self.variant.item.name} ({self.variant.qr_code})"
+        return f"{self.agent.user.username} - {self.variant.fabric.name} ({self.variant.qr_code})"

@@ -36,8 +36,6 @@ class CustomerListAdminTests(TestCase):
             email="admin1@test.com",
             password="pass1234",
             role="ADMIN",
-            business="gents",
-            brand=self.brand,
         )
 
         self.agent_user = User.objects.create_user(

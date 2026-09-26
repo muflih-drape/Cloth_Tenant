@@ -4,7 +4,7 @@ from celery import shared_task
 from django.conf import settings
 from django.core.management import call_command
 
-from .services import purge_archived_items
+from .services import purge_archived_fabrics
 
 logger = logging.getLogger(__name__)
 
@@ -17,14 +17,14 @@ def cleanup_orphaned_media_task():
 
 
 @shared_task
-def purge_archived_items_task():
-    if not settings.ARCHIVED_ITEM_PURGE_ENABLED:
-        logger.info("Archived item purge disabled; nothing to do")
+def purge_archived_fabrics_task():
+    if not settings.ARCHIVED_FABRIC_PURGE_ENABLED:
+        logger.info("Archived fabric purge disabled; nothing to do")
         return
-    logger.info("Starting archived item purge")
-    result = purge_archived_items(limit=settings.ARCHIVED_ITEM_PURGE_BATCH)
+    logger.info("Starting archived fabric purge")
+    result = purge_archived_fabrics(limit=settings.ARCHIVED_FABRIC_PURGE_BATCH)
     logger.info(
-        "Archived item purge finished: deleted=%s skipped_open_orders=%s "
+        "Archived fabric purge finished: deleted=%s skipped_open_orders=%s "
         "skipped_restocked=%s failed=%s",
         result.deleted,
         result.skipped_open_orders,

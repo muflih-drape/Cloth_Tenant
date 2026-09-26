@@ -3,26 +3,20 @@
 import { useEffect, useMemo, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { Info } from "lucide-react";
-import { itemApi } from "@/lib/api/item";
+import { fabricApi } from "@/lib/api/item";
 import { orderApi } from "@/lib/api/order";
 import { PageLoading } from "@/components/ui/Loading";
 import { toastSuccess, toastError } from "@/lib/toast";
-import type { ItemQRResponse, ItemVariant } from "@/types/item";
+import type { FabricQRResponse, FabricVariant } from "@/types/item";
+import { toMeters } from "@/types/item";
 import { useEditGuard } from "@/lib/useEditGuard";
-
-import {
-  getAvailableSizeRanges,
-  getMaxSizeGroup,
-  getAvailableStockForSizeGroup,
-} from "../../../new/[id]/[qr]/utils";
 
 import ProductHeader from "../../../new/[id]/[qr]/components/ProductHeader";
 import ProductImage from "../../../new/[id]/[qr]/components/ProductImage";
 import ProductInfo from "../../../new/[id]/[qr]/components/ProductInfo";
 import VariantSelector from "../../../new/[id]/[qr]/components/VariantSelector";
-import QuantitySelector from "../../../new/[id]/[qr]/components/QuantitySelector";
+import MetresSelector from "../../../new/[id]/[qr]/components/MetresSelector";
 import SubmitButton from "../../../new/[id]/[qr]/components/SubmitButton";
-import SizeGroupSelector from "../../../new/[id]/[qr]/components/SizeGroupSelector";
 
 export default function EditProductDetailPage() {
   const params = useParams<{ id: string; qr: string }>();
@@ -30,31 +24,27 @@ export default function EditProductDetailPage() {
   const router = useRouter();
   const { handleBack } = useEditGuard(id);
 
-  const [data, setData] = useState<ItemQRResponse | null>(null);
-  const [quantity, setQuantity] = useState<number>(1);
-  const [selectedVariant, setSelectedVariant] = useState<ItemVariant | null>(
-    null,
-  );
-  const [selectedSizeGroup, setSelectedSizeGroup] = useState<string | null>(
+  const [data, setData] = useState<FabricQRResponse | null>(null);
+  const [metres, setMetres] = useState("0");
+  const [selectedVariant, setSelectedVariant] = useState<FabricVariant | null>(
     null,
   );
   const [loading, setLoading] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
-  const [existingOrderItems, setExistingOrderItems] = useState<
-    Array<{
-      id: number;
-      variant_id: number;
-      size_group: string;
-      quantity: number;
-    }>
-  >([]);
+
+  const [existingMetres, setExistingMetres] = useState<Record<number, number>>(
+    {},
+  );
+  const [existingLineId, setExistingLineId] = useState<number | null>(null);
+
+  const isEditMode = existingLineId !== null;
 
   useEffect(() => {
     setLoading(true);
     const fetchData = async () => {
       try {
-        const [itemResponse, orderResponse] = await Promise.all([
-          itemApi.byqr(params.qr),
+        const [fabricResponse, orderResponse] = await Promise.all([
+          fabricApi.byQr(params.qr),
           (async () => {
             const orderKey = localStorage.getItem("orderKey");
             if (orderKey) {
@@ -64,27 +54,36 @@ export default function EditProductDetailPage() {
           })(),
         ]);
 
-        setData(itemResponse);
-        if (itemResponse.variants?.length > 0) {
-          setSelectedVariant(
-            itemResponse.variants.find(
-              (v) => v.id === (itemResponse.matched_variant_id || 0),
-            ) || itemResponse.variants[0],
-          );
-        }
+        setData(fabricResponse);
 
-        if (orderResponse) {
-          setExistingOrderItems(
-            orderResponse.items.map((item) => ({
-              id: item.id,
-              variant_id: item.variant || 0,
-              size_group: item.size_group || "",
-              quantity: item.quantity,
-            })),
+        const matched =
+          fabricResponse.variants?.find(
+            (v) => v.id === (fabricResponse.matched_variant_id || 0),
+          ) ?? fabricResponse.variants?.[0] ?? null;
+        setSelectedVariant(matched);
+
+        if (orderResponse && matched) {
+          const byVariant: Record<number, number> = {};
+          for (const line of orderResponse.items) {
+            if (line.variant) {
+              byVariant[line.variant] =
+                (byVariant[line.variant] ?? 0) + toMeters(line.ordered_quantity);
+            }
+          }
+          setExistingMetres(byVariant);
+
+          // Reuse this colour's line if the order already has one, so scanning
+          // the same roll twice adjusts it rather than duplicating it.
+          const sameVariant = orderResponse.items.find(
+            (line) => line.variant === matched.id,
           );
+          if (sameVariant) {
+            setExistingLineId(sameVariant.id);
+            setMetres(sameVariant.ordered_quantity);
+          }
         }
       } catch (e) {
-        console.error("Error fetching product details:", e);
+        console.error("Error fetching fabric details:", e);
       } finally {
         setLoading(false);
       }
@@ -92,108 +91,27 @@ export default function EditProductDetailPage() {
     fetchData();
   }, [params.qr]);
 
-  const sizeGroups = getAvailableSizeRanges(selectedVariant, data?.type);
-
-  const sizeGroupMeta = useMemo(() => {
-    if (!selectedVariant)
-      return {} as Record<string, { stock: number; alreadyAdded: boolean }>;
-
-    return Object.fromEntries(
-      sizeGroups.map((group) => {
-        const reservedItems = existingOrderItems
-          .filter((item) => item.variant_id === selectedVariant.id)
-          .map((item) => ({
-            size_group: item.size_group,
-            quantity: item.quantity,
-          }));
-
-        const stock = getAvailableStockForSizeGroup(
-          selectedVariant,
-          group,
-          reservedItems,
-        );
-        const alreadyAdded = existingOrderItems.some(
-          (item) =>
-            item.variant_id === selectedVariant.id && item.size_group === group,
-        );
-
-        return [group, { stock, alreadyAdded }];
-      }),
-    );
-  }, [sizeGroups, selectedVariant, existingOrderItems]);
-
-  useEffect(() => {
-    if (sizeGroups.length > 0 && !selectedSizeGroup) {
-      setSelectedSizeGroup(getMaxSizeGroup(sizeGroups));
-    }
-  }, [sizeGroups, selectedSizeGroup]);
-
-  const availableStock = (() => {
-    if (!selectedVariant || !selectedSizeGroup) return 0;
-
-    const reservedItems = existingOrderItems
-      .filter((item) => item.variant_id === selectedVariant.id)
-      .map((item) => ({
-        size_group: item.size_group,
-        quantity: item.quantity,
-      }));
-
-    return getAvailableStockForSizeGroup(
-      selectedVariant,
-      selectedSizeGroup,
-      reservedItems,
-    );
-  })();
-
-  const existingSameVariantAndSize = (() => {
-    if (!selectedVariant || !selectedSizeGroup) return null;
-    return existingOrderItems.find(
-      (item) =>
-        item.variant_id === selectedVariant.id &&
-        item.size_group === selectedSizeGroup,
-    );
-  })();
-
-  useEffect(() => {
-    if (quantity > availableStock) {
-      setValidationError(
-        `Only ${availableStock} items available for selected size group`,
-      );
-    } else {
-      setValidationError(null);
-    }
-  }, [quantity, availableStock]);
-
-  const handleVariantSelect = (variant: ItemVariant) => {
+  const handleVariantSelect = (variant: FabricVariant) => {
     setSelectedVariant(variant);
-    setQuantity(1);
     setValidationError(null);
+    const onOrder = existingMetres[variant.id];
+    if (onOrder) setMetres(String(onOrder));
   };
 
-  const handleSizeGroupSelect = (value: string) => {
-    setSelectedSizeGroup(value);
-    setQuantity(1);
-    setValidationError(null);
-  };
+  const onHandMetres = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
+  const requested = useMemo(() => toMeters(metres), [metres]);
 
   const handleSubmit = async () => {
     if (!selectedVariant) {
-      setValidationError("Please select a color/variant");
+      setValidationError("Choose a colour");
       return;
     }
-    if (!selectedSizeGroup) {
-      setValidationError("Please select a size group");
+    if (!selectedVariant.qr_code) {
+      setValidationError("This colour has no QR code. Ask an admin to set one.");
       return;
     }
-    if (quantity < 1) {
-      setValidationError("Quantity must be at least 1");
-      return;
-    }
-
-    if (quantity > availableStock) {
-      setValidationError(
-        `Only ${availableStock} items available for selected size group`,
-      );
+    if (requested <= 0) {
+      setValidationError("Enter how many metres are needed");
       return;
     }
 
@@ -202,35 +120,29 @@ export default function EditProductDetailPage() {
     try {
       setLoading(true);
       const orderKey = localStorage.getItem("orderKey");
-      if (orderKey) {
-        const orderId = parseInt(orderKey, 10);
-        const qrCode = selectedVariant.qr_code;
-
-        await orderApi.addItem(orderId, {
-          qr_code: qrCode,
-          quantity,
-          size_group: selectedSizeGroup,
-        });
-        setExistingOrderItems((prev) => [
-          ...prev,
-          {
-            id: Date.now(),
-            variant_id: selectedVariant.id,
-            size_group: selectedSizeGroup,
-            quantity,
-          },
-        ]);
-        toastSuccess("Item Added Successfully");
-        router.push(`/agent/order/edit/${id}`);
-      } else {
-        setValidationError(
-          "Order session not found. Please restart the order.",
-        );
+      if (!orderKey) {
+        setValidationError("Order session not found. Please restart the order.");
+        setLoading(false);
+        return;
       }
+      const orderId = parseInt(orderKey, 10);
+
+      if (existingLineId !== null) {
+        await orderApi.updateItem(existingLineId, {
+          ordered_quantity: metres,
+        });
+        toastSuccess("Fabric line updated");
+      } else {
+        await orderApi.addItem(orderId, {
+          qr_code: selectedVariant.qr_code,
+          ordered_quantity: metres,
+        });
+        toastSuccess("Fabric added");
+      }
+      router.push(`/agent/order/edit/${id}`);
     } catch (e) {
-      console.error("Error adding item to order:", e);
-      toastError("Failed to add item", e);
-    } finally {
+      console.error("Error adding fabric to order:", e);
+      toastError("Failed to add fabric", e);
       setLoading(false);
     }
   };
@@ -239,12 +151,12 @@ export default function EditProductDetailPage() {
 
   return (
     <div className="min-h-screen bg-gray-50/50 pb-32">
-      <ProductHeader isEditMode={false} onBack={handleBack} />
+      <ProductHeader isEditMode={isEditMode} onBack={handleBack} />
 
       <div className="max-w-md mx-auto px-6 pt-6">
         <ProductImage
           image={selectedVariant?.image}
-          alt={data?.name || "Product"}
+          alt={data?.name || "Fabric"}
         />
 
         <ProductInfo name={data?.name} />
@@ -252,40 +164,20 @@ export default function EditProductDetailPage() {
         <VariantSelector
           variants={data?.variants || []}
           selectedVariant={selectedVariant}
-          existingOrderItems={existingOrderItems}
-          selectedSizeGroup={selectedSizeGroup}
+          existingMetresByVariant={existingMetres}
           onSelect={handleVariantSelect}
         />
 
-        <SizeGroupSelector
-          sizeGroups={sizeGroups}
-          selectedSizeGroup={selectedSizeGroup}
-          availableStock={availableStock}
-          sizeGroupMeta={sizeGroupMeta}
-          onSelect={handleSizeGroupSelect}
+        <MetresSelector
+          metres={metres}
+          onChange={setMetres}
+          onHandMetres={onHandMetres}
+          isEditMode={isEditMode}
         />
-
-        <QuantitySelector
-          quantity={quantity}
-          availableStock={availableStock}
-          isEditMode={false}
-          onChange={setQuantity}
-        />
-
-        {existingSameVariantAndSize && (
-          <div className="mb-6 p-4 bg-amber-50 border border-amber-100 rounded-2xl flex items-start gap-3">
-            <Info size={18} className="text-amber-500 mt-0.5 shrink-0" />
-            <p className="text-sm text-amber-800 font-medium">
-              You already added {existingSameVariantAndSize.quantity} sets of
-              this color and size range. Submitting will add a new separate
-              item.
-            </p>
-          </div>
-        )}
 
         {validationError && (
-          <div className="mb-6 p-4 bg-rose-50 border border-rose-100 rounded-2xl flex items-center gap-3 text-rose-500 animate-in fade-in slide-in-from-top-2">
-            <Info size={18} />
+          <div className="mb-6 p-4 bg-rose-50 border border-rose-100 rounded-2xl flex items-center gap-3 text-rose-500">
+            <Info size={18} className="shrink-0" />
             <p className="text-xs font-bold uppercase tracking-wider">
               {validationError}
             </p>
@@ -293,9 +185,9 @@ export default function EditProductDetailPage() {
         )}
 
         <SubmitButton
-          isEditMode={false}
+          isEditMode={isEditMode}
           loading={loading}
-          disabled={availableStock === 0 || !!validationError}
+          disabled={loading || requested <= 0 || !!validationError}
           onClick={handleSubmit}
         />
       </div>

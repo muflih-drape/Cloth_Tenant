@@ -10,6 +10,7 @@ import {
   CartesianGrid,
 } from "recharts";
 import type { LeaderboardEntry } from "@/types/dashboard";
+import { toMeters } from "@/types/item";
 
 interface CustomerBarChartProps {
   customers: LeaderboardEntry[];
@@ -29,23 +30,23 @@ export default function CustomerBarChart({ customers }: CustomerBarChartProps) {
     );
   }
 
+  // The API ranks by metres allocated, so metres are what the bar length shows.
   const data = [...customers].reverse().map((customer) => ({
     name:
       customer.name.length > 12
-        ? customer.name.substring(0, 12) + "..."
+        ? `${customer.name.slice(0, 12)}...`
         : customer.name,
+    metres: toMeters(customer.metres),
     orders: customer.count,
   }));
 
-  const totalOrders = customers.reduce((sum, c) => sum + c.count, 0);
-  const topThreePct =
-    customers.length >= 3
-      ? (
-          (customers.slice(0, 3).reduce((sum, c) => sum + c.count, 0) /
-            totalOrders) *
-          100
-        ).toFixed(0)
-      : null;
+  const totalMetres = customers.reduce((sum, c) => sum + toMeters(c.metres), 0);
+  const topThreeMetres = customers
+    .slice(0, 3)
+    .reduce((sum, c) => sum + toMeters(c.metres), 0);
+  const topThreePct = totalMetres
+    ? ((topThreeMetres / totalMetres) * 100).toFixed(0)
+    : null;
 
   return (
     <div className="bg-white rounded-xl border p-4 shadow-sm mb-4">
@@ -68,10 +69,18 @@ export default function CustomerBarChart({ customers }: CustomerBarChartProps) {
             axisLine={false}
           />
           <Tooltip
-            formatter={(value) => [`${Number(value)} orders`, "Orders"]}
+            formatter={(value, _name, entry) => {
+              const orders = (entry?.payload as { orders?: number })?.orders;
+              return [
+                `${Number(value).toLocaleString("en-IN")} m${
+                  orders ? ` · ${orders} orders` : ""
+                }`,
+                "Metres",
+              ];
+            }}
           />
           <Bar
-            dataKey="orders"
+            dataKey="metres"
             fill="#3b82f6"
             radius={[0, 4, 4, 0]}
             barSize={16}
@@ -80,7 +89,7 @@ export default function CustomerBarChart({ customers }: CustomerBarChartProps) {
       </ResponsiveContainer>
       {topThreePct && (
         <div className="text-sm text-gray-400 mt-2">
-          Top 3 customers account for {topThreePct}% of all orders
+          Top 3 customers account for {topThreePct}% of all metres
         </div>
       )}
     </div>

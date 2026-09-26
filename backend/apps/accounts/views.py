@@ -63,7 +63,6 @@ class LoginView(APIView):
                 "user_id": user.id,
                 "username": user.username,
                 "email": user.email,
-                "business": user.business or None,
                 "is_superuser": user.is_superuser,
             },
             status=status.HTTP_200_OK,

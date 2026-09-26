@@ -50,7 +50,6 @@ class LoginResponseSerializer(serializers.Serializer):
     user_id = serializers.IntegerField()
     username = serializers.CharField(required=False, allow_blank=True)
     email = serializers.EmailField(required=False, allow_blank=True)
-    business = serializers.CharField(required=False, allow_blank=True, allow_null=True)
     is_superuser = serializers.BooleanField()
 
 
@@ -61,7 +60,7 @@ class VerifyPinRequestSerializer(serializers.Serializer):
 class UserSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
-        fields = ('id', 'username', 'email', 'role', 'business', 'is_superuser', 'display_name')
+        fields = ('id', 'username', 'email', 'role', 'is_superuser', 'display_name')
 
 
 class UserCreateSerializer(serializers.ModelSerializer):

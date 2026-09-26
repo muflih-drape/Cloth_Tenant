@@ -1,291 +1,149 @@
 "use client";
 import { PageLoading } from "@/components/ui/Loading";
 import { orderApi } from "@/lib/api/order";
-import { itemApi } from "@/lib/api/item";
 import { toastError, toastSuccess } from "@/lib/toast";
 import { OrderItem as OrderItemType, OrderItems } from "@/types/order";
-import { VariantSize, ItemType } from "@/types/item";
+import { formatMeters, toMeters } from "@/types/item";
 import { useState, useEffect } from "react";
 
 import { OrderItemRow } from "@/components/order";
 import OrderItemEditModal from "./orderItemEdit";
 import {
   isOrderItemFullyPacked,
+  outstandingMeters,
   sortOrderItemsUnpackedFirst,
 } from "@/lib/utils/orderItemSort";
-
-import {
-  getAvailableSizeGroups,
-  getAvailableStockForSizeGroup,
-  getPiecesForGroup,
-} from "./orderItemUtils";
 
 type Props = {
   items: OrderItems | undefined;
   isDeletable?: boolean;
   isEditable?: boolean;
   orderId?: number;
-  isPacking?: boolean;
-  isDispatching?: boolean;
-  onPackedChange?: () => void;
+  onAllocationChange?: () => void;
   onDeleteItem?: (itemId: number) => void;
-  status?: string;
-  outOfStockItemIds?: number[];
+  /** Hide unfulfilled lines -- used on the dispatch screen. */
+  onlyFullyPacked?: boolean;
+  outstandingItemIds?: number[];
 };
 
+/**
+ * The fabric lines on an order.
+ *
+ * There is no per-line "packed" tick any more: cloth is allocated in packing
+ * rounds, which is where stock actually moves. What this list shows is how much
+ * of each line the warehouse has committed, and how much is still owed.
+ */
 const OrderItem: React.FC<Props> = ({
   items,
   isDeletable,
   isEditable,
   orderId,
-  isPacking,
-  isDispatching,
-  onPackedChange,
+  onAllocationChange,
   onDeleteItem,
-  status,
-  outOfStockItemIds = [],
+  onlyFullyPacked = false,
+  outstandingItemIds = [],
 }) => {
-  const [loading, setLoading] = useState(false);
-  const [loadingItemId, setLoadingItemId] = useState<number | null>(null);
+  const [deleting, setDeleting] = useState(false);
+  const [saving, setSaving] = useState(false);
   const [orderItems, setOrderItems] = useState(items);
-  const [showUnpackDialog, setShowUnpackDialog] = useState(false);
-  const [pendingUnpack, setPendingUnpack] = useState<{
-    itemId: number;
-    newPacked: number;
-  } | null>(null);
   const [editingItem, setEditingItem] = useState<OrderItemType | null>(null);
-  const [editQuantity, setEditQuantity] = useState(1);
-  const [editSizeGroup, setEditSizeGroup] = useState("");
-  const [editPieceCount, setEditPieceCount] = useState(1);
-  const [editPackedQty, setEditPackedQty] = useState(0);
+  const [editMetres, setEditMetres] = useState("0");
+  const [editVariantId, setEditVariantId] = useState<number | null>(null);
+  const [metresError, setMetresError] = useState<string | null>(null);
   const [showEditDialog, setShowEditDialog] = useState(false);
-  const [sizeGroupOptions, setSizeGroupOptions] = useState<string[]>([]);
-  const [variantSizes, setVariantSizes] = useState<VariantSize[]>([]);
-  const [variantsLoading, setVariantsLoading] = useState(false);
-  const [sizeGroupError, setSizeGroupError] = useState<string | null>(null);
-  const [quantityError, setQuantityError] = useState<string | null>(null);
 
   useEffect(() => {
     setOrderItems(items);
   }, [items]);
 
-  const handleTogglePacked = async () => {
-    if (!pendingUnpack) return;
-    const { itemId, newPacked } = pendingUnpack;
-
-    try {
-      setLoadingItemId(pendingUnpack.itemId);
-      await orderApi.updateItem(itemId, { packed_quantity: newPacked });
-
-      if (status === "PACKED" && orderId) {
-        await orderApi.update(orderId, { status: "PENDING" });
-        toastSuccess("Order status changed to PENDING");
-      }
-
-      setOrderItems((prev) =>
-        prev?.map((item) =>
-          item.id === itemId ? { ...item, packed_quantity: newPacked } : item,
-        ),
-      );
-      if (onPackedChange) onPackedChange();
-    } catch (err) {
-      console.error("Error updating packed status:", err);
-      toastError("Failed to update packed status");
-    } finally {
-      setLoadingItemId(null);
-      setShowUnpackDialog(false);
-      setPendingUnpack(null);
-    }
-  };
-
-  const togglePacked = async (
-    itemId: number,
-    currentPacked: number,
-    totalPieces: number,
-  ) => {
-    const newPacked = currentPacked >= totalPieces ? 0 : totalPieces;
-
-    if (status === "PACKED" && newPacked < currentPacked) {
-      setPendingUnpack({ itemId, newPacked });
-      setShowUnpackDialog(true);
-      return;
-    }
-
-    try {
-      const updatePromise = orderApi.updateItem(itemId, {
-        packed_quantity: newPacked,
-      });
-      const statusChanged = status === "PACKED" && orderId;
-      const statusPromise =
-        status === "PACKED" && orderId
-          ? orderApi.update(orderId, { status: "PENDING" })
-          : Promise.resolve();
-
-      setLoadingItemId(itemId);
-      await Promise.all([updatePromise, statusPromise]);
-
-      if (statusChanged) {
-        toastSuccess("Order status changed to PENDING");
-      }
-
-      setOrderItems((prev) =>
-        prev?.map((item) =>
-          item.id === itemId ? { ...item, packed_quantity: newPacked } : item,
-        ),
-      );
-      if (statusChanged && onPackedChange) onPackedChange();
-    } catch (err) {
-      console.error("Error updating packed status:", err);
-      toastError("Failed to update packed status");
-    } finally {
-      setLoadingItemId(null);
-    }
-  };
-
-  const onDelete = async (itemId: number, orderId?: number) => {
+  const onDelete = async (itemId: number) => {
     if (!orderId) return;
     try {
-      setLoading(true);
+      setDeleting(true);
       await orderApi.deleteItem(orderId, itemId);
       setOrderItems((prev) => prev?.filter((item) => item.id !== itemId));
-      if (onDeleteItem) onDeleteItem(itemId);
+      onDeleteItem?.(itemId);
     } catch (err) {
-      toastError("Failed to delete item", err);
+      toastError("Failed to remove fabric line", err);
     } finally {
-      setLoading(false);
+      setDeleting(false);
     }
   };
 
-  const handleEditItem = async (item: OrderItemType) => {
+  const handleEditItem = (item: OrderItemType) => {
     setEditingItem(item);
-    setEditQuantity(item.quantity);
-    setEditSizeGroup(item.size_group || "");
-    setEditPieceCount(item.piece_count || 1);
-    setEditPackedQty(item.packed_quantity || 0);
+    setEditMetres(item.ordered_quantity);
+    setEditVariantId(item.variant);
+    setMetresError(null);
     setShowEditDialog(true);
-    setSizeGroupError(null);
-    setQuantityError(null);
-    setVariantsLoading(true);
-
-    try {
-      const variants = await itemApi.getAllVariants();
-
-      const variantId = item.variant;
-      const variant = variants.find((v) => v.id === variantId);
-      const itemType = item.item_type as ItemType | undefined;
-      if (variant && itemType) {
-        const validItemType =
-          itemType === "kids" || itemType === "gents" ? itemType : "gents";
-        const availableGroups = getAvailableSizeGroups(
-          variant.sizes || [],
-          validItemType,
-        );
-        setSizeGroupOptions(availableGroups);
-        setVariantSizes(variant.sizes || []);
-
-        const pieceCount = getPiecesForGroup(item.size_group || "");
-        setEditPieceCount(pieceCount > 0 ? pieceCount : item.piece_count || 1);
-
-        if (availableGroups.length === 0) {
-          setSizeGroupError("No sizes available for this variant");
-        } else if (!availableGroups.includes(item.size_group || "")) {
-          setSizeGroupError("Current size group is no longer available");
-        }
-      }
-    } catch (err) {
-      console.error("Error fetching variants:", err);
-    } finally {
-      setVariantsLoading(false);
-    }
   };
 
   const saveEditItem = async () => {
-    if (!editingItem || !orderId) return;
-    if (editQuantity < 1) {
-      toastError("Quantity must be at least 1");
+    if (!editingItem) return;
+
+    const metres = toMeters(editMetres);
+    if (metres <= 0) {
+      setMetresError("Enter how many metres are needed.");
       return;
     }
-    if (!editSizeGroup) {
-      toastError("Please select a size group");
-      return;
-    }
-
-    const reservedItems =
-      orderItems
-        ?.filter(
-          (orderItem) =>
-            orderItem.item == editingItem.item &&
-            orderItem.variant == editingItem.variant &&
-            orderItem.id != editingItem.id,
-        )
-        .map((item) => ({
-          size_group: item.size_group || "",
-          quantity: item.quantity,
-        })) || [];
-
-    const maxAvailable = getAvailableStockForSizeGroup(
-      variantSizes,
-      editSizeGroup,
-      reservedItems,
-    );
-    if (editQuantity > maxAvailable) {
-      setQuantityError(
-        `Only ${maxAvailable} sets available for this size group`,
+    // The API refuses to shrink a line below what packing has already committed,
+    // so surface that here rather than making the admin guess.
+    const alreadyPacked = toMeters(editingItem.allocated_quantity);
+    if (metres < alreadyPacked) {
+      setMetresError(
+        `${formatMeters(alreadyPacked)} m of this fabric is already packed. Cancel the packing round first.`,
       );
       return;
     }
 
     try {
-      setLoading(true);
-      const newPackedQty = Math.min(
-        editPackedQty,
-        editQuantity * editPieceCount,
-      );
+      setSaving(true);
       await orderApi.updateItem(editingItem.id, {
-        quantity: editQuantity,
-        size_group: editSizeGroup,
-        packed_quantity: newPackedQty,
+        ordered_quantity: editMetres,
+        variant: editVariantId,
       });
       setOrderItems((prev) =>
         prev?.map((item) =>
           item.id === editingItem.id
             ? {
                 ...item,
-                quantity: editQuantity,
-                size_group: editSizeGroup,
-                packed_quantity: newPackedQty,
-                piece_count: editPieceCount,
+                // Both fields can change, so keep the local copy in step or the
+                // row shows the old colour until the next refetch.
+                ordered_quantity: editMetres,
+                variant: editVariantId ?? item.variant,
+                allocated_quantity:
+                  toMeters(editMetres) < toMeters(item.allocated_quantity)
+                    ? editMetres
+                    : item.allocated_quantity,
               }
             : item,
         ),
       );
-      toastSuccess("Item updated successfully");
-    } catch (err: any) {
-      console.error("Error updating item:", err);
-      toastError(
-        (err as { response?: { data?: { error?: string } } })?.response?.data
-          ?.error || "Failed to update item",
-      );
-    } finally {
-      setLoading(false);
+      toastSuccess("Fabric line updated");
       setShowEditDialog(false);
       setEditingItem(null);
+      onAllocationChange?.();
+    } catch (err) {
+      // Keep the dialog open with the typed values so the admin can correct
+      // them instead of retyping the whole line.
+      toastError("Failed to update fabric line", err);
+    } finally {
+      setSaving(false);
     }
   };
 
-  if (loading) return <PageLoading />;
+  if (!items) return <PageLoading />;
+
+  const visibleItems = sortOrderItemsUnpackedFirst(
+    orderItems?.filter((item) => (onlyFullyPacked ? isOrderItemFullyPacked(item) : true)) ??
+      [],
+  );
 
   return (
     <>
       <div className="pt-0 space-y-1">
-        {sortOrderItemsUnpackedFirst(
-          orderItems?.filter((item) => {
-            if (!isDispatching) return true;
-            return isOrderItemFullyPacked(item);
-          }) ?? [],
-        ).map((item) => {
-          const totalPieces = (item.piece_count || 1) * item.quantity;
-          const isFullyPacked = (item.packed_quantity ?? 0) >= totalPieces;
+        {visibleItems.map((item) => {
+          const stillOwed = outstandingMeters(item);
 
           return (
             <OrderItemRow
@@ -293,72 +151,31 @@ const OrderItem: React.FC<Props> = ({
               item={item}
               showDelete={isDeletable}
               showEdit={isEditable}
-              showPackedToggle={isPacking}
-              isLoading={loadingItemId === item.id}
-              isPacked={isFullyPacked}
-              isOutOfStock={outOfStockItemIds.includes(item.id)}
-              onDelete={(deleteItemID) => onDelete(deleteItemID, orderId)}
+              isPacked={stillOwed === 0}
+              isOutOfStock={outstandingItemIds.includes(item.id)}
+              onDelete={(deleteItemId) => onDelete(deleteItemId)}
               onEdit={isEditable ? handleEditItem : undefined}
-              onTogglePacked={(id, packed) => {
-                void packed;
-                togglePacked(id, item.packed_quantity ?? 0, totalPieces);
-              }}
             />
           );
         })}
       </div>
 
-      {showUnpackDialog && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
-            <h3 className="text-lg font-bold text-gray-900 mb-2">
-              Unpack Items?
-            </h3>
-            <p className="text-sm text-gray-500 mb-6">
-              Order is currently marked as packed. Unpacking items will change
-              the order status back to PENDING. Continue?
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={() => {
-                  setShowUnpackDialog(false);
-                  setPendingUnpack(null);
-                }}
-                className="flex-1 py-3 px-4 rounded-xl border border-gray-200 text-gray-700 font-medium hover:bg-gray-50 transition-colors"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleTogglePacked}
-                className="flex-1 py-3 px-4 rounded-xl bg-primary text-white font-medium hover:bg-primary/90 transition-colors"
-              >
-                Unpack
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
       {showEditDialog && editingItem && (
         <OrderItemEditModal
-          editingItem={editingItem}
-          editQuantity={editQuantity}
-          editSizeGroup={editSizeGroup}
-          editPieceCount={editPieceCount}
-          variantsLoading={variantsLoading}
-          sizeGroupOptions={sizeGroupOptions}
-          variantSizes={variantSizes}
-          sizeGroupError={sizeGroupError}
-          quantityError={quantityError}
-          orderItems={orderItems}
-          setEditSizeGroup={setEditSizeGroup}
-          setEditQuantity={setEditQuantity}
-          setEditPieceCount={setEditPieceCount}
-          setSizeGroupError={setSizeGroupError}
-          setQuantityError={setQuantityError}
-          setShowEditDialog={setShowEditDialog}
-          setEditingItem={setEditingItem}
-          saveEditItem={saveEditItem}
+          item={editingItem}
+          metres={editMetres}
+          variantId={editVariantId}
+          metresError={metresError}
+          setMetres={setEditMetres}
+          setVariantId={setEditVariantId}
+          setMetresError={setMetresError}
+          saving={saving}
+          onClose={() => {
+            if (saving) return;
+            setShowEditDialog(false);
+            setEditingItem(null);
+          }}
+          onSave={saveEditItem}
         />
       )}
     </>

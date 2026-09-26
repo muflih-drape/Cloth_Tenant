@@ -2,60 +2,37 @@
 
 import { ImagePlus, Pencil, Trash2 } from "lucide-react";
 import type { ColorVariant } from "@/types/item";
+import { formatMeters } from "@/types/item";
 import { ImagePreview } from "@/components/pages/ImagePreview";
 
 interface Props {
   variant: ColorVariant;
-  index: number; // 1-based
+  index: number; // 0-based
   onEdit: () => void;
   onDelete: () => void;
   isOnly: boolean;
 }
 
-export default function ColorCard({
-  variant,
-  index,
-  onEdit,
-  onDelete,
-  isOnly,
-}: Props) {
-  const sizeList = variant.sizeRange;
-
+export default function ColorCard({ variant, index, onEdit, onDelete, isOnly }: Props) {
   return (
     <div className="flex items-center gap-3 bg-white border border-gray-100 rounded-2xl px-4 py-3 shadow-sm">
-      {/* Thumbnail */}
       <div className="flex-shrink-0 w-14 h-14 rounded-xl overflow-hidden bg-gray-100 flex items-center justify-center">
         {variant.imagePreview ? (
-          <ImagePreview src={variant.imagePreview} alt={`Variant ${index}`} />
+          <ImagePreview src={variant.imagePreview} alt={`Colour ${index + 1}`} />
         ) : (
           <ImagePlus size={18} className="text-gray-300" />
         )}
       </div>
 
-      {/* Details */}
       <div className="flex-1 min-w-0">
-        <p className="font-semibold text-sm">Variant #{index + 1}</p>
-        {Object.keys(variant.perSizeStock!).length > 0 ? (
-          // Kids: show selected sizes and their individual stock
-          <p className="text-[11px] text-gray-400 mt-0.5 truncate">
-            {Object.entries(variant.perSizeStock!)
-              .map(([size, stock]) => `${size}: ${stock} pcs`)
-              .join(" | ")}
-          </p>
-        ) : (
-          // Gents: show size range + uniform stock
-          <>
-            <p className="text-[11px] text-gray-400 mt-0.5 truncate">
-              {variant.sizeRange}
-            </p>
-            <p className="text-[11px] text-gray-400">
-              {variant.stock} per size
-            </p>
-          </>
-        )}
+        <p className="font-semibold text-sm truncate">
+          {variant.displayOrder || `Colour #${index + 1}`}
+        </p>
+        <p className="text-[11px] text-gray-400 mt-0.5">
+          {formatMeters(variant.stockMeters)} m in stock
+        </p>
       </div>
 
-      {/* Actions */}
       <div className="flex items-center gap-1 flex-shrink-0">
         <button
           type="button"

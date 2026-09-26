@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useMemo, useCallback, useEffect } from "react";
-import { Item } from "@/types/item";
+import { Fabric, formatMeters } from "@/types/item";
 import { ImagePreview } from "@/components/pages/ImagePreview";
 import { toastSuccess, toastError } from "@/lib/toast";
 import { Package, Scan, Download, ScanLine } from "lucide-react";
@@ -15,13 +15,13 @@ type ScanMode = "add" | "remove";
 
 interface VariantDisplay {
   variantId: number;
-  itemId: number;
-  itemName: string;
-  itemType?: string;
-  itemPrice: string;
+  fabricId: number;
+  fabricName: string;
+  pricePerMeter: string;
   image: string | null;
   qrCode: string | null;
-  sizes: { size: string; stock: number }[];
+  colour: string;
+  stockMeters: string;
   createdAt: string | null;
   isUnsaved: boolean;
   isPendingRemoval: boolean;
@@ -30,7 +30,7 @@ interface VariantDisplay {
 interface ItemAssignmentProps {
   agentId: number;
   agentName: string;
-  items: Item[];
+  items: Fabric[];
   selectedVariantIds: number[];
   savedVariantIds: number[];
   variantCreatedAt: Map<number, string>;
@@ -109,16 +109,13 @@ export default function ItemAssignment({
         const createdAt = variantCreatedAt.get(variant.id) ?? null;
         result.push({
           variantId: variant.id,
-          itemId: item.id,
-          itemName: item.name,
-          itemType: item.type,
-          itemPrice: item.price,
+          fabricId: item.id,
+          fabricName: item.name,
+          pricePerMeter: item.price_per_meter,
           image: variant.image ?? null,
           qrCode: variant.qr_code ?? null,
-          sizes: (variant.sizes || []).map((s) => ({
-            size: s.size!,
-            stock: s.stock,
-          })),
+          colour: variant.display_order ?? "",
+          stockMeters: variant.stock_meters,
           createdAt,
           isUnsaved:
             !savedVariantIds.includes(variant.id) &&
@@ -184,15 +181,15 @@ export default function ItemAssignment({
       if (activeTab === "Assigned") {
         const getSortKey = (name: string) => name.split("-")[0];
 
-        const nameCompare = getSortKey(a.itemName).localeCompare(
-          getSortKey(b.itemName),
+        const nameCompare = getSortKey(a.fabricName).localeCompare(
+          getSortKey(b.fabricName),
           undefined,
           { numeric: true, sensitivity: "base" },
         );
         if (nameCompare !== 0) return nameCompare;
 
         // Same sort key → fall back to full name, then createdAt
-        const fullNameCompare = a.itemName.localeCompare(b.itemName, undefined, {
+        const fullNameCompare = a.fabricName.localeCompare(b.fabricName, undefined, {
           numeric: true,
           sensitivity: "base",
         });
@@ -228,9 +225,9 @@ export default function ItemAssignment({
       }
       if (!selectedVariantIds.includes(variant.variantId)) {
         onToggleVariant(variant.variantId);
-        toastSuccess(`${variant.itemName} added`);
+        toastSuccess(`${variant.fabricName} added`);
       } else {
-        toastSuccess(`${variant.itemName} already selected`);
+        toastSuccess(`${variant.fabricName} already selected`);
       }
     } else {
       if (!variant) {
@@ -238,7 +235,7 @@ export default function ItemAssignment({
         return;
       }
       if (!selectedVariantIds.includes(variant.variantId)) {
-        toastError(`${variant.itemName} is not assigned to this agent`);
+        toastError(`${variant.fabricName} is not assigned to this agent`);
         return;
       }
       // Toggle immediately and mark red until Save is clicked
@@ -257,12 +254,12 @@ export default function ItemAssignment({
             const imageDataUrl = v.image ? await urlToDataUrl(v.image) : null;
             return {
               variantId: v.variantId,
-              itemName: v.itemName,
-              itemType: v.itemType,
-              itemPrice: v.itemPrice,
+              fabricName: v.fabricName,
+              pricePerMeter: v.pricePerMeter,
               imageDataUrl,
               qrCode: v.qrCode,
-              sizes: v.sizes,
+              colour: v.colour,
+              stockMeters: v.stockMeters,
             };
           }),
       );
@@ -400,7 +397,7 @@ export default function ItemAssignment({
               >
                 <div className="w-10 h-10 rounded-md shrink-0 overflow-hidden ring-1 ring-gray-100">
                   {variant.image ? (
-                    <ImagePreview src={variant.image} alt={variant.itemName} />
+                    <ImagePreview src={variant.image} alt={variant.fabricName} />
                   ) : (
                     <div className="w-full h-full bg-gray-100 flex items-center justify-center">
                       <Package size={16} className="text-gray-300" />
@@ -410,7 +407,7 @@ export default function ItemAssignment({
                 <div className="flex-1 min-w-0">
                   <div className="flex items-center gap-1.5">
                     <p className="font-bold text-gray-900 text-sm truncate">
-                      {variant.itemName}
+                      {variant.fabricName}
                     </p>
                     {variant.isPendingRemoval && (
                       <span className="shrink-0 text-[10px] font-bold text-red-600 bg-red-100 px-1.5 py-0.5 rounded leading-none">
@@ -424,21 +421,14 @@ export default function ItemAssignment({
                     )}
                   </div>
                   <p className="text-xs text-gray-400 truncate">
-                    Rs. {variant.itemPrice}
-                    {variant.itemType && ` · ${variant.itemType}`}
+                    Rs. {variant.pricePerMeter}/m
+                    {variant.colour && ` · ${variant.colour}`}
                   </p>
-                  {variant.sizes.length > 0 && (
-                    <div className="flex flex-wrap gap-1 mt-1">
-                      {variant.sizes.map((s) => (
-                        <span
-                          key={s.size}
-                          className="text-[10px] font-bold text-gray-500 bg-gray-50 px-1.5 py-0.5 rounded"
-                        >
-                          {s.size}:{s.stock}
-                        </span>
-                      ))}
-                    </div>
-                  )}
+                  <div className="flex flex-wrap gap-1 mt-1">
+                    <span className="text-[10px] font-bold text-gray-500 bg-gray-50 px-1.5 py-0.5 rounded">
+                      {formatMeters(variant.stockMeters)} m in stock
+                    </span>
+                  </div>
                 </div>
               </div>
             ))}
@@ -446,8 +436,8 @@ export default function ItemAssignment({
         ) : (
           <p className="text-center text-gray-400 py-8 text-sm">
             {activeTab === "Recent"
-              ? "No recently added variants"
-              : "No assigned variants"}
+              ? "No recently added colours"
+              : "No assigned colours"}
           </p>
         )}
       </div>

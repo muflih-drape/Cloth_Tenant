@@ -1,17 +1,23 @@
 import type { OrderItem } from "@/types/order";
+import { toMeters } from "@/types/item";
 
 /**
- * Whether an order item has been packed in full. Items whose `packed_quantity`
- * is below `piece_count * quantity` (including zero) are not fully packed.
+ * Whether packing has satisfied this line in full. A line still owed metres is
+ * unfinished work, and the packing board should show it first.
  */
 export function isOrderItemFullyPacked(item: OrderItem): boolean {
-  const totalPieces = (item.piece_count || 1) * item.quantity;
-  return (item.packed_quantity ?? 0) >= totalPieces;
+  return toMeters(item.allocated_quantity) >= toMeters(item.ordered_quantity);
+}
+
+/** Metres of this line that packing has not yet handed over. */
+export function outstandingMeters(item: OrderItem): number {
+  const gap = toMeters(item.ordered_quantity) - toMeters(item.allocated_quantity);
+  return gap > 0 ? gap : 0;
 }
 
 /**
- * Returns a new array with not-fully-packed items first and fully packed items
- * last. Stable: items inside each group keep their original relative order.
+ * Returns a new array with unfulfilled lines first and settled ones last.
+ * Stable: lines inside each group keep their original relative order.
  * Never mutates `items`.
  */
 export function sortOrderItemsUnpackedFirst(items: OrderItem[]): OrderItem[] {

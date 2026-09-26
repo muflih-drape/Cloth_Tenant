@@ -9,8 +9,10 @@ import {
 } from "lucide-react";
 import { ImagePreview } from "@/components/pages/ImagePreview";
 import { OrderItem } from "@/types/order";
+import { formatMeters, toMeters } from "@/types/item";
 import { orderItemColorSuffix } from "@/lib/colorLabel";
 import { Spinner } from "../ui/spinner";
+import { outstandingMeters } from "@/lib/utils/orderItemSort";
 
 // ─── Delete Confirmation Dialog ───────────────────────────────────────────────
 interface DeleteConfirmDialogProps {
@@ -53,7 +55,7 @@ function DeleteConfirmDialog({
             </div>
             <div>
               <h2 className="text-base font-bold text-gray-900 leading-tight">
-                Remove item?
+                Remove this fabric?
               </h2>
               <p className="text-sm text-gray-500 mt-0.5">
                 This action cannot be undone.
@@ -61,13 +63,13 @@ function DeleteConfirmDialog({
             </div>
           </div>
 
-          {/* Item preview card */}
+          {/* Line preview */}
           <div className="flex items-center gap-3 bg-gray-50 rounded-xl px-3 py-2.5 mb-6 border border-gray-100">
             <div className="relative w-10 h-10 rounded-lg overflow-hidden flex-shrink-0 border border-gray-200 bg-gray-100">
               {item.variant_image ? (
                 <ImagePreview
                   src={item.variant_image}
-                  alt={item.item_name || "Item"}
+                  alt={item.fabric_name}
                 />
               ) : (
                 <div className="w-full h-full bg-gray-200" />
@@ -75,19 +77,14 @@ function DeleteConfirmDialog({
             </div>
             <div className="flex-1 min-w-0">
               <p className="text-sm font-semibold text-gray-800 truncate">
-                {item.item_name || "Unknown Item"}
+                {item.fabric_name}
               </p>
               <p className="text-xs text-gray-400">
-                Size: {item.size_group || "N/A"}
+                {item.variant_display_order || "No colour"}
               </p>
             </div>
             <span className="text-sm font-bold text-gray-900 flex-shrink-0">
-              ₹
-              {(
-                (Number(item.item_price) || 0) *
-                (item.quantity || 1) *
-                (item.piece_count || 1)
-              ).toLocaleString("en-IN")}
+              ₹{Number(item.line_total || 0).toLocaleString("en-IN")}
             </span>
           </div>
 
@@ -153,9 +150,9 @@ export default function OrderItemRow({
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
 
-  const pieceCount = item.piece_count || 1;
-  const quantity = item.quantity;
-  const totalPieces = quantity * pieceCount;
+  const ordered = toMeters(item.ordered_quantity);
+  const allocated = toMeters(item.allocated_quantity);
+  const outstanding = outstandingMeters(item);
 
   const handleDeleteConfirm = async () => {
     if (!onDelete) return;
@@ -219,10 +216,7 @@ export default function OrderItemRow({
 
         <div className="relative w-12 h-12 rounded-lg overflow-hidden flex-shrink-0 border border-gray-100 bg-gray-50">
           {item.variant_image ? (
-            <ImagePreview
-              src={item.variant_image}
-              alt={item.item_name || "Item"}
-            />
+            <ImagePreview src={item.variant_image} alt={item.fabric_name} />
           ) : (
             <div className="w-full h-full bg-gray-100" />
           )}
@@ -238,11 +232,9 @@ export default function OrderItemRow({
                   : "text-gray-900"
             }`}
           >
-            {item.item_name || "Unknown Item"}{orderItemColorSuffix(item.variant_display_order)}
+            {item.fabric_name}
+            {orderItemColorSuffix(item.variant_display_order)}
           </h6>
-          <p className="text-[10px] text-gray-400 mt-0.5">
-            Size: {item.size_group || "N/A"}
-          </p>
           <p
             className={`text-xs font-medium mt-1 ${
               isPacked
@@ -252,31 +244,28 @@ export default function OrderItemRow({
                   : "text-gray-600"
             }`}
           >
-            {quantity} Set{quantity !== 1 ? "s" : ""} × {pieceCount} pcs ={" "}
-            <span
-              className={`font-bold ${isOutOfStock ? "text-red-700" : "text-gray-900"}`}
-            >
-              {totalPieces}
-            </span>{" "}
-            pcs
+            {formatMeters(ordered)} m ordered
+            {outstanding > 0 ? (
+              <>
+                {" · "}
+                <span className="font-bold text-amber-600">
+                  {formatMeters(outstanding)} m awaiting packing
+                </span>
+              </>
+            ) : (
+              <span className="text-green-600"> · fully packed</span>
+            )}
+          </p>
+          <p className="text-[10px] text-gray-400 mt-0.5">
+            ₹{Number(item.rate_per_meter || 0).toLocaleString("en-IN")}/m
           </p>
         </div>
 
         <div className="text-right flex-shrink-0">
-          <div
-            className={`text-xs font-black ${isOutOfStock ? "text-red-700" : "text-gray-900"}`}
-          >
-            ₹{(Number(item.item_price) || 0).toLocaleString("en-IN")}
-          </div>
           <span
             className={`text-base font-black ${isOutOfStock ? "text-red-700" : "text-gray-900"}`}
           >
-            ₹
-            {(
-              (Number(item.item_price) || 0) *
-              quantity *
-              pieceCount
-            ).toLocaleString("en-IN")}
+            ₹{Number(item.line_total || 0).toLocaleString("en-IN")}
           </span>
         </div>
       </div>

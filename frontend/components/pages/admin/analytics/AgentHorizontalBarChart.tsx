@@ -10,6 +10,7 @@ import {
   CartesianGrid,
 } from "recharts";
 import type { TopAgentsEntry } from "@/types/dashboard";
+import { toMeters } from "@/types/item";
 
 interface AgentHorizontalBarChartProps {
   agents: TopAgentsEntry[];
@@ -31,8 +32,11 @@ export default function AgentHorizontalBarChart({
     );
   }
 
+  // The API ranks agents by metres allocated, so plot metres rather than
+  // order count — otherwise the ordering carries no meaning.
   const data = [...agents].reverse().map((agent) => ({
     name: agent.username,
+    metres: toMeters(agent.metres),
     orders: agent.count,
   }));
 
@@ -57,10 +61,18 @@ export default function AgentHorizontalBarChart({
             axisLine={false}
           />
           <Tooltip
-            formatter={(value) => [`${Number(value)} orders`, "Orders"]}
+            formatter={(value, _name, entry) => {
+              const orders = (entry?.payload as { orders?: number })?.orders;
+              return [
+                `${Number(value).toLocaleString("en-IN")} m${
+                  orders ? ` · ${orders} orders` : ""
+                }`,
+                "Metres",
+              ];
+            }}
           />
           <Bar
-            dataKey="orders"
+            dataKey="metres"
             fill="#3b82f6"
             radius={[0, 4, 4, 0]}
             barSize={16}

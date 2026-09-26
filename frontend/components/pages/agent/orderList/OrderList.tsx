@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 import { orderApi } from "@/lib/api/order";
 import { toastError } from "@/lib/toast";
 import { OrderAllResponse } from "@/types/order";
+import { outstandingMeters } from "@/lib/utils/orderItemSort";
 import { PageLoading } from "@/components/ui/Loading";
 import { useRouter } from "next/navigation";
 import OrderCard from "@/components/pages/agent/order/OrderCard";
@@ -16,7 +17,7 @@ import Pagination from "@/components/ui/Pagination";
 import useSessionStorage from "@/hooks/useSessionStorage";
 import { PaginatedResponse } from "@/types/global";
 
-type ItemTypeTab = "all" | "gents" | "kids";
+type PackingTab = "all" | "awaiting" | "ready";
 
 interface AgentOrderListProps {
   pageOrderStatus?: "PROCESSING" | "COMPLETED";
@@ -45,8 +46,8 @@ export default function AgentOrderList({
   const [debouncedSearch, setDebouncedSearch] = useState(search);
   const [loading, setLoading] = useState(true);
   const [isFetching, setIsFetching] = useState(false);
-  const [activeTab, setActiveTab] = useSessionStorage<ItemTypeTab>(
-    "agent_itemTypeTab",
+  const [activeTab, setActiveTab] = useSessionStorage<PackingTab>(
+    "agent_packingTab",
     "all",
   );
 
@@ -107,12 +108,17 @@ export default function AgentOrderList({
     );
 
   // Client-side filter by active tab — same logic as Home page
+  // Cloth moves through the warehouse before it ships, so the useful split is
+  // "is any metre still waiting to be packed" rather than a product category.
   const filteredData =
     activeTab === "all"
       ? sortedData
-      : sortedData.filter((order) =>
-          order.items.some((item) => item.item_type === activeTab),
-        );
+      : sortedData.filter((order) => {
+          const awaiting = order.items.some(
+            (item) => outstandingMeters(item) > 0,
+          );
+          return activeTab === "awaiting" ? awaiting : !awaiting;
+        });
 
   const order_len = filteredData.length;
 
@@ -133,7 +139,7 @@ export default function AgentOrderList({
     }
   };
 
-  const handleTabChange = (tab: ItemTypeTab) => {
+  const handleTabChange = (tab: PackingTab) => {
     setActiveTab(tab);
     sessionStorage.removeItem("agent_scrollY");
     window.scrollTo({ top: 0, behavior: "smooth" });
@@ -235,11 +241,11 @@ export default function AgentOrderList({
         onClear={handleClearFilters}
         tabs={[
           { value: "all", label: "All" },
-          { value: "gents", label: "Gents" },
-          { value: "kids", label: "Kids" },
+          { value: "awaiting", label: "Awaiting Packing" },
+          { value: "ready", label: "Fully Packed" },
         ]}
         activeTab={activeTab}
-        onTabChange={(tab) => handleTabChange(tab as ItemTypeTab)}
+        onTabChange={(tab) => handleTabChange(tab as PackingTab)}
       />
 
       {order_len === 0 ? (

@@ -14,7 +14,7 @@ interface Variant {
 }
 interface Item {
   name: string;
-  price: string | number;
+  price_per_meter: string | number;
   variants: Variant[];
 }
 interface QRLabelPdfProps {
@@ -66,7 +66,9 @@ export const QRLabelPdf = ({ item, qrImages, id }: QRLabelPdfProps) => (
             {/* eslint-disable-next-line*/}
             <Image src={qrImages[variant.id]} style={styles.qr} />
           </View>
-          <Text style={styles.price}>Rs. {Number(item.price).toFixed(2)}</Text>
+          <Text style={styles.price}>
+            Rs. {Number(item.price_per_meter).toFixed(2)}/m
+          </Text>
         </Page>
       );
     })}

@@ -10,18 +10,16 @@ class UserAdmin(BaseUserAdmin):
         "username",
         "email",
         "role",
-        "business",
-        "brand",
+        "display_name",
         "is_staff",
         "is_active",
     )
-    list_filter = ("role", "business", "brand", "is_staff", "is_active")
-    search_fields = ("username", "email")
+    list_filter = ("role", "is_staff", "is_active")
+    search_fields = ("username", "email", "display_name")
 
     fieldsets = (
         (None, {"fields": ("username", "password")}),
-        ("Personal info", {"fields": ("first_name", "last_name", "email")}),
-        ("Business", {"fields": ("business", "brand")}),
+        ("Personal info", {"fields": ("first_name", "last_name", "email", "display_name")}),
         (
             "Permissions",
             {
@@ -38,7 +36,7 @@ class UserAdmin(BaseUserAdmin):
         ("Important dates", {"fields": ("last_login", "date_joined")}),
     )
 
-    item_fieldsets = (
+    add_fieldsets = (
         (
             None,
             {
@@ -49,8 +47,6 @@ class UserAdmin(BaseUserAdmin):
                     "password1",
                     "password2",
                     "role",
-                    "business",
-                    "brand",
                 ),
             },
         ),

@@ -1,8 +1,7 @@
 "use client";
 
-import { orderApi } from "@/lib/api/order";
+import { orderApi, InvoiceResponse } from "@/lib/api/order";
 import { toastError } from "@/lib/toast";
-import { InvoiceResponse } from "@/types/order";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { pdf } from "@react-pdf/renderer";
@@ -311,10 +310,9 @@ export default function InvoicePage() {
                             brand={invoice.brand}
                             created_at={invoice.created_at}
                             items={invoice.items}
-                            gst_rate={invoice.gst_rate}
-                            total_price={invoice.total_price}
+                            totals={invoice.totals}
+                            lr_number={invoice.lr_number}
                             invoiceRef={invoiceRef}
-                            status={invoice.status}
                         />
                     </div>
                 ) : pdfGenerating ? (

@@ -4,39 +4,29 @@ from io import BytesIO
 
 from django.conf import settings
 from django.core.files.base import ContentFile
+from django.db.models import Sum
 from django.utils import timezone
 from PIL import Image
 from rest_framework import serializers
 
-from apps.business.models import Brand
-from apps.orders.utils import SIZE_MAPPING
-
-from .models import Item, ItemVariant, ItemVariantSize
-from .services import touch_catalog
-
-KIDS_SIZES = set()
-for sizes in SIZE_MAPPING.get("kids", {}).values():
-    KIDS_SIZES.update(sizes)
-KIDS_SIZES = list(KIDS_SIZES)
-
-GENTS_SIZES = set()
-for sizes in SIZE_MAPPING.get("gents", {}).values():
-    GENTS_SIZES.update(sizes)
-GENTS_SIZES = list(GENTS_SIZES)
+from .models import Fabric, FabricVariant
+from .services import sync_out_of_stock, touch_catalog
 
 
-class ItemVariantSizeSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = ItemVariantSize
-        fields = ["id", "size", "stock"]
-
-
-class ItemVariantSerializer(serializers.ModelSerializer):
-    sizes = ItemVariantSizeSerializer(many=True, read_only=True)
+class FabricVariantSerializer(serializers.ModelSerializer):
+    """One colour/finish of a fabric: its own QR label, image and metre stock."""
 
     class Meta:
-        model = ItemVariant
-        fields = ["id", "qr_code", "image", "sizes", "display_order"]
+        model = FabricVariant
+        fields = [
+            "id",
+            "qr_code",
+            "image",
+            "display_order",
+            "stock_meters",
+            "stock_updated_at",
+        ]
+        read_only_fields = ["qr_code", "stock_updated_at"]
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -46,52 +36,51 @@ class ItemVariantSerializer(serializers.ModelSerializer):
         return data
 
     def create(self, validated_data):
-        sizes_data = validated_data.pop("sizes", [])
-        variant = ItemVariant.objects.create(**validated_data)
-        for size_data in sizes_data:
-            ItemVariantSize.objects.create(item_variant=variant, **size_data)
-
-        if variant.item_id:
-            touch_catalog(variant.item)
+        variant = FabricVariant.objects.create(**validated_data)
+        touch_catalog(variant.fabric)
+        sync_out_of_stock(variant.fabric)
         return variant
 
     def update(self, instance, validated_data):
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
         instance.save()
-
-        if instance.item_id:
-            touch_catalog(instance.item)
+        touch_catalog(instance.fabric)
         return instance
 
 
-class ItemSerializer(serializers.ModelSerializer):
-    variants = ItemVariantSerializer(many=True, read_only=True)
-    brand_id = serializers.IntegerField(source="brand.id", read_only=True)
-    brand_name = serializers.CharField(source="brand.name", read_only=True)
+class FabricSerializer(serializers.ModelSerializer):
+    """A cloth quality, priced per metre, with its colour variants."""
+
+    variants = FabricVariantSerializer(many=True, read_only=True)
+    total_stock_meters = serializers.SerializerMethodField()
     purge_on = serializers.SerializerMethodField()
     days_until_purge = serializers.SerializerMethodField()
 
     class Meta:
-        model = Item
+        model = Fabric
         fields = [
             "id",
             "name",
-            "type",
-            "price",
             "description",
-            "brand_id",
-            "brand_name",
+            "price_per_meter",
             "variants",
+            "total_stock_meters",
             "out_of_stock_since",
             "purge_on",
             "days_until_purge",
         ]
 
+    def get_total_stock_meters(self, obj):
+        total = obj.variants.aggregate(total=Sum("stock_meters"))["total"]
+        return str(total or 0)
+
     def _purge_date(self, obj):
         if not obj.out_of_stock_since:
             return None
-        total = settings.ARCHIVE_AFTER_DAYS + settings.ARCHIVED_ITEM_RETENTION_DAYS
+        total = (
+            settings.ARCHIVE_AFTER_DAYS + settings.ARCHIVED_FABRIC_RETENTION_DAYS
+        )
         return timezone.localdate(obj.out_of_stock_since + timedelta(days=total))
 
     def get_purge_on(self, obj):
@@ -105,104 +94,66 @@ class ItemSerializer(serializers.ModelSerializer):
         return max((purge - timezone.localdate()).days, 0)
 
 
-class ItemVariantSizeRequestSerializer(serializers.Serializer):
-    size = serializers.CharField()
-    stock = serializers.IntegerField(required=False, default=0)
-
-
-class ItemVariantRequestSerializer(serializers.Serializer):
+class FabricVariantRequestSerializer(serializers.Serializer):
     id = serializers.IntegerField(required=False)
     image = serializers.FileField(required=False)
-    remove_image = serializers.BooleanField(required=False, default=False)  # ← new
-    sizes = ItemVariantSizeRequestSerializer(many=True)
+    remove_image = serializers.BooleanField(required=False, default=False)
     display_order = serializers.CharField(
         max_length=100, required=False, allow_null=True, allow_blank=True
     )
+    stock_meters = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        required=False,
+        allow_null=True,
+        help_text="Opening stock in metres, for a new variant only.",
+    )
 
 
-class CreateItemSerializer(serializers.Serializer):
+class CreateFabricSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=100)
     description = serializers.CharField(required=False, default="")
-    price = serializers.DecimalField(max_digits=10, decimal_places=2)
-    type = serializers.ChoiceField(choices=Item.TYPE_CHOICES)
-    brand_id = serializers.IntegerField(required=False)
-    variants = ItemVariantRequestSerializer(many=True)
+    price_per_meter = serializers.DecimalField(max_digits=10, decimal_places=2)
+    variants = FabricVariantRequestSerializer(many=True)
+
+    def validate_price_per_meter(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Price per metre must be greater than zero.")
+        return value
 
     def validate_variants(self, variants):
-        item_type = self.initial_data.get("type")
-
+        seen = set()
         for variant in variants:
-            for size_data in variant.get("sizes", []):
-                size = size_data.get("size")
-                if not size:
+            if variant.get("id"):
+                if variant["id"] in seen:
                     raise serializers.ValidationError(
-                        "Size is required for each variant size"
+                        f"Variant {variant['id']} was sent twice."
                     )
-
-                if item_type == "kids" and size not in KIDS_SIZES:
-                    raise serializers.ValidationError(
-                        f"'{size}' is not a valid size for kids items"
-                    )
-                if item_type == "gents" and size not in GENTS_SIZES:
-                    raise serializers.ValidationError(
-                        f"'{size}' is not a valid size for gents items"
-                    )
-
+                seen.add(variant["id"])
         return variants
 
     def create(self, validated_data):
         variants_data = validated_data.pop("variants", [])
-        brand_id = validated_data.pop("brand_id", None)
-
-        request_user = self.context["request"].user
-
-        if request_user.is_superuser:
-            if not brand_id:
-                raise serializers.ValidationError("brand_id is required for superuser")
-
-            try:
-                brand = Brand.objects.get(id=brand_id)
-            except Brand.DoesNotExist:
-                raise serializers.ValidationError("Invalid brand_id")
-        else:
-            if not hasattr(request_user, "brand") or not request_user.brand:
-                raise serializers.ValidationError(
-                    "User has no brand assigned, please contact your superuser."
-                )
-
-            brand = request_user.brand
-
-        item = Item.objects.create(
-            name=validated_data["name"],
-            description=validated_data.get("description", ""),
-            price=validated_data["price"],
-            type=validated_data["type"],
-            brand=brand,
-        )
-
+        fabric = Fabric.objects.create(**validated_data)
         for variant_data in variants_data:
-            self._create_variant(item, variant_data)
+            self._create_variant(fabric, variant_data)
+        return fabric
 
-        return item
-
-    def _create_variant(self, item, variant_data):
+    def _create_variant(self, fabric, variant_data):
         image_file = variant_data.pop("image", None)
-        variant_data.pop("remove_image", None)  # ← ignore on create
+        variant_data.pop("remove_image", None)  # nothing to remove on create
+        stock = variant_data.pop("stock_meters", None) or 0
         display_order = variant_data.pop("display_order", None) or None
-        variant = ItemVariant.objects.create(
-            item=item, qr_code=uuid.uuid4(), display_order=display_order
-        )
 
+        variant = FabricVariant.objects.create(
+            fabric=fabric,
+            qr_code=uuid.uuid4(),
+            display_order=display_order,
+            stock_meters=stock,
+        )
         if image_file:
             self._save_variant_image(variant, image_file)
-
-        for size_data in variant_data.get("sizes", []):
-            ItemVariantSize.objects.create(
-                item_variant=variant,
-                size=size_data["size"],
-                stock=size_data.get("stock", 0),
-            )
-
+        sync_out_of_stock(fabric)
         return variant
 
     def _save_variant_image(self, variant, image_file):
@@ -234,100 +185,68 @@ class CreateItemSerializer(serializers.Serializer):
 
     def update(self, instance, validated_data):
         variants_data = validated_data.pop("variants", [])
-        request_user = self.context["request"].user
-        brand_id = self.initial_data.get("brand_id")
-
-        if request_user.is_superuser:
-            if brand_id:
-                from apps.business.models import (
-                    Brand,  # ← fixed import (was apps.brands)
-                )
-
-                instance.brand = Brand.objects.get(id=brand_id)
-        else:
-            if hasattr(request_user, "brand") and request_user.brand:
-                instance.brand = request_user.brand
 
         instance.name = validated_data.get("name", instance.name)
-        instance.description = validated_data.get("description", instance.description)
-        instance.price = validated_data.get("price", instance.price)
-        instance.type = validated_data.get("type", instance.type)
+        instance.description = validated_data.get(
+            "description", instance.description
+        )
+        instance.price_per_meter = validated_data.get(
+            "price_per_meter", instance.price_per_meter
+        )
         instance.save()
 
-        existing_variants = {v.id: v for v in instance.variants.all()}
+        existing = {v.id: v for v in instance.variants.all()}
 
         for variant_data in variants_data:
             variant_id = variant_data.get("id")
             remove_image = variant_data.get("remove_image", False)
 
-            if variant_id and variant_id in existing_variants:
-                variant = existing_variants.pop(variant_id)  # ← pop so it's not deleted
+            if variant_id and variant_id in existing:
+                variant = existing.pop(variant_id)
 
                 if "display_order" in variant_data:
                     variant.display_order = variant_data.get("display_order") or None
 
-                # Handle image removal
                 if remove_image and variant.image:
                     variant.image.delete(save=False)
                     variant.image = None
-                    variant.save()
 
-                # Handle new image upload
                 image_file = variant_data.get("image")
                 if image_file:
                     self._save_variant_image(variant, image_file)
                 variant.save()
-                self._update_sizes(variant, variant_data.get("sizes", []))
-
             else:
-                # No id → brand new variant being added from the edit page
                 self._create_variant(instance, dict(variant_data))
 
-        # Delete variants that were removed on the frontend
-        for variant in existing_variants.values():
+        for variant in existing.values():
             variant.delete()
 
         touch_catalog(instance)
-
         return instance
 
-    def _update_sizes(self, variant, sizes_data):
-        existing_sizes = {s.size: s for s in variant.sizes.all()}
 
-        for size_data in sizes_data:
-            size_name = size_data["size"]
-
-            if size_name in existing_sizes:
-                existing = existing_sizes[size_name]
-                new_stock = size_data.get("stock", existing.stock)
-                if existing.stock != new_stock:
-                    existing.stock = new_stock
-                    existing.stock_updated_at = timezone.now()
-                    existing.save()
-                del existing_sizes[size_name]
-            else:
-                ItemVariantSize.objects.create(
-                    item_variant=variant,
-                    size=size_name,
-                    stock=size_data.get("stock", 0),
-                    stock_updated_at=timezone.now(),
-                )
-
-        for size in existing_sizes.values():
-            size.delete()
-
-
-UpdateItemSerializer = CreateItemSerializer
+UpdateFabricSerializer = CreateFabricSerializer
 
 
 class CustomerRequirementSerializer(serializers.Serializer):
+    """One line of open packing demand, as shown on the admin packing board."""
+
+    order_id = serializers.IntegerField()
+    order_status = serializers.CharField(source="order.status")
     customer_name = serializers.CharField(source="order.customer.name")
-    variant_display_order = serializers.CharField(
-        source="variant.display_order", default=""
-    )
-    quantity = serializers.IntegerField()
-    size_group = serializers.CharField()
+    agent = serializers.SerializerMethodField()
+    fabric_name = serializers.CharField()
+    variant_display_order = serializers.CharField(default="")
+    ordered_quantity = serializers.DecimalField(max_digits=14, decimal_places=3)
+    allocated_quantity = serializers.DecimalField(max_digits=14, decimal_places=3)
+    outstanding_quantity = serializers.SerializerMethodField()
     variant_image = serializers.SerializerMethodField()
+
+    def get_agent(self, obj):
+        return obj.order.agent.user.username if obj.order.agent_id else None
+
+    def get_outstanding_quantity(self, obj):
+        return str(obj.outstanding_quantity)
 
     def get_variant_image(self, obj):
         request = self.context.get("request")

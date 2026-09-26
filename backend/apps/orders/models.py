@@ -1,13 +1,28 @@
+from decimal import Decimal
+
 from django.contrib.auth import get_user_model
 from django.db import models
 
 from apps.agents.models import Agent
 from apps.customers.models import Customer
-from apps.items.models import Item, ItemVariant
+from apps.items.models import Fabric, FabricVariant
 from transports.models import Transport
+
+User = get_user_model()
 
 
 class Order(models.Model):
+    """A cloth order placed by an agent (or an admin) for a customer.
+
+    Money is tracked in two fields on purpose:
+
+    * ``computed_total`` is always derived from the lines
+      (``SUM(ordered_quantity * rate_per_meter)``) and is never edited.
+    * ``final_total`` is what the customer is actually invoiced. It mirrors
+      ``computed_total`` until somebody overrides it, after which the override
+      plus its reason is preserved on the order and in the audit log.
+    """
+
     STATUS_CHOICES = (
         ("DRAFT", "Draft"),
         ("PENDING", "Pending"),
@@ -19,7 +34,7 @@ class Order(models.Model):
     customer = models.ForeignKey(Customer, on_delete=models.PROTECT)
     agent = models.ForeignKey(Agent, on_delete=models.PROTECT, null=True)
     created_by = models.ForeignKey(
-        get_user_model(),
+        User,
         on_delete=models.SET_NULL,
         null=True,
         blank=True,
@@ -27,6 +42,22 @@ class Order(models.Model):
     )
 
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="DRAFT")
+
+    computed_total = models.DecimalField(
+        max_digits=14, decimal_places=2, default=0
+    )
+    final_total = models.DecimalField(
+        max_digits=14, decimal_places=2, null=True, blank=True
+    )
+    price_override_reason = models.CharField(max_length=200, blank=True, default="")
+    price_overridden_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="priced_orders",
+    )
+    price_overridden_at = models.DateTimeField(null=True, blank=True)
 
     expected_delivery_date = models.DateField(null=True, blank=True)
     preferred_transport = models.ForeignKey(
@@ -45,18 +76,49 @@ class Order(models.Model):
     )
     lr_number = models.CharField(max_length=50, blank=True, default="")
 
-    reservation_snapshot = models.JSONField(default=list, blank=True)
+    # Set when an order ships short: a line could not be fully allocated and the
+    # shortfall was accepted deliberately rather than refunded.
+    shortfall_reason = models.CharField(max_length=200, blank=True, default="")
+
+    #: Line-by-line copy taken when an agent starts editing, so an abandoned edit
+    #: can be rolled back exactly.
+    edit_snapshot = models.JSONField(default=list, blank=True)
     editing_started_at = models.DateTimeField(null=True, blank=True)
     notes = models.CharField(max_length=200, null=True, blank=True)
 
     created_at = models.DateTimeField(auto_now_add=True)
     dispatched_at = models.DateTimeField(null=True, blank=True)
 
+    class Meta:
+        ordering = ["-created_at"]
+
+    @property
+    def is_price_overridden(self):
+        return (
+            self.final_total is not None
+            and self.final_total != self.computed_total
+        )
+
+    @property
+    def effective_total(self):
+        """The number that is actually billed and reported everywhere."""
+        if self.final_total is not None:
+            return self.final_total
+        return self.computed_total
+
     def __str__(self):
         return f"Order #{self.id}"
 
 
 class OrderLog(models.Model):
+    """Audit trail for an order.
+
+    ``order`` is nullable and ``SET_NULL`` so that deleting an order does not erase
+    the record of what happened to it -- which matters most for a deletion, since
+    that is exactly the entry you need afterwards. ``order_ref`` keeps the original
+    id so log entries stay traceable to a row that no longer exists.
+    """
+
     ACTION_CHOICES = (
         ("ITEM_DELETED", "Item Deleted"),
         ("ORDER_DELETED", "Order Deleted"),
@@ -65,52 +127,168 @@ class OrderLog(models.Model):
         ("EDIT_STARTED", "Edit Started"),
         ("EDIT_SAVED", "Edit Saved"),
         ("EDIT_CANCELLED", "Edit Cancelled"),
+        ("PRICE_OVERRIDE", "Price Overridden"),
+        ("PRICE_OVERRIDE_CLEARED", "Price Override Cleared"),
+        ("ALLOCATION_MADE", "Stock Allocated"),
+        ("ALLOCATION_REVERSED", "Allocation Reversed"),
+        ("ROUND_CANCELLED", "Packing Round Cancelled"),
     )
 
-    order = models.ForeignKey(Order, on_delete=models.CASCADE, related_name="logs")
-    action = models.CharField(max_length=20, choices=ACTION_CHOICES)
+    order = models.ForeignKey(
+        Order, on_delete=models.SET_NULL, null=True, related_name="logs"
+    )
+    #: The order's id at the time the entry was written.
+    order_ref = models.PositiveIntegerField(db_index=True)
+    action = models.CharField(max_length=30, choices=ACTION_CHOICES)
     details = models.JSONField(default=dict, blank=True)
     performed_by = models.ForeignKey(
-        get_user_model(), on_delete=models.SET_NULL, null=True, blank=True
+        User, on_delete=models.SET_NULL, null=True
     )
     created_at = models.DateTimeField(auto_now_add=True)
 
+    class Meta:
+        ordering = ["-created_at"]
+        indexes = [models.Index(fields=["order_ref", "-created_at"])]
+
+    @classmethod
+    def record(cls, order, action, details=None, performed_by=None):
+        """Append an audit entry for ``order``.
+
+        ``order_ref`` is filled in here so no call site can forget it.
+        """
+        return cls.objects.create(
+            order=order,
+            order_ref=order.pk,
+            action=action,
+            details=details or {},
+            performed_by=performed_by,
+        )
+
     def __str__(self):
-        return f"Order #{self.order_id} - {self.action}"
+        return f"Order #{self.order_ref} - {self.action}"
 
 
 class OrderItem(models.Model):
+    """One fabric line on an order.
+
+    Quantities are metres. ``ordered_quantity`` is what the customer asked for;
+    ``allocated_quantity`` is how much of it packing has actually handed over.
+    The gap between the two is the outstanding demand that the packing queue
+    works through.
+    """
+
     order = models.ForeignKey(Order, related_name="items", on_delete=models.CASCADE)
 
-    item = models.ForeignKey(Item, on_delete=models.SET_NULL, null=True, blank=True)
-
-    variant = models.ForeignKey(
-        ItemVariant, on_delete=models.SET_NULL, null=True, blank=True
+    fabric = models.ForeignKey(
+        Fabric, on_delete=models.SET_NULL, null=True, blank=True
     )
 
-    size_group = models.CharField(max_length=50, default="NONE")
-    item_type = models.CharField(max_length=10, default="gents")
+    variant = models.ForeignKey(
+        FabricVariant, on_delete=models.SET_NULL, null=True, blank=True
+    )
 
-    item_name = models.CharField(max_length=100, default="Unknown Item")
-    item_price = models.DecimalField(max_digits=10, decimal_places=2, default=0)
+    fabric_name = models.CharField(max_length=100, default="Unknown Fabric")
+    rate_per_meter = models.DecimalField(
+        max_digits=10, decimal_places=2, default=0
+    )
     variant_image = models.URLField(null=True, blank=True)
-    size = models.CharField(max_length=10, default="")
+    variant_display_order = models.CharField(max_length=100, blank=True, default="")
 
-    quantity = models.PositiveIntegerField()
+    ordered_quantity = models.DecimalField(max_digits=14, decimal_places=3)
+    allocated_quantity = models.DecimalField(
+        max_digits=14, decimal_places=3, default=0
+    )
 
-    packed_quantity = models.PositiveIntegerField(default=0)
+    @property
+    def outstanding_quantity(self):
+        return self.ordered_quantity - self.allocated_quantity
 
     def __str__(self):
-        return f"{self.item_name} x {self.quantity}"
+        return f"{self.fabric_name} x {self.ordered_quantity}m"
+
+
+class PackingRound(models.Model):
+    """One admin-initiated allocation of warehouse stock to pending demand.
+
+    A round is planned against a single :class:`FabricVariant` because the
+    warehouse holds one colour at a time. ``round_size`` is the per-line grant
+    the admin types in (metres each participating line receives before any
+    leftover is handed to the highest-priority customer). A round is created in
+    ``DRAFT`` so the plan can be reviewed and hand-adjusted before any stock
+    moves.
+    """
+
+    STATUS_CHOICES = (
+        ("DRAFT", "Draft"),
+        ("CONFIRMED", "Confirmed"),
+        ("CANCELLED", "Cancelled"),
+    )
+
+    variant = models.ForeignKey(
+        FabricVariant, related_name="packing_rounds", on_delete=models.PROTECT
+    )
+    round_size = models.DecimalField(max_digits=14, decimal_places=3)
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default="DRAFT")
+    note = models.CharField(max_length=200, blank=True, default="")
+
+    #: When the admin hand-adjusts the plan, the metres per ``order_item`` are
+    #: stored here as ``[{"order_item": <pk>, "metres": "<decimal>"}]`` and
+    #: applied verbatim on confirm. Empty means "re-plan from live stock".
+    plan_override = models.JSONField(default=list, blank=True)
+
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    confirmed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self):
+        return f"Round #{self.id} - {self.variant} ({self.status})"
+
+
+class Allocation(models.Model):
+    """Metres handed to one order line by one packing round.
+
+    ``sequence`` records which pass of the engine awarded the metres: ``1`` is
+    the equal fill every participant receives, ``2`` is a priority top-up given
+    to a top-ranked customer when stock ran past the round size. The link to the
+    round is ``SET_NULL`` so that cancelling a round never erases the record of
+    cloth that physically changed hands.
+    """
+
+    round = models.ForeignKey(
+        PackingRound,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="allocations",
+    )
+    order_item = models.ForeignKey(
+        OrderItem, on_delete=models.CASCADE, related_name="allocations"
+    )
+
+    metres = models.DecimalField(max_digits=14, decimal_places=3)
+    sequence = models.PositiveSmallIntegerField(default=1)
+    is_priority_award = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["sequence", "id"]
+
+    def __str__(self):
+        return f"{self.metres}m -> {self.order_item_id}"
 
 
 class UserViewedOrder(models.Model):
-    user = models.ForeignKey(get_user_model(), on_delete=models.CASCADE)
+    user = models.ForeignKey(User, on_delete=models.CASCADE)
     order = models.ForeignKey(Order, on_delete=models.CASCADE)
     viewed_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        unique_together = [["user", "order"]]
+        unique_together = (("user", "order"),)
         ordering = ["-viewed_at"]
 
     def __str__(self):

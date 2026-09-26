@@ -52,7 +52,7 @@ export default function OrderScannerPage() {
       </div>
 
       <div className="flex-1 max-w-md mx-auto w-full px-6 py-10 flex flex-col items-center justify-center">
-        <ScannerPage id={id} orderId={orderId} basePath={basePath} />
+        <ScannerPage id={id} basePath={basePath} />
       </div>
     </div>
   );

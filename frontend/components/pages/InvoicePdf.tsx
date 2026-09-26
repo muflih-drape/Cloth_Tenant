@@ -6,7 +6,8 @@ import {
     StyleSheet,
     Image,
 } from "@react-pdf/renderer";
-import { InvoiceResponse } from "@/types/order";
+import type { InvoiceResponse } from "@/lib/api/order";
+import { formatMeters, toMeters } from "@/types/item";
 
 const styles = StyleSheet.create({
     page: {
@@ -183,11 +184,10 @@ const styles = StyleSheet.create({
         backgroundColor: "#f9f9f9",
     },
 
-    colItem: { width: "30%", textAlign: "center" },
-    colSize: { width: "22%", textAlign: "center" },
-    colPrice: { width: "18%", textAlign: "center" },
-    colQty: { width: "12%", textAlign: "center" },
-    colAmount: { width: "18%", textAlign: "center" },
+    colItem: { width: "34%", textAlign: "center" },
+    colPrice: { width: "20%", textAlign: "center" },
+    colQty: { width: "20%", textAlign: "center" },
+    colAmount: { width: "26%", textAlign: "center" },
 
     cellText: {
         fontSize: 9.5,
@@ -208,19 +208,19 @@ const styles = StyleSheet.create({
         marginBottom: 8,
     },
 
-    totalPiecesRow: {
+    totalMetresRow: {
         flexDirection: "row",
         justifyContent: "flex-start",
         columnGap: 4,
     },
 
-    totalPiecesLabel: {
+    totalMetresLabel: {
         fontSize: 10,
         color: "#444",
         fontFamily: "Helvetica-Bold",
     },
 
-    totalPiecesValue: {
+    totalMetresValue: {
         fontSize: 10,
         color: "#444",
         fontFamily: "Helvetica",
@@ -334,7 +334,9 @@ const formatTime = (iso: string) =>
 
 // ── Component ─────────────────────────────────────
 export const InvoicePDF = ({ invoice }: { invoice: InvoiceResponse }) => {
-    const brandName = invoice.brand?.name ?? invoice.items[0].item_type!;
+    // The company profile is a singleton; if it has not been filled in yet the
+    // header just stays blank rather than borrowing a fabric's name.
+    const brandName = invoice.brand?.name ?? "";
     const address1 = invoice.brand?.address_line1 ?? "";
     const address2 = invoice.brand?.address_line2 ?? "";
     const phone = invoice.brand?.phone ?? "";
@@ -343,12 +345,13 @@ export const InvoicePDF = ({ invoice }: { invoice: InvoiceResponse }) => {
     const logoUrl = invoice.brand?.logo_url ?? null;
 
     const gstRate = invoice.gst_rate ?? 0;
-    const gstAmount = invoice.total_price * (gstRate / 100);
-    const totalWithGst = invoice.total_price + gstAmount;
-    const totalPieces = invoice.items.reduce(
-        (sum, item) => sum + item.quantity * (item.piece_count || 1),
-        0,
-    );
+    // Bill what the order is actually worth, which is the override when one
+    // exists, not the raw line arithmetic.
+    const orderTotal = toMeters(invoice.totals.effective_total);
+    const gstAmount = orderTotal * (gstRate / 100);
+    const totalWithGst = orderTotal + gstAmount;
+    const totalOrderedMeters = toMeters(invoice.totals.total_ordered_meters);
+    const isOverridden = invoice.totals.is_price_overridden;
 
     return (
         <Document>
@@ -426,9 +429,9 @@ export const InvoicePDF = ({ invoice }: { invoice: InvoiceResponse }) => {
                     <View style={styles.partyBox}>
                         <Text style={styles.partyBadge}>AGENT:</Text>
                         <Text style={styles.partyName}>
-                            {invoice.agent.username}
+                            {invoice.agent?.username ?? "Unassigned"}
                         </Text>
-                        {invoice.agent.contact ? (
+                        {invoice.agent?.contact ? (
                             <Text style={styles.partyDetail}>
                                 {invoice.agent.contact}
                             </Text>
@@ -440,16 +443,13 @@ export const InvoicePDF = ({ invoice }: { invoice: InvoiceResponse }) => {
                 <View style={styles.table}>
                     <View style={styles.tableHeader}>
                         <Text style={[styles.tableHeaderText, styles.colItem]}>
-                            Item
-                        </Text>
-                        <Text style={[styles.tableHeaderText, styles.colSize]}>
-                            Size
+                            Fabric
                         </Text>
                         <Text style={[styles.tableHeaderText, styles.colPrice]}>
-                            Price
+                            Rate/m
                         </Text>
                         <Text style={[styles.tableHeaderText, styles.colQty]}>
-                            Qty
+                            Metres
                         </Text>
                         <Text
                             style={[styles.tableHeaderText, styles.colAmount]}
@@ -459,11 +459,9 @@ export const InvoicePDF = ({ invoice }: { invoice: InvoiceResponse }) => {
                     </View>
 
                     {invoice.items.map((item, idx) => {
-                        const pieceCount = item.piece_count || 1;
-                        const totalPieces = item.quantity * pieceCount;
-                        const itemPrice =
-                            parseFloat(String(item.item_price)) || 0;
-                        const amount = itemPrice * item.quantity * pieceCount;
+                        const rate = toMeters(item.rate_per_meter);
+                        const ordered = toMeters(item.ordered_quantity);
+                        const packed = toMeters(item.allocated_quantity);
 
                         return (
                             <View
@@ -475,27 +473,23 @@ export const InvoicePDF = ({ invoice }: { invoice: InvoiceResponse }) => {
                             >
                                 <View style={styles.colItem}>
                                     <Text style={styles.cellText}>
-                                      {item.item_name}{item.variant_display_order ? ` ( ${item.variant_display_order})` : ""}
+                                        {item.fabric_name}{item.variant_display_order ? ` (${item.variant_display_order})` : ""}
                                     </Text>
                                 </View>
-
-                                <Text style={[styles.cellText, styles.colSize]}>
-                                    {item.size_group}
-                                </Text>
 
                                 <Text
                                     style={[styles.cellText, styles.colPrice]}
                                 >
-                                    Rs. {itemPrice.toFixed(2)}
+                                    Rs. {rate.toFixed(2)}
                                 </Text>
 
                                 <View style={styles.colQty}>
                                     <Text style={styles.cellText}>
-                                        {item.quantity}
+                                        {formatMeters(ordered)} m
                                     </Text>
-                                    {pieceCount > 1 && (
+                                    {packed < ordered && (
                                         <Text style={styles.cellSub}>
-                                            ×{pieceCount}={totalPieces}pc
+                                            {formatMeters(packed)} m packed
                                         </Text>
                                     )}
                                 </View>
@@ -503,7 +497,10 @@ export const InvoicePDF = ({ invoice }: { invoice: InvoiceResponse }) => {
                                 <Text
                                     style={[styles.cellText, styles.colAmount]}
                                 >
-                                    Rs. {amount.toLocaleString("en-IN")}
+                                    Rs.{" "}
+                                    {Number(item.line_total).toLocaleString(
+                                        "en-IN",
+                                    )}
                                 </Text>
                             </View>
                         );
@@ -511,28 +508,38 @@ export const InvoicePDF = ({ invoice }: { invoice: InvoiceResponse }) => {
                 </View>
 
                 <View style={styles.summaryRow}>
-                    {/* ── Total Pieces ── */}
-                    <View style={styles.totalPiecesRow}>
-                        <Text style={styles.totalPiecesLabel}>
-                            TOTAL PIECES:
+                    {/* ── Total metres ── */}
+                    <View style={styles.totalMetresRow}>
+                        <Text style={styles.totalMetresLabel}>
+                            TOTAL METRES:
                         </Text>
-                        <Text style={styles.totalPiecesValue}>
-                            {totalPieces}
+                        <Text style={styles.totalMetresValue}>
+                            {formatMeters(totalOrderedMeters)} m
                         </Text>
                     </View>
 
                     <View>
                         {/* ── Total Breakdown ── */}
                         <View style={styles.subtotalRow}>
-                            <Text style={styles.subtotalLabel}>SUBTOTAL:</Text>
+                            <Text style={styles.subtotalLabel}>
+                                {isOverridden ? "OVERRIDDEN TOTAL:" : "SUBTOTAL:"}
+                            </Text>
                             <View style={styles.subtotalValueBox}>
                                 <Text style={styles.subtotalValueText}>
-                                    Rs.{" "}
-                                    {invoice.total_price.toLocaleString(
-                                        "en-IN",
-                                    )}
+                                    Rs. {orderTotal.toLocaleString("en-IN")}
                                 </Text>
                             </View>
+                            {isOverridden && (
+                                <Text style={styles.cellSub}>
+                                    Computed Rs.{" "}
+                                    {Number(
+                                        invoice.totals.computed_total,
+                                    ).toLocaleString("en-IN")}
+                                    {invoice.totals.price_override_reason
+                                        ? ` · ${invoice.totals.price_override_reason}`
+                                        : ""}
+                                </Text>
+                            )}
                         </View>
                         <View style={styles.subtotalRow}>
                             <Text style={styles.subtotalLabel}>

@@ -1,5 +1,6 @@
 "use client";
 import { OrderAllResponse } from "@/types/order";
+import { formatMeters, toMeters } from "@/types/item";
 import StatusBadge from "@/components/ui/custom/StatusBadge";
 import { User } from "lucide-react";
 import { getColorFromId } from "@/util/getColorFromId";
@@ -29,15 +30,8 @@ export default function OrderCard({ order, onClick }: OrderCardProps) {
     onClick();
   };
 
-  const totalSets =
-    order.total_sets ||
-    order.items.reduce((sum, item) => sum + item.quantity, 0);
-  const totalPieces =
-    order.total_pieces ||
-    order.items.reduce(
-      (sum, item) => sum + item.quantity * (item.piece_count || 1),
-      0,
-    );
+  const totalOrderedMeters = toMeters(order.totals?.total_ordered_meters);
+  const totalOutstandingMeters = toMeters(order.totals?.total_outstanding_meters);
 
   return (
     <div
@@ -57,7 +51,7 @@ export default function OrderCard({ order, onClick }: OrderCardProps) {
               {order.customer_details?.name || "Unknown Customer"}
             </h6>
             <p className="text-xs text-gray-400 mt-0.5">
-              {order.agent_details.username}
+              {order.agent_details?.username ?? "Unassigned"}
             </p>
             <p className="text-xs text-gray-400 mt-0.5">
               {formatDate(order.created_at)}
@@ -71,27 +65,24 @@ export default function OrderCard({ order, onClick }: OrderCardProps) {
       <div className="flex items-center justify-between mt-4 pt-3 border-t border-gray-50">
         <div className="flex items-center gap-1.5">
           <span className="text-base font-black text-gray-900">
-            {totalSets}
+            {formatMeters(totalOrderedMeters)}
           </span>
-          <span className="text-xs text-gray-400">Sets</span>
-          <span className="text-gray-300 mx-1">•</span>
-          <span className="text-sm font-bold text-gray-600">{totalPieces}</span>
-          <span className="text-xs text-gray-400">pcs</span>
+          <span className="text-xs text-gray-400">m</span>
+          {totalOutstandingMeters > 0 && (
+            <>
+              <span className="text-gray-300 mx-1">•</span>
+              <span className="text-sm font-bold text-amber-600">
+                {formatMeters(totalOutstandingMeters)}
+              </span>
+              <span className="text-xs text-amber-600">to pack</span>
+            </>
+          )}
         </div>
 
         <div className="text-right">
           <span className="text-sm font-black text-primary">
             ₹
-            {order.items
-              ?.reduce(
-                (sum, item) =>
-                  sum +
-                  (Number(item.item_price) || 0) *
-                    item.quantity *
-                    (item.piece_count || 1),
-                0,
-              )
-              .toLocaleString("en-IN")}
+            {Number(order.totals?.effective_total || 0).toLocaleString("en-IN")}
           </span>
         </div>
       </div>

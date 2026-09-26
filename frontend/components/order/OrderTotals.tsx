@@ -1,8 +1,11 @@
 "use client";
 
+import { formatMeters, toMeters } from "@/types/item";
+
 interface OrderTotalsProps {
-  totalSets: number;
-  totalPieces: number;
+  /** Total metres across every line, as a display string from the API. */
+  totalMetres: string | number;
+  totalLines: number;
   totalPrice: number;
   onPlaceOrder?: () => void;
   isLoading?: boolean;
@@ -11,8 +14,8 @@ interface OrderTotalsProps {
 }
 
 export default function OrderTotals({
-  totalSets,
-  totalPieces,
+  totalMetres,
+  totalLines,
   totalPrice,
   onPlaceOrder,
   isLoading = false,
@@ -26,32 +29,32 @@ export default function OrderTotals({
       </p>
 
       <div className="flex items-center justify-between gap-3">
-        {/* Stats row */}
         <div className="flex items-center gap-2 flex-wrap min-w-0">
           <div className="flex items-baseline gap-1">
             <span className="text-lg font-black text-gray-900 leading-none">
-              {totalSets}
+              {formatMeters(totalMetres)}
             </span>
-            <span className="text-xs text-gray-400">Sets</span>
+            <span className="text-xs text-gray-400">m</span>
           </div>
           <span className="text-gray-300 text-sm">|</span>
           <div className="flex items-baseline gap-1">
             <span className="text-lg font-black text-gray-900 leading-none">
-              {totalPieces}
+              {totalLines}
             </span>
-            <span className="text-xs text-gray-400">pcs</span>
+            <span className="text-xs text-gray-400">
+              {totalLines === 1 ? "line" : "lines"}
+            </span>
           </div>
           <span className="text-gray-300 text-sm">|</span>
           <span className="text-xl font-black text-primary leading-none">
-            ₹{totalPrice.toLocaleString("en-IN")}
+            ₹{Number(totalPrice || 0).toLocaleString("en-IN")}
           </span>
         </div>
 
-        {/* Button */}
         {showButton && onPlaceOrder && (
           <button
             onClick={onPlaceOrder}
-            disabled={isLoading || totalSets === 0}
+            disabled={isLoading || toMeters(totalMetres) === 0}
             className="shrink-0 flex items-center justify-center gap-2 bg-primary text-white font-bold py-2.5 px-4 rounded-2xl shadow-lg shadow-primary/30 hover:opacity-90 transition-all active:scale-95 disabled:opacity-50 text-sm whitespace-nowrap"
           >
             {isLoading ? (

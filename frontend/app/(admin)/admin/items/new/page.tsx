@@ -5,35 +5,29 @@ import { useRouter } from "next/navigation";
 import Step1CommonDetails from "./commonDetails";
 import Step2AddColor from "./addColor";
 import ColorListScreen from "./colorList";
-import { submitItem } from "@/lib/submitItem";
-import type { ColorVariant, CommonDetails, WizardStep } from "@/types/item";
-import { getSizesForItemType } from "@/types/item";
+import { submitFabric } from "@/lib/submitItem";
+import type { ColorVariant, FabricDetails, WizardStep } from "@/types/item";
 import { toastError, toastWarning } from "@/lib/toast";
-import { useAuth } from "@/context/AuthContext";
 
 const uid = () => Math.random().toString(36).slice(2, 9);
 
-function blankVariant(common: CommonDetails): ColorVariant {
+function blankVariant(): ColorVariant {
   return {
     id: uid(),
-    sizeRange: getSizesForItemType(common.type, "item_creation")[0],
-    stock: 0,
+    stockMeters: "0",
+    displayOrder: "",
     image: null,
-    perSizeStock: {},
     imagePreview: null,
   };
 }
 
 export default function NewItemPage() {
   const router = useRouter();
-  const { business, isSuperuser } = useAuth();
 
-  const [common, setCommon] = useState<CommonDetails>({
+  const [common, setCommon] = useState<FabricDetails>({
     name: "",
     description: "",
-    price: "",
-    type: (business as CommonDetails["type"]) || "gents",
-    brand_id: undefined,
+    price_per_meter: "",
   });
 
   const [variants, setVariants] = useState<ColorVariant[]>([]);
@@ -47,13 +41,13 @@ export default function NewItemPage() {
     if (variants.length > 0) {
       setStep({ screen: "list" });
     } else {
-      setDraft(blankVariant(common));
+      setDraft(blankVariant());
       setStep({ screen: "add-color" });
     }
   };
 
   const startAddColor = () => {
-    setDraft(blankVariant(common));
+    setDraft(blankVariant());
     setStep({ screen: "add-color" });
   };
 
@@ -103,10 +97,10 @@ export default function NewItemPage() {
           "You have uploaded more than 20MB of images. The server may reject this. Consider using smaller photos.",
         );
       }
-      await submitItem(common, variants);
+      await submitFabric(common, variants);
       router.push("/admin/items");
     } catch (err) {
-      toastError("Failed to create item", err);
+      toastError("Failed to create fabric", err);
       setLoading(false);
     }
   };
@@ -120,7 +114,6 @@ export default function NewItemPage() {
         onChange={setCommon}
         onNext={goCommonNext}
         onBack={() => router.back()}
-        isSuperuser={isSuperuser}
       />
     );
   }

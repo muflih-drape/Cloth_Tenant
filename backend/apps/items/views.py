@@ -1,96 +1,35 @@
 from datetime import timedelta
+from decimal import Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db.models import Sum
+from django.db.models import F, Sum
 from django.utils import timezone
+from drf_spectacular.utils import OpenApiTypes, extend_schema
 from rest_framework import status
 from rest_framework.decorators import action
-from rest_framework.permissions import AllowAny, IsAuthenticated
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework.views import APIView
 from rest_framework.viewsets import ModelViewSet
 
-from drf_spectacular.utils import OpenApiTypes, extend_schema
-
-from apps.accounts.permissions import IsAdmin, admin_business, check_admin_pin
+from apps.accounts.permissions import IsAdmin, check_admin_pin
 from apps.agents.models import Agent, AgentItem
 from apps.orders.models import OrderItem
-from apps.orders.utils import SIZE_MAPPING
 
-from .models import Item, ItemVariant, ItemVariantSize
+from .models import Fabric, FabricVariant
 from .serializers import (
-    CreateItemSerializer,
+    CreateFabricSerializer,
     CustomerRequirementSerializer,
-    ItemSerializer,
-    ItemVariantSerializer,
-    UpdateItemSerializer,
+    FabricSerializer,
+    FabricVariantSerializer,
+    UpdateFabricSerializer,
 )
-from .services import delete_item_keep_history
+from .services import delete_fabric_keep_history
 
-ITEM_CREATION_SIZES_BY_TYPE = {
-    "gents": [
-        "S,M,L,XL,XXL",
-        "S,M,L,XL",
-        "M,L,XL,XXL",
-        "M,L,XL",
-    ],
-    "kids": [
-        "20-24",
-        "26-36",
-        "38",
-    ],
-}
+ZERO = Decimal("0")
 
-ORDER_CREATION_SIZES_BY_TYPE = {
-    "gents": [
-        "S,M,L,XL,XXL",
-        "S,M,L,XL",
-        "M,L,XL,XXL",
-        "M,L,XL",
-    ],
-    "kids": [
-        "20-24",
-        "20-36",
-        "20-30",
-        "26-36",
-        "32-36",
-        "20-38",
-        "26-38",
-        "32-38",
-    ],
-}
-
-
-def get_agent_reservation_boost(user):
-    """Return {(variant_id, size): qty} the agent can additionally see as available
-    because of their currently-EDITING orders."""
-    boost = {}
-    if not hasattr(user, "role") or user.role != "AGENT":
-        return boost
-
-    from apps.orders.models import Order
-
-    editing_orders = Order.objects.filter(agent__user=user, status="EDITING")
-    for order in editing_orders:
-        for snap in order.reservation_snapshot:
-            item_type = snap["item_type"]
-            if item_type not in SIZE_MAPPING:
-                continue
-            size_group = snap["size_group"]
-            if size_group not in SIZE_MAPPING[item_type]:
-                continue
-            variant_id = snap["variant_id"]
-            qty = snap["quantity"]
-            for size in SIZE_MAPPING[item_type][size_group]:
-                key = (variant_id, size)
-                boost[key] = boost.get(key, 0) + qty
-    return boost
-
-
-def filter_items_by_business(qs, user):
-    biz = admin_business(user)
-    return qs.filter(type=biz) if biz else qs
+#: Order statuses whose lines are still open packing demand.
+OPEN_ORDER_STATUSES = ("PENDING", "PACKED")
 
 
 def _clamp_int(raw, default, lo, hi):
@@ -101,37 +40,53 @@ def _clamp_int(raw, default, lo, hi):
     return max(lo, min(hi, val))
 
 
-def _sync_total_stock(qs):
-    return (
-        ItemVariantSize.objects.filter(item_variant__item__in=qs)
-        .aggregate(total=Sum("stock"))["total"]
-        or 0
-    )
+def _parse_iso(raw):
+    try:
+        parsed = timezone.datetime.fromisoformat(raw)
+    except (TypeError, ValueError):
+        return None
+    if timezone.is_naive(parsed):
+        return timezone.make_aware(parsed)
+    return parsed
 
 
-def _sync_items_payload(request, qs, page, page_size):
-    """Build sync item entries for a page of ``qs`` (constant query count)."""
+def _active_fabrics():
+    """Fabrics still shown in the catalogue (not deleted, not long archived)."""
+    cutoff = timezone.now() - timedelta(days=settings.ARCHIVE_AFTER_DAYS)
+    return Fabric.objects.prefetch_related("variants").filter(
+        is_deleted=False
+    ).exclude(out_of_stock_since__isnull=False, out_of_stock_since__lte=cutoff)
+
+
+def _total_stock(qs):
+    return FabricVariant.objects.filter(fabric__in=qs).aggregate(
+        total=Sum("stock_meters")
+    )["total"] or ZERO
+
+
+def _sync_fabrics_payload(request, qs, page, page_size):
+    """Build sync entries for one page of ``qs`` at constant query count."""
     start = (page - 1) * page_size
     end = start + page_size
-    items = []
-    qs = qs.order_by("id")[start:end].prefetch_related("variants__sizes")
-    for item in qs:
-        first = item.variants.first()
-        items.append(
+    fabrics = []
+    qs = qs.order_by("id")[start:end]
+    for fabric in qs:
+        variants = list(fabric.variants.all())
+        first = variants[0] if variants else None
+        fabrics.append(
             {
-                "id": item.id,
-                "rev": item.catalog_updated_at.isoformat(),
-                "name": item.name,
-                "type": item.type,
-                "price": str(item.price),
+                "id": fabric.id,
+                "rev": fabric.catalog_updated_at.isoformat(),
+                "name": fabric.name,
+                "price_per_meter": str(fabric.price_per_meter),
                 "thumb": (
                     request.build_absolute_uri(first.image.url)
                     if first is not None and first.image
                     else None
                 ),
                 "out_of_stock_since": (
-                    item.out_of_stock_since.isoformat()
-                    if item.out_of_stock_since
+                    fabric.out_of_stock_since.isoformat()
+                    if fabric.out_of_stock_since
                     else None
                 ),
                 "variants": [
@@ -144,210 +99,158 @@ def _sync_items_payload(request, qs, page, page_size):
                             if variant.image
                             else None
                         ),
-                        "sizes": [
-                            {"id": s.id, "size": s.size, "stock": s.stock}
-                            for s in variant.sizes.all()
-                        ],
+                        "stock_meters": str(variant.stock_meters),
+                        "stock_updated_at": variant.stock_updated_at.isoformat(),
                     }
-                    for variant in item.variants.all()
+                    for variant in variants
                 ],
             }
         )
-    return items
+    return fabrics
 
 
 def _sync_stock_payload(since, active_ids):
-    rows = ItemVariantSize.objects.filter(
-        stock_updated_at__gt=since,
-        item_variant__item__in=active_ids,
-    ).values_list("id", "size", "stock")
-    return [{"id": rid, "size": sz, "stock": st} for rid, sz, st in rows]
+    """Variants whose metre stock moved since the cursor."""
+    rows = FabricVariant.objects.filter(
+        stock_updated_at__gt=since, fabric__in=active_ids
+    ).values_list("id", "stock_meters")
+    return [
+        {"variant_id": vid, "stock_meters": str(stock)} for vid, stock in rows
+    ]
 
 
-class ItemViewSet(ModelViewSet):
-    queryset = Item.objects.prefetch_related("variants__sizes").all()
-    serializer_class = ItemSerializer
+class FabricViewSet(ModelViewSet):
+    serializer_class = FabricSerializer
+
+    def get_queryset(self):
+        return _active_fabrics().order_by("-id")
 
     def get_permissions(self):
-        if self.action == "items_sync":
+        if self.action == "fabrics_sync":
             return [IsAdmin()]
         if self.request.method in ["POST", "PUT", "PATCH", "DELETE"]:
             return [IsAdmin()]
         return [IsAuthenticated()]
 
-    def get_queryset(self):
-        cutoff = timezone.now() - timedelta(days=settings.ARCHIVE_AFTER_DAYS)
-        return (
-            filter_items_by_business(
-                Item.objects.prefetch_related("variants__sizes"),
-                self.request.user,
-            )
-            .filter(is_deleted=False)
-            .exclude(out_of_stock_since__isnull=False, out_of_stock_since__lte=cutoff)
-            .order_by("-id")
-        )
-
     def get_serializer_class(self):
         if self.action == "create":
-            return CreateItemSerializer
+            return CreateFabricSerializer
         if self.action in ["update", "partial_update"]:
-            return UpdateItemSerializer
-        return ItemSerializer
+            return UpdateFabricSerializer
+        return FabricSerializer
 
     def destroy(self, request, *args, **kwargs):
         pin_error = check_admin_pin(request)
         if pin_error:
             return pin_error
-        instance = self.get_object()
-        delete_item_keep_history(instance)
+        delete_fabric_keep_history(self.get_object())
         return Response(status=status.HTTP_204_NO_CONTENT)
 
     @action(detail=False, methods=["get"], url_path="stock-list")
     def get_stock_list(self, request):
-        items = (
-            filter_items_by_business(
-                Item.objects.prefetch_related("variants__sizes"),
-                request.user,
-            )
-            .filter(is_deleted=False)
-            .order_by("-id")
-        )
-
-        boost = get_agent_reservation_boost(request.user)
-
+        """Every fabric with its per-colour metre stock, for the order wizard."""
         result = []
-        for item in items:
-            variants = []
-            for variant in item.variants.all():
-                sizes = [
-                    {
-                        "size_range": s.size,
-                        "stock": s.stock + boost.get((variant.id, s.size), 0),
-                    }
-                    for s in variant.sizes.all()
-                ]
-                variants.append(
-                    {
-                        "id": variant.id,
-                        "qr_code": str(variant.qr_code) if variant.qr_code else None,
-                        "image": request.build_absolute_uri(variant.image.url)
-                        if variant.image
-                        else None,
-                        "sizes": sizes,
-                        "total_stock": sum(s["stock"] for s in sizes),
-                        "display_order": variant.display_order,
-                    }
-                )
-
+        for fabric in _active_fabrics().order_by("-id"):
+            variants = list(fabric.variants.all())
             result.append(
                 {
-                    "id": item.id,
-                    "name": item.name,
-                    "type": item.type,
-                    "price": str(item.price),
-                    "image": request.build_absolute_uri(item.variants.first().image.url)
-                    if item.variants.exists() and item.variants.first().image
-                    else None,
-                    "variants": variants,
+                    "id": fabric.id,
+                    "name": fabric.name,
+                    "price_per_meter": str(fabric.price_per_meter),
+                    "image": (
+                        request.build_absolute_uri(variants[0].image.url)
+                        if variants and variants[0].image
+                        else None
+                    ),
+                    "variants": [
+                        {
+                            "id": variant.id,
+                            "qr_code": (
+                                str(variant.qr_code) if variant.qr_code else None
+                            ),
+                            "display_order": variant.display_order,
+                            "image": (
+                                request.build_absolute_uri(variant.image.url)
+                                if variant.image
+                                else None
+                            ),
+                            "stock_meters": str(variant.stock_meters),
+                        }
+                        for variant in variants
+                    ],
                 }
             )
-
         return Response(result)
 
     @extend_schema(
         summary="Incremental sync feed for the mobile Inventory screen",
         description=(
             "Accepts an opaque cursor (?since=<ISO>) and returns either a delta "
-            " (catalog items, stock rows and removed ids since the cursor) or a "
+            "(catalog fabrics, stock rows and removed ids since the cursor) or a "
             "full snapshot (bootstrap / out-of-window / too-many-deltas). "
             "Full snapshots are paged via page/page_size. The response also "
             "carries `server_time` (UTC ISO) so clients can correct for "
             "device-clock skew, `check` (an integrity fingerprint over the "
-            "server's visible item set) and `archive_after_days`. Delta "
-            "`stock` rows carry the ItemVariantSize `id` so clients can map "
-            "them onto the sizes returned in `items`."
+            "server's visible fabric set) and `archive_after_days`. Delta "
+            "`stock` rows carry the FabricVariant `variant_id`."
         ),
         responses={200: OpenApiTypes.OBJECT},
     )
     @action(detail=False, methods=["get"], url_path="sync")
-    def items_sync(self, request):
+    def fabrics_sync(self, request):
         since_raw = request.query_params.get("since", "").strip()
         page = _clamp_int(request.query_params.get("page"), 1, 1, 10_000_000)
         page_size = _clamp_int(request.query_params.get("page_size"), 100, 1, 500)
 
-        cutoff = timezone.now() - timedelta(days=settings.ARCHIVE_AFTER_DAYS)
-
-        active = (
-            filter_items_by_business(
-                Item.objects.prefetch_related("variants__sizes"),
-                request.user,
-            )
-            .filter(is_deleted=False)
-            .exclude(
-                out_of_stock_since__isnull=False, out_of_stock_since__lte=cutoff
-            )
-        )
+        active = _active_fabrics()
         active_ids = set(active.values_list("id", flat=True))
 
-        check = {"items": len(active_ids), "total_stock": _sync_total_stock(active)}
+        check = {
+            "fabrics": len(active_ids),
+            "total_stock_meters": str(_total_stock(active)),
+        }
 
-        since = None
-        if since_raw:
-            try:
-                since = timezone.datetime.fromisoformat(since_raw)
-                if timezone.is_aware(since):
-                    since = timezone.localtime(since)
-                else:
-                    since = timezone.make_aware(since)
-            except ValueError:
-                since = None
-
+        since = _parse_iso(since_raw) if since_raw else None
         cursor = timezone.now()
 
         use_full = since is None
-        if since is not None and not use_full:
-            if since < timezone.now() - timedelta(days=settings.ITEM_SYNC_MAX_AGE_DAYS):
-                use_full = True
+        if since is not None and since < cursor - timedelta(
+            days=settings.FABRIC_SYNC_MAX_AGE_DAYS
+        ):
+            use_full = True
+
+        catalog_changed = set(
+            Fabric.objects.filter(catalog_updated_at__gt=since).values_list(
+                "id", flat=True
+            )
+        ) if since is not None else set()
 
         if not use_full:
-            catalog_changed = Item.objects.filter(
-                catalog_updated_at__gt=since
-            ).values_list("id", flat=True)
-            stock_rows = ItemVariantSize.objects.filter(
-                stock_updated_at__gt=since,
-                item_variant__item__in=active,
+            stock_rows = FabricVariant.objects.filter(
+                stock_updated_at__gt=since, fabric__in=active
             ).count()
-            changed_ids = set(catalog_changed)
-            if (
-                len(changed_ids) + stock_rows
-                > settings.ITEM_SYNC_MAX_DELTA_ITEMS
-            ):
+            if len(catalog_changed) + stock_rows > settings.FABRIC_SYNC_MAX_DELTA_FABRICS:
                 use_full = True
 
         if use_full:
-            items_data = _sync_items_payload(request, active, page, page_size)
-            page_has_more = (page * page_size) < check["items"]
+            fabrics_data = _sync_fabrics_payload(request, active, page, page_size)
+            page_has_more = (page * page_size) < check["fabrics"]
             return Response(
                 {
                     "mode": "full",
                     "cursor": cursor.isoformat(),
                     "server_time": cursor.isoformat(),
                     "archive_after_days": settings.ARCHIVE_AFTER_DAYS,
-                    "items": items_data,
+                    "fabrics": fabrics_data,
                     "stock": [],
-                    "removed_item_ids": [],
+                    "removed_fabric_ids": [],
                     "check": check,
                     "next_page": page + 1 if page_has_more else None,
                 }
             )
 
-        changed_ids = set(catalog_changed)
-        removed_ids = sorted(changed_ids - active_ids)
-
-        delta_active = active.filter(id__in=changed_ids & active_ids)
-        delta_items = _sync_items_payload(request, delta_active, 1, 500)
-
-        stock_rows_data = _sync_stock_payload(since, active_ids)
+        removed_ids = sorted(catalog_changed - active_ids)
+        delta_active = active.filter(id__in=catalog_changed & active_ids)
 
         return Response(
             {
@@ -355,9 +258,9 @@ class ItemViewSet(ModelViewSet):
                 "cursor": cursor.isoformat(),
                 "server_time": cursor.isoformat(),
                 "archive_after_days": settings.ARCHIVE_AFTER_DAYS,
-                "items": delta_items,
-                "stock": stock_rows_data,
-                "removed_item_ids": removed_ids,
+                "fabrics": _sync_fabrics_payload(request, delta_active, 1, 500),
+                "stock": _sync_stock_payload(since, active_ids),
+                "removed_fabric_ids": removed_ids,
                 "check": check,
                 "next_page": None,
             }
@@ -365,36 +268,31 @@ class ItemViewSet(ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="by-qr")
     def get_by_qr(self, request):
+        """Resolve a scanned fabric QR into the fabric and its colours."""
         qr_code = request.query_params.get("qr_code", "").strip()
-
         if not qr_code or len(qr_code) > 255 or "/" in qr_code:
-            return Response({"error": "No such item with this QR exists"}, status=400)
+            return Response(
+                {"error": "No such fabric with this QR exists"}, status=400
+            )
 
         try:
-            variant = (
-                ItemVariant.objects.select_related("item")
-                .prefetch_related("sizes")
-                .get(qr_code=qr_code, item__is_deleted=False)
+            variant = FabricVariant.objects.select_related("fabric").get(
+                qr_code=qr_code, fabric__is_deleted=False
             )
-        except (ItemVariant.DoesNotExist, ValidationError):
+        except (FabricVariant.DoesNotExist, ValidationError):
             return Response({"error": "Invalid QR code"}, status=400)
 
-        biz = admin_business(request.user)
-        if biz and variant.item.type != biz:
-            return Response({"error": "Not found"}, status=404)
+        fabric = variant.fabric
+        variants = list(fabric.variants.all())
 
-        item = variant.item
-        variants = item.variants.prefetch_related("sizes").all()
         agent_id = request.query_params.get("agent_id")
-        assigned_variant_ids = None
-
         if agent_id:
             try:
                 agent = Agent.objects.get(user_id=agent_id)
             except Agent.DoesNotExist:
                 return Response({"error": "Agent not found"}, status=404)
 
-            assigned_variant_ids = list(
+            assigned_variant_ids = set(
                 AgentItem.objects.filter(agent=agent).values_list(
                     "variant_id", flat=True
                 )
@@ -402,40 +300,31 @@ class ItemViewSet(ModelViewSet):
             if variant.id not in assigned_variant_ids:
                 return Response(
                     {
-                        "error": "This item is not assigned to you. Please contact admin for assignment."
+                        "error": "This fabric is not assigned to you. Please "
+                        "contact admin for assignment."
                     },
                     status=status.HTTP_400_BAD_REQUEST,
                 )
-            variants = variants.filter(id__in=assigned_variant_ids)
-
-        boost = get_agent_reservation_boost(request.user)
-
-        response_variants = []
-        for v in variants:
-            variant_data = {
-                "id": v.id,
-                "qr_code": v.qr_code,
-                "image": request.build_absolute_uri(v.image.url) if v.image else None,
-                "sizes": [
-                    {
-                        "id": s.id,
-                        "size_range": s.size,
-                        "stock": s.stock + boost.get((v.id, s.size), 0),
-                    }
-                    for s in v.sizes.all()
-                ],
-                "display_order": v.display_order,
-            }
-            response_variants.append(variant_data)
+            variants = [v for v in variants if v.id in assigned_variant_ids]
 
         return Response(
             {
-                "id": item.id,
-                "name": item.name,
-                "price": item.price,
-                "type": item.type,
-                "description": item.description,
-                "variants": response_variants,
+                "id": fabric.id,
+                "name": fabric.name,
+                "price_per_meter": str(fabric.price_per_meter),
+                "description": fabric.description,
+                "variants": [
+                    {
+                        "id": v.id,
+                        "qr_code": str(v.qr_code),
+                        "image": (
+                            request.build_absolute_uri(v.image.url) if v.image else None
+                        ),
+                        "display_order": v.display_order,
+                        "stock_meters": str(v.stock_meters),
+                    }
+                    for v in variants
+                ],
                 "matched_variant_id": variant.id,
             }
         )
@@ -443,135 +332,98 @@ class ItemViewSet(ModelViewSet):
     @action(detail=False, methods=["get"], url_path="archived")
     def get_archived(self, request):
         cutoff = timezone.now() - timedelta(days=settings.ARCHIVE_AFTER_DAYS)
-        items = filter_items_by_business(
-            Item.objects.prefetch_related("variants__sizes"),
-            request.user,
-        ).filter(
+        fabrics = Fabric.objects.prefetch_related("variants").filter(
             is_deleted=False,
             out_of_stock_since__isnull=False,
             out_of_stock_since__lte=cutoff,
         )
-        serializer = self.get_serializer(items, many=True)
-        return Response(serializer.data)
+        return Response(FabricSerializer(fabrics, many=True).data)
 
-    @action(detail=False, methods=["get"], url_path="by-qr/out-of-stock")
-    def check_out_of_stock(self, request):
-        qr_code = request.query_params.get("qr_code", "").strip()
-        order_id = request.query_params.get("order_id")
+    @action(detail=False, methods=["get"], url_path="outstanding-demand")
+    def outstanding_demand(self, request):
+        """Metres still wanted per variant, and how much cloth is on hand.
 
-        if not qr_code or len(qr_code) > 255 or "/" in qr_code:
-            return Response({"error": "Invalid QR code"}, status=400)
-
-        try:
-            variant = (
-                ItemVariant.objects.select_related("item")
-                .prefetch_related("sizes")
-                .get(qr_code=qr_code, item__is_deleted=False)
-            )
-        except (ItemVariant.DoesNotExist, ValidationError):
-            return Response({"error": "Variant not found"}, status=404)
-
-        biz = admin_business(request.user)
-        if biz and variant.item.type != biz:
-            return Response({"error": "Not found"}, status=404)
-
-        item = variant.item
-        item_type = item.type
-        boost = get_agent_reservation_boost(request.user)
-
-        # Existing draft quantities for this order
-        draft_reserved: dict[str, int] = {}
-
-        if order_id:
-            draft_items = OrderItem.objects.filter(
-                order_id=order_id,
-                order__status="DRAFT",
-                variant=variant,
-            )
-
-            for d in draft_items:
-                for draft_size in SIZE_MAPPING[item_type][d.size_group]:
-                    draft_reserved[draft_size] = d.quantity
-
-        # Build a flat stock map: { size: total_stock } across all variants
-        stock_map: dict[str, int] = {}
-        for s in variant.sizes.all():
-            effective = s.stock + boost.get((variant.id, s.size), 0)
-            # Reducing quantity that are already orderdered by the agent
-            effective -= draft_reserved.get(s.size, 0)
-
-            stock_map[s.size] = stock_map.get(s.size, 0) + effective
-
-        size_groups = ORDER_CREATION_SIZES_BY_TYPE.get(item_type, [])
-
-        group_stock = {}
-        for group in size_groups:
-            members = SIZE_MAPPING[item_type][group]
-            group_stock[group] = min(stock_map.get(m, 0) for m in members)
-
-        out_of_stock = all(v == 0 for v in group_stock.values())
-
-        return Response(
-            {
-                "out_of_stock": out_of_stock,
-                "group_stock": group_stock,
-            }
+        This is the number that tells the admin whether an order is routine or
+        genuinely oversubscribed.
+        """
+        variant_id = request.query_params.get("variant")
+        qs = FabricVariant.objects.select_related("fabric").filter(
+            fabric__is_deleted=False
         )
+        if variant_id:
+            qs = qs.filter(pk=variant_id)
+
+        rows = []
+        for variant in qs:
+            wanted = OrderItem.objects.filter(
+                variant=variant, order__status__in=OPEN_ORDER_STATUSES
+            ).aggregate(total=Sum("ordered_quantity") - Sum("allocated_quantity"))[
+                "total"
+            ] or ZERO
+            rows.append(
+                {
+                    "variant": variant.id,
+                    "fabric": variant.fabric.name,
+                    "fabric_id": variant.fabric_id,
+                    "display_order": variant.display_order,
+                    "stock_meters": str(variant.stock_meters),
+                    "outstanding_meters": str(wanted),
+                    "is_backordered": wanted > variant.stock_meters,
+                }
+            )
+        return Response(rows)
 
     @action(detail=False, methods=["get"], url_path="customer-requirements")
     def customer_requirements(self, request):
-        item_id = request.query_params.get("item_id")
-        if not item_id:
+        """Who is waiting for a given fabric, and how much each still needs."""
+        fabric_id = request.query_params.get("fabric_id")
+        if not fabric_id:
             return Response(
-                {"detail": "item_id query parameter is required."},
+                {"detail": "fabric_id query parameter is required."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
         try:
-            order_item = OrderItem.objects.select_related("item").get(pk=item_id)
-        except (OrderItem.DoesNotExist, ValueError):
+            fabric = Fabric.objects.get(pk=fabric_id)
+        except (Fabric.DoesNotExist, ValueError):
             return Response(
-                {"detail": "OrderItem not found."}, status=status.HTTP_404_NOT_FOUND
+                {"detail": "Fabric not found."}, status=status.HTTP_404_NOT_FOUND
             )
 
-        if order_item.item is None or order_item.item.is_deleted:
+        if fabric.is_deleted:
             return Response(
-                {"detail": "Item not found."}, status=status.HTTP_404_NOT_FOUND
-            )
-
-        item = order_item.item
-
-        biz = admin_business(request.user)
-        if biz and item.type != biz:
-            return Response(
-                {"detail": "Item not found."}, status=status.HTTP_404_NOT_FOUND
+                {"detail": "Fabric not found."}, status=status.HTTP_404_NOT_FOUND
             )
 
         order_items = (
-            OrderItem.objects.filter(item=item, packed_quantity=0)
-            .select_related("order__customer", "variant")
-            .order_by("-id")
-        )
-
-        serializer = CustomerRequirementSerializer(
-            order_items, many=True, context={"request": request}
+            OrderItem.objects.filter(fabric=fabric)
+            .filter(order__status__in=OPEN_ORDER_STATUSES)
+            .filter(allocated_quantity__lt=F("ordered_quantity"))
+            .select_related("order__customer", "order__agent__user", "variant")
+            .order_by("-order__created_at")
         )
 
         return Response(
             {
-                "item": {"id": item.id, "name": item.name},
-                "customers": serializer.data,
+                "fabric": {
+                    "id": fabric.id,
+                    "name": fabric.name,
+                    "price_per_meter": str(fabric.price_per_meter),
+                },
+                "customers": CustomerRequirementSerializer(
+                    order_items, many=True, context={"request": request}
+                ).data,
             }
         )
 
 
-class ItemVariantViewSet(ModelViewSet):
-    queryset = (
-        ItemVariant.objects.prefetch_related("sizes")
-        .filter(item__is_deleted=False)
-        .all()
-    )
-    serializer_class = ItemVariantSerializer
+class FabricVariantViewSet(ModelViewSet):
+    serializer_class = FabricVariantSerializer
+
+    def get_queryset(self):
+        return FabricVariant.objects.select_related("fabric").filter(
+            fabric__is_deleted=False
+        )
 
     def get_permissions(self):
         if self.request.method in ["POST", "PUT", "PATCH", "DELETE"]:
@@ -580,47 +432,29 @@ class ItemVariantViewSet(ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="all")
     def get_all_variants(self, request):
-        variants = filter_items_by_business(
-            ItemVariant.objects.select_related("item").prefetch_related("sizes"),
-            request.user,
-        ).filter(item__is_deleted=False)
+        variants = (
+            FabricVariant.objects.select_related("fabric")
+            .filter(fabric__is_deleted=False)
+            .order_by("fabric__name", "display_order")
+        )
 
-        boost = get_agent_reservation_boost(request.user)
-
-        result = []
-        for variant in variants:
-            sizes_with_boost = [
-                {"size": s.size, "stock": s.stock + boost.get((variant.id, s.size), 0)}
-                for s in variant.sizes.all()
-            ]
-            total_stock = sum(s["stock"] for s in sizes_with_boost)
-            unique_sizes = list(set(s["size"] for s in sizes_with_boost))
-
-            result.append(
+        return Response(
+            [
                 {
                     "id": variant.id,
-                    "item_id": variant.item.id,
-                    "item_name": variant.item.name,
-                    "item_type": variant.item.type,
-                    "item_price": str(variant.item.price),
+                    "fabric_id": variant.fabric_id,
+                    "fabric_name": variant.fabric.name,
+                    "price_per_meter": str(variant.fabric.price_per_meter),
                     "qr_code": str(variant.qr_code) if variant.qr_code else None,
-                    "image": request.build_absolute_uri(variant.image.url)
-                    if variant.image
-                    else None,
-                    "sizes": sizes_with_boost,
-                    "total_stock": total_stock,
-                    "unique_sizes": unique_sizes,
+                    "display_order": variant.display_order,
+                    "image": (
+                        request.build_absolute_uri(variant.image.url)
+                        if variant.image
+                        else None
+                    ),
+                    "stock_meters": str(variant.stock_meters),
+                    "stock_updated_at": variant.stock_updated_at.isoformat(),
                 }
-            )
-
-        return Response(result)
-
-
-class SizeRangesAPIView(APIView):
-    def get(self, request):
-        return Response(
-            {
-                "item_creation_sizes_by_type": ITEM_CREATION_SIZES_BY_TYPE,
-                "order_creation_sizes_by_type": ORDER_CREATION_SIZES_BY_TYPE,
-            }
+                for variant in variants
+            ]
         )

@@ -3,47 +3,46 @@
 import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
-import { itemApi } from "@/lib/api/item";
-import { orderApi, UnpackedOrderItem } from "@/lib/api/order";
-import { ItemStockEntry, UIItem } from "@/types/item";
+import { fabricApi } from "@/lib/api/item";
+import { FabricStockEntry, OutstandingDemandRow, UIItem } from "@/types/item";
 import { ItemList, StockTab } from "@/components/items";
 
 interface ListItemsProps {
   initialTab?: StockTab;
 }
 
-function normalizeAdminItem(item: ItemStockEntry): UIItem {
+function normalizeAdminItem(item: FabricStockEntry): UIItem {
   return {
     id: item.id,
     name: item.name,
-    type: item.type,
-    price: item.price,
-    variants: item.variants.map((v) => ({
-      id: v.id,
-      image: v.image,
-      qr_code: v.qr_code,
-      sizes: v.sizes,
-      display_order: v.display_order
+    price_per_meter: item.price_per_meter,
+    variants: item.variants.map((variant) => ({
+      id: variant.id,
+      image: variant.image,
+      qr_code: variant.qr_code,
+      display_order: variant.display_order,
+      stock_meters: variant.stock_meters,
     })),
   };
 }
+
 const ListItems: React.FC<ListItemsProps> = ({ initialTab }) => {
   const { isAuthenticated } = useAuth();
   const router = useRouter();
   const [data, setData] = useState<UIItem[]>([]);
+  const [outstanding, setOutstanding] = useState<OutstandingDemandRow[]>([]);
   const [loading, setLoading] = useState(true);
-  const [orderedItems, setOrderedItems] = useState<UnpackedOrderItem[]>([]);
 
   const fetchData = useCallback(async () => {
     try {
-      const [stockResult, unpackedResult] = await Promise.all([
-        itemApi.getStockList(),
-        orderApi.getUnpackedOrderItems(),
+      const [stockResult, demandResult] = await Promise.all([
+        fabricApi.getStockList(),
+        fabricApi.getOutstandingDemand(),
       ]);
       setData(stockResult.map(normalizeAdminItem));
-      setOrderedItems(unpackedResult);
+      setOutstanding(demandResult);
     } catch (e) {
-      console.error("Error fetching items:", e);
+      console.error("Error fetching fabrics:", e);
     } finally {
       setLoading(false);
     }
@@ -80,10 +79,6 @@ const ListItems: React.FC<ListItemsProps> = ({ initialTab }) => {
     router.push(`/admin/items/qr-print?qr=${qr}&id=${id}`);
   };
 
-  const handleOrderItemClick = (itemId: number) => {
-    router.push(`/admin/items/ordered/${itemId}`);
-  };
-
   return (
     <ItemList
       items={data}
@@ -94,8 +89,10 @@ const ListItems: React.FC<ListItemsProps> = ({ initialTab }) => {
       onEdit={handleEdit}
       onPrintAll={handlePrintAll}
       onPrintQR={handlePrintQR}
-      orderedItems={orderedItems}
-      onOrderItemClick={handleOrderItemClick}
+      outstandingDemand={outstanding}
+      onOutstandingClick={(fabricId) =>
+        router.push(`/admin/items/ordered/${fabricId}`)
+      }
     />
   );
 };

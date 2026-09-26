@@ -4,13 +4,13 @@ import { useParams, useRouter } from "next/navigation";
 import { orderApi } from "@/lib/api/order";
 import { transportApi } from "@/lib/api/transport";
 import { OrderResponse } from "@/types/order";
-import OrderTabs, { Tab } from "@/components/pages/order/OrderTabs";
+import { formatMeters, toMeters } from "@/types/item";
 import OrderSummary from "@/components/pages/order/OrderSummary";
 import OrderItemsSection from "@/components/pages/order/OrderItemsSection";
 import OrderFooter from "@/components/pages/order/OrderFooter";
 import OrderDetailHeader from "@/components/pages/admin/order-item/OrderDetailHeader";
 import OrderLogs from "@/components/pages/order/OrderLogs";
-import { toastSuccess } from "@/lib/toast";
+import { toastError, toastSuccess } from "@/lib/toast";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import { Trash2 } from "lucide-react";
 import PinDeleteDialog from "@/components/ui/pinDeleteDialog";
@@ -23,38 +23,30 @@ export default function Page() {
   const id = params.id as string;
   const router = useRouter();
 
-  const [activeTab, setActiveTab] = useState<Tab>("Packing");
   const [loading, setLoading] = useState(false);
   const [data, setData] = useState<OrderResponse>();
-  const [isPackingMode, setIsPackingMode] = useState(false);
-  const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [showDispatchDialog, setShowDispatchDialog] = useState(false);
   const [deleting, setDeleting] = useState(false);
   const [dispatchTransport, setDispatchTransport] = useState<string>("");
   const [lrNumber, setLrNumber] = useState<string>("");
+  const [shortfallReason, setShortfallReason] = useState<string>("");
   const [transports, setTransports] = useState<
     { value: string; label: string }[]
   >([]);
   const [pinDialogOpen, setPinDialogOpen] = useState(false);
 
-  const fetchData = useCallback(
-    async (setInitialTab = false) => {
-      try {
-        const response = await orderApi.getOne(Number(id));
-        setData(response);
-        if (setInitialTab && response.status === "PACKED") {
-          setActiveTab("Dispatching");
-        }
-      } catch (error) {
-        console.error("Error fetching data:", error);
-      }
-    },
-    [id],
-  );
+  const fetchData = useCallback(async () => {
+    try {
+      const response = await orderApi.getOne(Number(id));
+      setData(response);
+    } catch (error) {
+      console.error("Error fetching data:", error);
+    }
+  }, [id]);
 
   useEffect(() => {
     setLoading(true);
-    fetchData(true).finally(() => setLoading(false));
+    fetchData().finally(() => setLoading(false));
   }, [fetchData]);
 
   useEffect(() => {
@@ -82,37 +74,15 @@ export default function Page() {
     if (match) setDispatchTransport(match.value);
   }, [data, transports]);
 
-  const handlePackedChange = useCallback(async () => {
+  const handleItemsChange = useCallback(async () => {
     await fetchData();
   }, [fetchData]);
 
-  const handleUpdateStatus = async (newStatus: "PACKED" | "DISPATCHED") => {
-    if (newStatus === "DISPATCHED" && anyItemPacked) {
-      setShowDispatchDialog(true);
-      return;
-    } else if (newStatus === "PACKED") {
-      await updateStatus(newStatus);
-    }
-  };
-
-  const updateStatus = async (newStatus: "PACKED" | "DISPATCHED") => {
-    try {
-      setLoading(true);
-      if (newStatus === "DISPATCHED") {
-        await orderApi.dispatchOrder(Number(id));
-      } else {
-        await orderApi.update(Number(id), { status: newStatus });
-      }
-      await fetchData();
-      if (newStatus === "PACKED") setIsPackingMode(false);
-    } catch (err) {
-      console.error("Error updating status:", err);
-    } finally {
-      setLoading(false);
-    }
-  };
-
   const handleConfirmDispatch = async () => {
+    if (isPartial && !shortfallReason.trim()) {
+      toastError("Say why the order is going out short.");
+      return;
+    }
     setShowDispatchDialog(false);
     try {
       await orderApi.dispatchOrder(Number(id), {
@@ -120,16 +90,15 @@ export default function Page() {
           ? parseInt(dispatchTransport)
           : null,
         lr_number: lrNumber,
+        // A partial dispatch has to say why, so the gap is auditable later.
+        ...(isPartial
+          ? { allow_partial: true, shortfall_reason: shortfallReason.trim() }
+          : {}),
       });
       router.push("/admin");
     } catch (err) {
       console.error("Error dispatching order:", err);
     }
-  };
-
-  const handleTabChange = (tab: Tab) => {
-    setActiveTab(tab);
-    setIsPackingMode(false);
   };
 
   const handleDeleteClick = () => {
@@ -160,9 +129,21 @@ export default function Page() {
     }
   };
 
-  const anyItemPacked = data?.items.some(
-    (item) => (item.packed_quantity ?? 0) > 0,
+  // Every metre has to be allocated before the order can go out on a truck in
+  // full, but a partly-allocated order can still ship what is cut — the backend
+  // keeps the remainder owed.
+  const fullyPacked =
+    (data?.items.length ?? 0) > 0 &&
+    data!.items.every((item) => toMeters(item.outstanding_quantity) === 0);
+  const allocatedMeters = (data?.items ?? []).reduce(
+    (sum, item) => sum + toMeters(item.allocated_quantity),
+    0,
   );
+  const outstandingMeters = (data?.items ?? []).reduce(
+    (sum, item) => sum + toMeters(item.outstanding_quantity),
+    0,
+  );
+  const isPartial = !fullyPacked && allocatedMeters > 0;
   const isDeletable = data?.status === "PENDING" || data?.status === "PACKED";
 
   if (loading && !data) return <PageLoading />;
@@ -179,8 +160,6 @@ export default function Page() {
       <OrderDetailHeader orderId={id} backHref="/admin" />
 
       <div className="px-4 pt-4 max-w-4xl mx-auto">
-        <OrderTabs activeTab={activeTab} onTabChange={handleTabChange} />
-
         {isDeletable && (
           <div className="flex justify-end w-full p-2">
             <StockFlowButton
@@ -225,57 +204,20 @@ export default function Page() {
 
         <OrderItemsSection
           items={data?.items}
-          activeTab={activeTab}
-          isPackingMode={isPackingMode}
-          onPackedChange={handlePackedChange}
-          onTogglePackingMode={async () => {
-            await fetchData();
-            setIsPackingMode((prev) => !prev);
-          }}
           status={data?.status}
           orderId={Number(id)}
+          onItemsChange={handleItemsChange}
         />
 
         <OrderLogs orderId={Number(id)} />
       </div>
 
       <OrderFooter
-        activeTab={activeTab}
         status={data?.status}
-        anyItemPacked={anyItemPacked!}
-        isPackingMode={isPackingMode}
-        onActionButtonClick={handleUpdateStatus}
+        fullyPacked={fullyPacked}
+        allocatedMeters={allocatedMeters}
+        onDispatch={() => setShowDispatchDialog(true)}
       />
-
-      {showDeleteDialog && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
-          <div className="bg-white rounded-2xl p-6 max-w-sm w-full shadow-xl">
-            <h3 className="text-lg font-bold text-gray-900 mb-2">
-              Delete Order?
-            </h3>
-            <p className="text-sm text-gray-500 mb-6">
-              This will return the stock back to the warehouse. This action
-              cannot be undone.
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setShowDeleteDialog(false)}
-                className="flex-1 py-3 px-4 rounded-xl border border-gray-200 text-gray-700 font-medium hover:bg-gray-50 transition-colors"
-                disabled={deleting}
-              >
-                Cancel
-              </button>
-              <button
-                onClick={handleDeleteClick}
-                disabled={deleting}
-                className="flex-1 py-3 px-4 rounded-xl bg-red-500 text-white font-medium hover:bg-red-600 transition-colors disabled:opacity-50"
-              >
-                {deleting ? "Deleting..." : "Delete"}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
 
       {showDispatchDialog && (
         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
@@ -284,8 +226,22 @@ export default function Page() {
               Dispatch Order
             </h3>
             <p className="text-sm text-gray-500 mb-4">
-              Unpacked items will be returned to the warehouse.
+              Record the transport carrying this cloth out.
             </p>
+
+            {isPartial && (
+              <div className="mb-4 p-3 rounded-xl bg-amber-50 border border-amber-200">
+                <p className="text-xs font-bold text-amber-800">
+                  {formatMeters(allocatedMeters)} m is cut and ready,{" "}
+                  {formatMeters(outstandingMeters)} m is still owed.
+                </p>
+                <p className="text-[11px] text-amber-700 mt-1">
+                  Dispatching short closes the order: the unpacking-ready
+                  remainder is written off and stops competing for cloth. Only do
+                  this once the customer has agreed to collect later.
+                </p>
+              </div>
+            )}
 
             <div className="space-y-4 mb-6">
               <div>
@@ -318,6 +274,26 @@ export default function Page() {
                   className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-xl focus:border-primary focus:ring-2 focus:ring-primary/10 text-sm"
                 />
               </div>
+
+              {isPartial && (
+                <div>
+                  <label className="text-xs font-bold uppercase tracking-widest text-gray-400 mb-1.5 block">
+                    Reason for dispatching short
+                  </label>
+                  <input
+                    type="text"
+                    value={shortfallReason}
+                    onChange={(e) => setShortfallReason(e.target.value)}
+                    placeholder="e.g. customer will collect the rest later"
+                    className="w-full px-4 py-3 bg-gray-50 border border-gray-100 rounded-xl focus:border-primary focus:ring-2 focus:ring-primary/10 text-sm"
+                  />
+                  {!shortfallReason.trim() && (
+                    <p className="text-[11px] text-gray-400 mt-1">
+                      Required — the reason is saved on the order's log.
+                    </p>
+                  )}
+                </div>
+              )}
             </div>
 
             <div className="flex gap-3">
@@ -329,9 +305,10 @@ export default function Page() {
               </button>
               <button
                 onClick={handleConfirmDispatch}
-                className="flex-1 py-3 px-4 rounded-xl bg-primary text-white font-medium hover:bg-primary/90 transition-colors"
+                disabled={isPartial && !shortfallReason.trim()}
+                className="flex-1 py-3 px-4 rounded-xl bg-primary text-white font-medium hover:bg-primary/90 transition-colors disabled:opacity-40"
               >
-                Dispatch
+                {isPartial ? "Dispatch short" : "Dispatch"}
               </button>
             </div>
           </div>

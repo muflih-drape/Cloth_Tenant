@@ -5,9 +5,12 @@ export interface AnalyticsKPIs {
   editing: number;
   packed: number;
   dispatched: number;
-  total_value?: number;
-  total_sets?: number;
-  total_pieces?: number;
+  /** Metres ordered across placed (non-DRAFT) orders in the range. */
+  total_metres_ordered: string;
+  /** Metres allocated on dispatched orders. */
+  total_metres_shipped: string;
+  /** Billed revenue, so an admin's price override is reflected. */
+  total_value: number;
 }
 
 export interface TrendPoint {
@@ -19,17 +22,22 @@ export interface LeaderboardEntry {
   id: number;
   name: string;
   count: number;
+  /** Metres allocated across this customer's orders. */
+  metres: string;
 }
 
 export interface TopAgentsEntry {
   id: number;
   username: string;
   count: number;
+  /** Metres allocated across this agent's orders. */
+  metres: string;
 }
 
-export interface TopItemsEntry {
+export interface TopFabricsEntry {
   name: string;
-  qty: number;
+  metres_ordered: string;
+  metres_shipped: string;
 }
 
 export interface TimeMetrics {
@@ -43,6 +51,6 @@ export interface AnalyticsResponse {
   trend: TrendPoint[];
   top_customers: LeaderboardEntry[];
   top_agents: TopAgentsEntry[];
-  top_items: TopItemsEntry[];
+  top_fabrics: TopFabricsEntry[];
   time_metrics: TimeMetrics;
 }

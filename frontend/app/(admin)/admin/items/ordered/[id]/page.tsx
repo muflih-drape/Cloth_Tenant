@@ -3,40 +3,40 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { ArrowLeft, Info, Users, AlertTriangle } from "lucide-react";
-import { itemApi } from "@/lib/api/item";
-import { CustomerRequirementResponse } from "@/types/item";
+import { fabricApi } from "@/lib/api/item";
+import { CustomerRequirementResponse, formatMeters, toMeters } from "@/types/item";
 import { ImagePreview } from "@/components/pages/ImagePreview";
 import { PageLoading } from "@/components/ui/Loading";
 
 export default function CustomerRequirementsPage() {
   const params = useParams();
   const router = useRouter();
-  const itemId = Number(params.id);
+  const fabricId = Number(params.id);
 
   const [data, setData] = useState<CustomerRequirementResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    if (!itemId) return;
+    if (!fabricId) return;
 
     const fetchData = async () => {
       try {
-        const result = await itemApi.getCustomerRequirements(itemId);
+        const result = await fabricApi.getCustomerRequirements(fabricId);
         setData(result);
       } catch (e) {
         console.error("Error fetching customer requirements:", e);
-        setError("Failed to load item details");
+        setError("Failed to load fabric details");
       } finally {
         setLoading(false);
       }
     };
 
     fetchData();
-  }, [itemId]);
+  }, [fabricId]);
 
   if (loading) {
-    return <PageLoading text="Loading item details…" />;
+    return <PageLoading text="Loading demand…" />;
   }
 
   if (error || !data) {
@@ -53,7 +53,7 @@ export default function CustomerRequirementsPage() {
         </div>
         <div className="flex-1 flex flex-col items-center justify-center text-gray-400">
           <AlertTriangle size={48} className="mb-4" />
-          <h2 className="text-lg font-bold">{error || "Item not found"}</h2>
+          <h2 className="text-lg font-bold">{error || "Fabric not found"}</h2>
           <button
             onClick={() => router.replace("/admin/items?tab=ordered")}
             className="mt-3 text-primary text-sm font-medium hover:underline"
@@ -65,7 +65,10 @@ export default function CustomerRequirementsPage() {
     );
   }
 
-  const totalQuantity = data.customers.reduce((sum, c) => sum + c.quantity, 0);
+  const totalOutstanding = data.customers.reduce(
+    (sum, customer) => sum + toMeters(customer.outstanding_quantity),
+    0,
+  );
 
   return (
     <div className="min-h-screen">
@@ -80,8 +83,11 @@ export default function CustomerRequirementsPage() {
           </button>
           <div className="flex-1 min-w-0">
             <h1 className="text-lg font-extrabold text-gray-900 truncate">
-              {data.item.name}
+              {data.fabric.name}
             </h1>
+            <p className="text-xs text-gray-400">
+              ₹{Number(data.fabric.price_per_meter).toLocaleString("en-IN")}/m
+            </p>
           </div>
         </div>
       </div>
@@ -93,28 +99,26 @@ export default function CustomerRequirementsPage() {
             <div className="flex items-center gap-2">
               <Users size={14} className="text-primary" />
               <h2 className="text-xs font-bold text-gray-500 uppercase tracking-wider">
-                Customers
+                Open demand
               </h2>
             </div>
             <div className="bg-primary/10 text-primary rounded-full py-0.5 px-3 border border-primary/20">
-              <span className="font-bold text-xs">
-                {data.customers.length}
-              </span>
+              <span className="font-bold text-xs">{data.customers.length}</span>
             </div>
           </div>
 
           <div className="mt-3 pt-3 border-t border-gray-100 grid grid-cols-2 gap-3">
             <div>
               <p className="text-[10px] text-gray-400 uppercase font-medium">
-                Total Quantity
+                Still to pack
               </p>
               <p className="text-sm font-black text-gray-900">
-                {totalQuantity}
+                {formatMeters(totalOutstanding)} m
               </p>
             </div>
             <div>
               <p className="text-[10px] text-gray-400 uppercase font-medium">
-                Unique Colors
+                Colours waiting
               </p>
               <p className="text-sm font-black text-gray-900">
                 {new Set(data.customers.map((c) => c.variant_display_order)).size}
@@ -123,28 +127,26 @@ export default function CustomerRequirementsPage() {
           </div>
         </div>
 
-        {/* Customers List */}
+        {/* Customer lines */}
         <div>
           <div className="flex items-center gap-2 mb-3">
             <Info size={14} className="text-primary" />
             <h2 className="text-xs font-bold text-gray-500 uppercase tracking-wider">
-              Ordered By
+              Waiting on
             </h2>
           </div>
 
           {data.customers.length === 0 ? (
             <div className="bg-white rounded-md border border-gray-300 p-6 text-center">
               <Info size={32} className="mx-auto text-gray-300 mb-2" />
-              <p className="text-sm text-gray-400">
-                No customer orders found
-              </p>
+              <p className="text-sm text-gray-400">No open demand for this fabric</p>
             </div>
           ) : (
             <div className="space-y-2">
               {data.customers.map((customer, index) => (
                 <div
-                  key={index}
-                  className="bg-white rounded-md border border-gray-300 p-2 flex items-center gap-3"
+                  key={`${customer.order_id}-${index}`}
+                  className="bg-white rounded-md border border-gray-300 p-3 flex items-center gap-3"
                 >
                   <div className="relative w-12 h-12 rounded-md bg-gray-50 overflow-hidden flex-shrink-0 border border-gray-100">
                     {customer.variant_image ? (
@@ -163,31 +165,36 @@ export default function CustomerRequirementsPage() {
                     <h3 className="text-sm font-bold text-gray-900 truncate">
                       {customer.customer_name}
                     </h3>
-                    <div className="flex items-center gap-2 mt-0.5">
-                      {customer.variant_display_order && (
-                        <span className="text-[10px] text-gray-400">
-                          Color #{customer.variant_display_order}
-                        </span>
-                      )}
-                      {customer.size_group && (
+                    <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                      <span className="text-[10px] text-gray-400">
+                        {customer.variant_display_order
+                          ? `Colour #${customer.variant_display_order}`
+                          : "No colour"}
+                      </span>
+                      {customer.agent && (
                         <>
                           <span className="text-gray-200">·</span>
                           <span className="text-[10px] text-gray-400">
-                            Size: {customer.size_group}
+                            {customer.agent}
                           </span>
                         </>
                       )}
+                      <span className="text-gray-200">·</span>
+                      <span className="text-[10px] text-gray-400">
+                        Order #{customer.order_id}
+                      </span>
                     </div>
                   </div>
-                  <div className="flex-shrink-0">
+
+                  <div className="flex-shrink-0 text-right">
                     <div className="bg-gray-100 rounded-lg px-3 py-1.5">
                       <span className="text-sm font-black text-gray-900">
-                        {customer.quantity}
-                      </span>
-                      <span className="text-[10px] text-gray-500 ml-1">
-                        sets
+                        {formatMeters(customer.outstanding_quantity)} m
                       </span>
                     </div>
+                    <p className="text-[10px] text-gray-400 mt-0.5">
+                      of {formatMeters(customer.ordered_quantity)} m
+                    </p>
                   </div>
                 </div>
               ))}

@@ -14,13 +14,12 @@ def get_auth_header(user):
     return {"HTTP_AUTHORIZATION": f"Bearer {refresh.access_token}"}
 
 
-def make_admin(username, business="gents", pin=None):
+def make_admin(username, pin=None):
     admin = User.objects.create_user(
         username=username,
         email=f"{username}@test.com",
         password="pass1234",
         role="ADMIN",
-        business=business,
     )
     if pin is not None:
         admin.set_pin(pin)

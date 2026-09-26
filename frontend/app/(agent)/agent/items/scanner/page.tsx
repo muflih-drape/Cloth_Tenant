@@ -4,10 +4,11 @@ import { useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import { Scanner } from "@yudiel/react-qr-scanner";
 import { ImagePreview } from "@/components/pages/ImagePreview";
-import { itemApi } from "@/lib/api/item";
+import { fabricApi } from "@/lib/api/item";
 import { customerApi } from "@/lib/api/customer";
 import { PageLoading } from "@/components/ui/Loading";
 import { toastError } from "@/lib/toast";
+import { extractErrorMessage } from "@/lib/orderFlow";
 import {
   ArrowLeft,
   QrCode,
@@ -16,71 +17,14 @@ import {
   X,
   ShoppingCart,
 } from "lucide-react";
-import type { ItemQRResponse, ItemVariant, ItemType } from "@/types/item";
-import {
-  SIZE_RANGE_TO_SIZES,
-  FrontendSizeRange,
-  SIZE_RANGE_PIECE_COUNT,
-  getSizesForItemType,
-} from "@/types/item";
+import type { FabricQRResponse, FabricVariant } from "@/types/item";
+import { formatMeters, toMeters } from "@/types/item";
 import type { CustomerAllResponse } from "@/types/customer";
-
-function getAvailableSizeRanges(
-  variant: ItemVariant | null,
-  type: ItemType | undefined,
-): string[] {
-  if (!variant || !type) return [];
-
-  const variantSizes = Array.from(
-    new Set(
-      variant.sizes
-        .map((s) => s.size_range)
-        .filter((s): s is string => s !== undefined),
-    ),
-  );
-  const variantSizeSet = new Set(variantSizes);
-
-  const availableRanges = getSizesForItemType(type, "order_creation");
-
-  if (type === "gents") {
-    for (const range of availableRanges) {
-      const rangeSizes = SIZE_RANGE_TO_SIZES[range];
-      const rangeSizeSet = new Set(rangeSizes);
-      if (
-        rangeSizeSet.size === variantSizeSet.size &&
-        [...rangeSizeSet].every((s) => variantSizeSet.has(s))
-      ) {
-        return [range];
-      }
-    }
-    return variantSizes;
-  }
-
-  return availableRanges.filter((range) => {
-    const requiredSizes = SIZE_RANGE_TO_SIZES[range];
-    return requiredSizes.every((s) => variantSizeSet.has(s));
-  });
-}
-
-function getSizeGroupStock(
-  variant: ItemVariant | null,
-  sizeGroup: string,
-): number {
-  if (!variant) return 0;
-  const sizes = SIZE_RANGE_TO_SIZES[sizeGroup as FrontendSizeRange] || [];
-  let minStock = Infinity;
-  for (const size of sizes) {
-    const sizeObj = variant.sizes.find((s) => s.size_range === size);
-    if (!sizeObj) return 0;
-    minStock = Math.min(minStock, sizeObj.stock);
-  }
-  return minStock === Infinity ? 0 : minStock;
-}
 
 export default function PriceCheckScannerPage() {
   const router = useRouter();
-  const [scanResult, setScanResult] = useState<ItemQRResponse | null>(null);
-  const [selectedVariant, setSelectedVariant] = useState<ItemVariant | null>(
+  const [scanResult, setScanResult] = useState<FabricQRResponse | null>(null);
+  const [selectedVariant, setSelectedVariant] = useState<FabricVariant | null>(
     null,
   );
   const [loading, setLoading] = useState(false);
@@ -107,7 +51,7 @@ export default function PriceCheckScannerPage() {
     setLoading(true);
 
     try {
-      const result = await itemApi.byqr(data[0].rawValue);
+      const result = await fabricApi.byQr(data[0].rawValue);
       setScanResult(result);
       if (result.matched_variant_id) {
         const matched = result.variants.find(
@@ -117,9 +61,15 @@ export default function PriceCheckScannerPage() {
       } else {
         setSelectedVariant(result.variants[0] || null);
       }
-    } catch (err: any) {
-      console.error("Error fetching item:", err);
-      toastError(err.response?.data?.error || "Item not found", err);
+    } catch (err) {
+      console.error("Error fetching fabric:", err);
+      toastError(
+        extractErrorMessage(
+          (err as { response?: { data?: unknown } })?.response?.data,
+          "Fabric not found",
+        ),
+        err,
+      );
       setScanned(false);
     } finally {
       setLoading(false);
@@ -148,6 +98,8 @@ export default function PriceCheckScannerPage() {
     setSelectedVariant(null);
     setScanned(false);
   };
+
+  const onHand = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
 
   if (loading) return <PageLoading />;
 
@@ -262,7 +214,7 @@ export default function PriceCheckScannerPage() {
                   {v.image ? (
                     <ImagePreview
                       src={v.image}
-                      alt={`Variant ${v.id}`}
+                      alt={v.display_order || `Colour ${v.id}`}
                       enlargeDisabled={true}
                     />
                   ) : (
@@ -282,9 +234,11 @@ export default function PriceCheckScannerPage() {
             <h2 className="text-2xl font-black text-gray-900 mb-1">
               {scanResult.name}
             </h2>
-            <span className="inline-block px-3 py-1 bg-color-primary/10 text-color-primary rounded-full text-xs font-bold uppercase tracking-wider">
-              {scanResult.type}
-            </span>
+            {selectedVariant?.display_order && (
+              <span className="inline-block px-3 py-1 bg-color-primary/10 text-color-primary rounded-full text-xs font-bold uppercase tracking-wider">
+                {selectedVariant.display_order}
+              </span>
+            )}
           </div>
 
           <div className="bg-gradient-to-r from-green-50 to-emerald-50 border border-green-100 rounded-3xl p-6 mb-6">
@@ -292,57 +246,35 @@ export default function PriceCheckScannerPage() {
               Price
             </p>
             <p className="text-4xl font-black text-green-700">
-              ₹{scanResult.price}
+              ₹{Number(scanResult.price_per_meter).toLocaleString("en-IN")}
+              <span className="text-lg text-green-600/70">/m</span>
             </p>
           </div>
 
-          {(() => {
-            const sizeGroups = getAvailableSizeRanges(
-              selectedVariant,
-              scanResult.type as ItemType,
-            );
-            return sizeGroups.length > 0 ? (
-              <div className="mb-6">
-                <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-3">
-                  Available Size Groups
-                </p>
-                <div className="flex flex-wrap gap-2">
-                  {sizeGroups.map((group) => {
-                    const stock = getSizeGroupStock(selectedVariant, group);
-                    const setsAvailable = Math.floor(stock);
-                    const piecesPerSet = SIZE_RANGE_PIECE_COUNT[group] || 1;
-                    return (
-                      <div
-                        key={group}
-                        className="flex-shrink-0 px-3 py-2 rounded-lg min-w-[80px] bg-gray-50"
-                      >
-                        <span className="text-xs font-bold block text-gray-700">
-                          {group}
-                        </span>
-                        <span className="text-sm font-black block text-gray-900">
-                          {setsAvailable} Sets
-                        </span>
-                        <span className="text-[10px] text-gray-400 block">
-                          {piecesPerSet} pcs/set
-                        </span>
-                      </div>
-                    );
-                  })}
-                </div>
+          <div className="mb-6">
+            <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-3">
+              Availability
+            </p>
+            {onHand > 0 ? (
+              <div className="flex items-center justify-between px-4 py-3 bg-green-50 border border-green-100 rounded-xl">
+                <span className="text-sm font-bold text-green-700">
+                  {formatMeters(onHand)} m on the roll
+                </span>
+                <span className="text-xs text-green-600 font-medium">
+                  worth ₹
+                  {(
+                    onHand * Number(scanResult.price_per_meter)
+                  ).toLocaleString("en-IN")}
+                </span>
               </div>
             ) : (
-              <div className="mb-6">
-                <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-3">
-                  Availability
-                </p>
-                <div className="flex items-center gap-2 px-4 py-3 bg-red-50 border border-red-100 rounded-xl">
-                  <span className="font-bold text-sm text-red-500">
-                    Out of stock
-                  </span>
-                </div>
+              <div className="flex items-center gap-2 px-4 py-3 bg-red-50 border border-red-100 rounded-xl">
+                <span className="font-bold text-sm text-red-500">
+                  Nothing on the roll
+                </span>
               </div>
-            );
-          })()}
+            )}
+          </div>
 
           <button
             onClick={handleQuickOrder}
@@ -357,7 +289,7 @@ export default function PriceCheckScannerPage() {
             className="w-full mt-3 flex items-center justify-center gap-2 text-gray-400 border rounded-2xl border-gray-400 py-3 font-bold text-sm active:scale-[0.98] transition-all"
           >
             <QrCode size={16} />
-            Scan Another Item
+            Scan Another Fabric
           </button>
         </div>
       </div>
@@ -376,7 +308,7 @@ export default function PriceCheckScannerPage() {
           </button>
           <div className="flex flex-col">
             <h1 className="text-xl font-black text-gray-900 leading-tight">
-              Scan Item
+              Scan Fabric
             </h1>
             <p className="text-[10px] text-gray-400 font-bold uppercase tracking-wider">
               Check price
@@ -416,9 +348,9 @@ export default function PriceCheckScannerPage() {
               Price Check
             </span>
           </div>
-          <h2 className="text-lg font-bold text-gray-800">Scan Item QR</h2>
+          <h2 className="text-lg font-bold text-gray-800">Scan Fabric QR</h2>
           <p className="text-sm text-gray-400 mt-2 max-w-[200px] mx-auto leading-relaxed font-medium">
-            Scan an item&apos;s QR code to view price and details
+            Scan a fabric QR to see its rate and stock
           </p>
         </div>
       </div>

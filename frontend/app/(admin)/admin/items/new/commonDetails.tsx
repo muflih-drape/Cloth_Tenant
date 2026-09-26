@@ -3,62 +3,24 @@
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import { ArrowLeft } from "lucide-react";
-import type { CommonDetails, ItemType } from "@/types/item";
-import { useEffect, useState } from "react";
-import { brandApi } from "@/lib/api/brand";
-import { Brand } from "@/types/brand";
+import type { FabricDetails } from "@/types/item";
 
 interface Props {
-  value: CommonDetails;
-  onChange: (v: CommonDetails) => void;
+  value: FabricDetails;
+  onChange: (v: FabricDetails) => void;
   onNext: () => void;
   onBack: () => void;
-  isSuperuser?: boolean;
 }
 
-export default function Step1CommonDetails({
-  value,
-  onChange,
-  onNext,
-  onBack,
-  isSuperuser = false,
-}: Props) {
-  const [brandData, setBrandData] = useState<Brand[]>([]);
-  const [loading, setLoading] = useState(false);
-
-  const [mounted, setMounted] = useState(false);
-  useEffect(() => setMounted(true), []);
-
-  const set = <K extends keyof CommonDetails>(key: K, val: CommonDetails[K]) =>
+export default function Step1CommonDetails({ value, onChange, onNext, onBack }: Props) {
+  const set = <K extends keyof FabricDetails>(key: K, val: FabricDetails[K]) =>
     onChange({ ...value, [key]: val });
 
-  useEffect(() => {
-    const fetchData = async () => {
-      try {
-        const response = await brandApi.getAll();
-        setBrandData(response);
-      } catch (error) {
-        console.error("Error fetching brands:", error);
-      } finally {
-        setLoading(false);
-      }
-    };
-    fetchData();
-  }, []);
-
-  const isValid =
-    value.name.trim() !== "" &&
-    value.price.trim() !== "" &&
-    (!isSuperuser || value.brand_id);
+  const rate = Number(value.price_per_meter);
+  const priceValid = value.price_per_meter.trim() !== "" && rate >= 0;
+  const isValid = value.name.trim() !== "" && priceValid;
 
   return (
     <div className="flex flex-col min-h-screen bg-white px-4 py-8">
@@ -75,20 +37,19 @@ export default function Step1CommonDetails({
           <p className="text-[10px] text-gray-400 uppercase tracking-widest">
             Step 1 of 2
           </p>
-          <h1 className="text-xl font-black leading-tight">Item Details</h1>
+          <h1 className="text-xl font-black leading-tight">Fabric Details</h1>
         </div>
       </div>
 
-      {/* Hint */}
       <p className="text-sm text-gray-400 mb-6 leading-relaxed">
-        These details are shared across all color variants you&apos;ll add next.
+        These details are shared across all the colours you&apos;ll add next.
       </p>
 
       <div className="space-y-5 flex-1">
         <Field>
-          <FieldLabel>Name *</FieldLabel>
+          <FieldLabel>Fabric name *</FieldLabel>
           <Input
-            placeholder="e.g. Classic Sneaker"
+            placeholder="e.g. Cotton Lawn, Rayon Cambric"
             value={value.name}
             onChange={(e) => set("name", e.target.value)}
           />
@@ -97,74 +58,35 @@ export default function Step1CommonDetails({
         <Field>
           <FieldLabel>Description</FieldLabel>
           <Textarea
-            placeholder="Describe the item…"
+            placeholder="Composition, weight, feel…"
             value={value.description}
             onChange={(e) => set("description", e.target.value)}
           />
         </Field>
 
-        <div className="grid grid-cols-2 gap-4">
-          <Field>
-            <FieldLabel>Price (₹) *</FieldLabel>
-            <Input
-              type="number"
-              min={0}
-              placeholder="0.00"
-              value={value.price}
-              onChange={(e) => set("price", e.target.value)}
-            />
-          </Field>
-          <Field>
-            <FieldLabel>Type *</FieldLabel>
-            {!mounted || !isSuperuser ? (
-              <div className="h-12 px-3 flex items-center bg-gray-50 border border-gray-100 rounded-xl text-sm font-medium text-gray-500 capitalize">
-                {value.type}
-              </div>
-            ) : (
-              <Select
-                value={value.type}
-                onValueChange={(v) => set("type", v as ItemType)}
-              >
-                <SelectTrigger>
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="gents">Gents</SelectItem>
-                  <SelectItem value="kids">Kids</SelectItem>
-                </SelectContent>
-              </Select>
-            )}
-          </Field>
-          {mounted && isSuperuser && (
-            <Field>
-              <FieldLabel>Brand *</FieldLabel>
-              <Select
-                value={brandData
-                  .filter((brand) => brand.id === value.brand_id)?.[0]
-                  ?.name?.toString()}
-                onValueChange={(v) => set("brand_id", Number(v))}
-              >
-                <SelectTrigger>
-                  <SelectValue placeholder="Select brand" />
-                </SelectTrigger>
-                <SelectContent>
-                  {brandData.map((brand) => (
-                    <SelectItem key={brand.id} value={brand.id.toString()}>
-                      {brand.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </Field>
+        <Field>
+          <FieldLabel>Price per metre (₹) *</FieldLabel>
+          <Input
+            type="number"
+            min={0}
+            step="0.01"
+            inputMode="decimal"
+            placeholder="0.00"
+            value={value.price_per_meter}
+            onChange={(e) => set("price_per_meter", e.target.value)}
+          />
+          {value.price_per_meter.trim() !== "" && !priceValid && (
+            <p className="mt-1.5 text-xs text-red-600">
+              Enter a price of zero or more.
+            </p>
           )}
-        </div>
+        </Field>
       </div>
 
-      {/* CTA */}
       <div className="mt-auto pt-8 pb-6">
         <StockFlowButton
           variant="filled"
-          text="Next — Add Colors"
+          text="Next — Add Colours"
           disabled={!isValid}
           onClick={onNext}
           className="w-full h-14 rounded-2xl bg-primary text-white font-bold shadow-lg shadow-primary/20 flex items-center justify-center"

@@ -1,14 +1,21 @@
-from django.conf import settings
+from decimal import Decimal
 
+from django.conf import settings
 from rest_framework import serializers
 
 from apps.agents.models import Agent
 from apps.business.models import Brand
 from apps.customers.models import Customer
-from apps.items.models import ItemVariant
+from apps.items.models import FabricVariant
 
-from .models import Order, OrderItem
-from .utils import get_piece_count
+from .models import Allocation, Order, OrderItem
+from .pricing import line_value, order_totals
+
+CENT = Decimal("0.01")
+
+#: Smallest orderable quantity: one gram, i.e. 0.001 m at 3 decimal places.
+#: Anything below this is a rounding artefact, not a real order line.
+MIN_ORDER_METERS = Decimal("0.001")
 
 
 class SimpleCustomerSerializer(serializers.ModelSerializer):
@@ -49,53 +56,54 @@ class SimpleBrandSerializer(serializers.ModelSerializer):
 
 
 class OrderItemSerializer(serializers.ModelSerializer):
-    item_name_display = serializers.CharField(source="item_name", read_only=True)
-    item_price_display = serializers.DecimalField(
-        source="item_price", max_digits=10, decimal_places=2, read_only=True
-    )
-    variant_image_display = serializers.URLField(source="variant_image", read_only=True)
+    fabric_name_display = serializers.CharField(source="fabric_name", read_only=True)
     variant_display_order = serializers.CharField(
         source="variant.display_order", read_only=True
     )
-    size_display = serializers.CharField(source="size", read_only=True)
-    piece_count = serializers.SerializerMethodField()
+    outstanding_quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=3, read_only=True
+    )
+    line_total = serializers.SerializerMethodField()
+    allocation_count = serializers.SerializerMethodField()
 
     class Meta:
         model = OrderItem
         fields = [
             "id",
-            "item",
+            "fabric",
             "variant",
-            "size_group",
-            "item_type",
-            "item_name",
-            "item_name_display",
-            "item_price",
-            "item_price_display",
-            "variant_image",
-            "variant_image_display",
             "variant_display_order",
-            "size",
-            "size_display",
-            "quantity",
-            "packed_quantity",
-            "piece_count",
+            "fabric_name",
+            "fabric_name_display",
+            "rate_per_meter",
+            "variant_image",
+            "ordered_quantity",
+            "allocated_quantity",
+            "outstanding_quantity",
+            "line_total",
+            "allocation_count",
         ]
-        read_only_fields = ("order", "item_name", "item_price", "variant_image", "size")
+        read_only_fields = (
+            "order",
+            "fabric_name",
+            "rate_per_meter",
+            "variant_image",
+            "allocated_quantity",
+        )
 
-    def get_piece_count(self, obj):
-        return get_piece_count(obj.size_group, obj.item_type or "gents")
+    def get_line_total(self, obj):
+        return str(line_value(obj).quantize(CENT))
+
+    def get_allocation_count(self, obj):
+        return obj.allocations.count()
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get("request")
 
         variant_image = data.get("variant_image")
-
-        if not variant_image and request:
-            if instance.variant and instance.variant.image:
-                variant_image = request.build_absolute_uri(instance.variant.image.url)
-                data["variant_image"] = variant_image
+        if not variant_image and request and instance.variant and instance.variant.image:
+            data["variant_image"] = request.build_absolute_uri(instance.variant.image.url)
         elif variant_image and request and not variant_image.startswith("http"):
             data["variant_image"] = request.build_absolute_uri(variant_image)
 
@@ -104,91 +112,91 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
 class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, read_only=True)
-
     customer = serializers.PrimaryKeyRelatedField(
         queryset=Customer.objects.filter(is_active=True), write_only=True
     )
-
     agent_details = SimpleAgentSerializer(source="agent", read_only=True)
-
     customer_details = SimpleCustomerSerializer(source="customer", read_only=True)
-
     created_by = serializers.PrimaryKeyRelatedField(read_only=True)
 
-    total_sets = serializers.SerializerMethodField()
-    total_pieces = serializers.SerializerMethodField()
+    totals = serializers.SerializerMethodField()
+    is_price_overridden = serializers.BooleanField(read_only=True)
 
     class Meta:
         model = Order
         fields = "__all__"
         read_only_fields = ("created_by",)
 
-    def get_total_sets(self, obj):
-        return sum(i.quantity for i in obj.items.all())
-
-    def get_total_pieces(self, obj):
-        total = 0
-        for i in obj.items.all():
-            piece_count = get_piece_count(i.size_group, i.item_type or "gents")
-            total += i.quantity * piece_count
-        return total
+    def get_totals(self, obj):
+        totals = order_totals(obj)
+        return {
+            **totals,
+            "total_ordered_meters": str(totals["total_ordered_meters"]),
+            "total_allocated_meters": str(totals["total_allocated_meters"]),
+            "total_outstanding_meters": str(totals["total_outstanding_meters"]),
+            "computed_total": str(totals["computed_total"]),
+            "final_total": (
+                str(totals["final_total"]) if totals["final_total"] is not None else None
+            ),
+            "effective_total": str(totals["effective_total"]),
+            "price_overridden_at": (
+                totals["price_overridden_at"].isoformat()
+                if totals["price_overridden_at"]
+                else None
+            ),
+        }
 
 
 class AddOrderItemSerializer(serializers.Serializer):
+    """Add a fabric line to a draft by scanning its QR label."""
+
     qr_code = serializers.UUIDField()
-    quantity = serializers.IntegerField()
-    size_group = serializers.CharField()
-    size = serializers.CharField(required=False, default="")
+    ordered_quantity = serializers.DecimalField(
+        max_digits=14, decimal_places=3, min_value=MIN_ORDER_METERS
+    )
 
     def validate(self, attrs):
-
         try:
-            variant = ItemVariant.objects.get(qr_code=attrs["qr_code"])
-        except ItemVariant.DoesNotExist:
+            variant = FabricVariant.objects.select_related("fabric").get(
+                qr_code=attrs["qr_code"]
+            )
+        except FabricVariant.DoesNotExist:
             raise serializers.ValidationError("Invalid QR Code")
 
-        if variant.item.is_deleted:
-            raise serializers.ValidationError("This item has been deleted")
+        if variant.fabric.is_deleted:
+            raise serializers.ValidationError("This fabric has been deleted")
 
         attrs["variant"] = variant
-        attrs["item"] = variant.item
+        attrs["fabric"] = variant.fabric
 
         request = self.context.get("request")
         image_url = getattr(variant.image, "url", None) if variant.image else None
-        if request and image_url:
-            attrs["variant_image"] = request.build_absolute_uri(image_url)
-        else:
-            attrs["variant_image"] = None
+        attrs["variant_image"] = (
+            request.build_absolute_uri(image_url) if request and image_url else None
+        )
 
-        attrs["item_name"] = variant.item.name
-        attrs["item_price"] = variant.item.price
+        attrs["fabric_name"] = variant.fabric.name
+        attrs["rate_per_meter"] = variant.fabric.price_per_meter
+        attrs["variant_display_order"] = variant.display_order or ""
 
         return attrs
 
 
-class UnpackedOrderItemSerializer(serializers.Serializer):
-    id = serializers.IntegerField()
-    item_name = serializers.CharField()
-    variant_display_order = serializers.CharField(
-        source="variant.display_order", default=""
-    )
-    quantity = serializers.IntegerField()
-    size_group = serializers.CharField()
-    item_type = serializers.CharField()
-    variant_image = serializers.SerializerMethodField()
-    piece_count = serializers.SerializerMethodField()
+class AllocationSerializer(serializers.ModelSerializer):
+    customer = serializers.CharField(source="order_item.order.customer.name", read_only=True)
+    fabric = serializers.CharField(source="order_item.fabric_name", read_only=True)
 
-    def get_variant_image(self, obj):
-        request = self.context.get("request")
-        image = obj.variant_image
-        if not image and obj.variant and obj.variant.image:
-            image = obj.variant.image.url
-        if image and request and not image.startswith("http"):
-            image = request.build_absolute_uri(image)
-        return image
-
-    def get_piece_count(self, obj):
-        return get_piece_count(obj.size_group, obj.item_type or "gents")
+    class Meta:
+        model = Allocation
+        fields = [
+            "id",
+            "metres",
+            "sequence",
+            "is_priority_award",
+            "created_at",
+            "customer",
+            "fabric",
+        ]
 
 
 class InvoiceSerializer(serializers.ModelSerializer):
@@ -196,7 +204,7 @@ class InvoiceSerializer(serializers.ModelSerializer):
     agent = SimpleAgentSerializer()
     items = OrderItemSerializer(many=True)
     brand = serializers.SerializerMethodField()
-    total_price = serializers.SerializerMethodField()
+    totals = serializers.SerializerMethodField()
     gst_rate = serializers.SerializerMethodField()
 
     class Meta:
@@ -209,31 +217,32 @@ class InvoiceSerializer(serializers.ModelSerializer):
             "created_at",
             "status",
             "items",
-            "total_price",
+            "totals",
             "gst_rate",
+            "lr_number",
+            "notes",
         ]
 
     def get_gst_rate(self, obj):
         return settings.GST_RATE
 
     def get_brand(self, obj):
-        first_item = obj.items.first()
-        if first_item and first_item.item and first_item.item.brand:
-            serializer = SimpleBrandSerializer(
-                first_item.item.brand, context=self.context
-            )
-            return serializer.data
-        return None
+        brand = Brand.objects.order_by("id").first()
+        if brand is None:
+            return None
+        return SimpleBrandSerializer(brand, context=self.context).data
 
-    def get_total_price(self, obj):
-
-        total = 0
-
-        for item in obj.items.all():
-            if item.item is None:
-                continue
-            item_type = item.item_type if item.item_type else "gents"
-            piece_count = get_piece_count(item.size_group, item_type)
-            total += float(item.item_price) * item.quantity * piece_count
-
-        return total
+    def get_totals(self, obj):
+        totals = order_totals(obj)
+        return {
+            "total_ordered_meters": str(totals["total_ordered_meters"]),
+            "total_allocated_meters": str(totals["total_allocated_meters"]),
+            "total_outstanding_meters": str(totals["total_outstanding_meters"]),
+            "computed_total": str(totals["computed_total"]),
+            "final_total": (
+                str(totals["final_total"]) if totals["final_total"] is not None else None
+            ),
+            "total_price": str(totals["effective_total"]),
+            "is_price_overridden": totals["is_price_overridden"],
+            "price_override_reason": totals["price_override_reason"],
+        }

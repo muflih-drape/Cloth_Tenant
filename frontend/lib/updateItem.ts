@@ -1,100 +1,61 @@
-import { EditableVariant, EditCommonDetails } from "@/types/item";
-import { api } from "./api";
-import { itemApi } from "./api/item";
+import type { EditableVariant, FabricRequest } from "@/types/item";
+import { fabricApi } from "./api/item";
+import { fabricToFormData } from "./form-utils";
 
-export async function updateItem(
-  itemId: number,
-  common: EditCommonDetails,
+/** Local-only marker for a colour the admin just added on the edit screen. */
+function isNewVariant(backendId: number): boolean {
+  return backendId < 0;
+}
+
+/**
+ * Build the update payload for a fabric.
+ *
+ * Two rules the API relies on, both easy to get wrong:
+ *  - Every colour has to be sent, because the API treats a colour missing from
+ *    the payload as deleted.
+ *  - `stock_meters` is only sent for colours that don't exist yet. The API
+ *    ignores it for existing colours anyway, and sending the live warehouse
+ *    count back would be a lie the moment packing has moved stock since the
+ *    page was loaded.
+ */
+export function buildFabricUpdatePayload(
+  common: { name: string; description?: string; price_per_meter: string },
+  variants: EditableVariant[],
+): FabricRequest {
+  return {
+    name: common.name,
+    description: common.description ?? "",
+    price_per_meter: common.price_per_meter,
+    variants: variants.map((variant) => {
+      const isNew = isNewVariant(variant.backendId);
+      // Trim: a label of only spaces is an empty label, not the colour "  ".
+      const label = variant.displayOrder.trim();
+      return {
+        // No id means "create this", which is how a just-added colour is sent.
+        ...(variant.backendId > 0 ? { id: variant.backendId } : {}),
+        display_order: label || null,
+        ...(variant.newImage ? { image: variant.newImage } : {}),
+        // A cleared photo is signalled by having no URL and no replacement.
+        ...(variant.backendId > 0 && !variant.imageUrl && !variant.newImage
+          ? { remove_image: true }
+          : {}),
+        // Opening stock only applies to new colours.
+        ...(isNew ? { stock_meters: variant.stockMeters || "0" } : {}),
+      };
+    }),
+  };
+}
+
+export async function updateFabric(
+  fabricId: number,
+  common: { name: string; description?: string; price_per_meter: string },
   variants: EditableVariant[],
 ): Promise<void> {
-  // ── Group all variants by backendId ───────────────────────────────────────
-  // Positive backendId  → existing variant (send with id)
-  // Negative backendId  → new variant added on edit page (send without id)
-
-  type GroupEntry = {
-    id?: number; // omitted for new variants
-    isNew: boolean;
-    sizes: { size: string; stock: number }[];
-    newImage: File | null;
-    imageRemoved: boolean;
-    display_order?: string;
-  };
-
-  const grouped = variants.reduce<Record<string, GroupEntry>>((acc, v) => {
-    const key = String(v.backendId);
-    if (!acc[key]) {
-      acc[key] = {
-        ...(v.backendId > 0 ? { id: v.backendId } : {}), // no id for new
-        isNew: v.backendId < 0,
-        sizes: [],
-        newImage: v.newImage,
-        imageRemoved:
-          v.imageUrl === null && v.newImage === null && v.backendId > 0,
-        display_order: v.display_order,
-      };
-    }
-    acc[key].sizes.push({ size: v.size, stock: v.stock });
-    return acc;
-  }, {});
-
-  // ── Build PATCH payload ───────────────────────────────────────────────────
-  const payload = {
-    name: common.name,
-    price: common.price,
-    type: common.type,
-    ...(common.description && { description: common.description }),
-    variants: Object.values(grouped).map((g) => ({
-      ...(g.id ? { id: g.id } : {}), // existing variants carry their id
-      sizes: g.sizes,
-      ...(g.imageRemoved ? { remove_image: true } : {}),
-      ...(g.display_order !== undefined ? { display_order: g.display_order === "" ? null : g.display_order } : {}),
-    })),
-  };
-
-  const updatedItem = await itemApi.update(itemId, payload);
-
-  // ── Upload images ─────────────────────────────────────────────────────────
-  // Collect image jobs: existing variants with a new image + newly created variants
-  const imageJobs: { variantId: number; image: File }[] = [];
-
-  // 1. Existing variants that got a new image
-  Object.values(grouped)
-    .filter((g) => !g.isNew && g.newImage)
-    .forEach((g) => {
-      imageJobs.push({ variantId: g.id!, image: g.newImage! });
-    });
-
-  // 2. New variants that have an image — match them by position in the response
-  //    The backend returns variants in insertion order; new ones are appended.
-  const newGroups = Object.values(grouped).filter((g) => g.isNew && g.newImage);
-  if (newGroups.length > 0 && updatedItem?.variants) {
-    // Existing variant ids we already know about
-    const existingIds = new Set(
-      Object.values(grouped)
-        .filter((g) => !g.isNew)
-        .map((g) => g.id),
-    );
-    // The remaining variants in the response are the newly created ones
-    const createdVariants = updatedItem.variants.filter(
-      (v: { id: number }) => !existingIds.has(v.id),
-    );
-    newGroups.forEach((g, i) => {
-      if (createdVariants[i]) {
-        imageJobs.push({
-          variantId: createdVariants[i].id,
-          image: g.newImage!,
-        });
-      }
-    });
-  }
-
-  if (imageJobs.length === 0) return;
-
-  await Promise.all(
-    imageJobs.map(({ variantId, image }) => {
-      const fd = new FormData();
-      fd.append("image", image);
-      return api.patch(`/api/items/variants/${variantId}/`, fd);
-    }),
+  // Multipart, not JSON: a replaced photo is a File, and JSON.stringify turns a
+  // File into `{}`, which the API's FileField rejects with "The submitted data
+  // was not a file."
+  await fabricApi.update(
+    fabricId,
+    fabricToFormData(buildFabricUpdatePayload(common, variants)),
   );
 }

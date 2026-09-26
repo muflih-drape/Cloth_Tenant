@@ -12,7 +12,8 @@ import {
 import { useParams, useRouter } from "next/navigation";
 import { useEffect, useState } from "react";
 import { orderApi } from "@/lib/api/order";
-import { OrderResponse, OutOfStockItem, PlaceOrderError } from "@/types/order";
+import { OrderResponse } from "@/types/order";
+import { formatMeters, toMeters } from "@/types/item";
 import { PageLoading } from "@/components/ui/Loading";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import { AxiosError } from "axios";
@@ -30,8 +31,6 @@ export default function EditOrderPage() {
   const [placingOrder, setPlacingOrder] = useState(false);
   const [orders, setOrders] = useState<OrderResponse>();
   const [loadError, setLoadError] = useState(false);
-  const [showOutOfStockModal, setShowOutOfStockModal] = useState(false);
-  const [outOfStockItems, setOutOfStockItems] = useState<OutOfStockItem[]>([]);
   const [showMergeWarning, setShowMergeWarning] = useState(false);
 
   const [expectedDeliveryDate, setExpectedDeliveryDate] = useState("");
@@ -44,26 +43,28 @@ export default function EditOrderPage() {
   const [loadingTransports, setLoadingTransports] = useState(true);
   const [notes, setNotes] = useState("");
   interface MergeGroup {
-    item_name: string;
-    size_group: string;
-    items: Array<{ id: number; quantity: number }>;
-    total: number;
+    fabric_name: string;
+    variant_display_order: string;
+    items: Array<{ id: number; metres: number }>;
+    totalMetres: number;
   }
 
+  /** The same colour scanned twice is really one line; the totals get combined. */
   const duplicateGroups = (() => {
     if (!orders?.items.length) return [];
 
     const map = new Map<
       string,
-      Array<{ id: number; quantity: number; item_name: string }>
+      { id: number; metres: number; fabric_name: string; variant_display_order: string }[]
     >();
     for (const item of orders.items) {
-      const key = `${item.item?.id ?? "unknown"}-${item.variant ?? "none"}-${item.size_group ?? "none"}`;
-      const group = map.get(key) || [];
+      const key = `${item.fabric ?? "unknown"}-${item.variant ?? "none"}`;
+      const group = map.get(key) ?? [];
       group.push({
         id: item.id,
-        quantity: item.quantity,
-        item_name: item.item?.name || item.item_name || "Unknown Item",
+        metres: toMeters(item.ordered_quantity),
+        fabric_name: item.fabric_name,
+        variant_display_order: item.variant_display_order,
       });
       map.set(key, group);
     }
@@ -71,41 +72,20 @@ export default function EditOrderPage() {
     const groups: MergeGroup[] = [];
     for (const [, items] of map) {
       if (items.length > 1) {
-        const total = items.reduce((sum, i) => sum + i.quantity, 0);
         groups.push({
-          item_name: items[0].item_name,
-          size_group:
-            items[0].quantity > 0
-              ? orders.items.find((o) => o.id === items[0].id)?.size_group || ""
-              : "",
-          items: items.map((i) => ({ id: i.id, quantity: i.quantity })),
-          total,
+          fabric_name: items[0].fabric_name,
+          variant_display_order: items[0].variant_display_order,
+          items: items.map((i) => ({ id: i.id, metres: i.metres })),
+          totalMetres: items.reduce((sum, i) => sum + i.metres, 0),
         });
       }
     }
     return groups;
   })();
 
-  const outOfStockItemIds = outOfStockItems.map((item) => item.order_item_id);
-
-  const totalSets =
-    orders?.items.reduce((sum, item) => sum + item.quantity, 0) || 0;
-
-  const totalPieces =
-    orders?.items.reduce(
-      (sum, item) => sum + item.quantity * (item.piece_count || 1),
-      0,
-    ) || 0;
-
-  const totalMoney =
-    orders?.items.reduce(
-      (sum, item) =>
-        sum +
-        (Number(item.item_price) || 0) *
-          item.quantity *
-          (item.piece_count || 1),
-      0,
-    ) || 0;
+  const totalMetres =
+    orders?.items.reduce((sum, item) => sum + toMeters(item.ordered_quantity), 0) ?? 0;
+  const totalMoney = Number(orders?.totals.computed_total ?? 0);
 
   const handleSaveChanges = async () => {
     if (duplicateGroups.length > 0) {
@@ -125,13 +105,12 @@ export default function EditOrderPage() {
       toastSuccess("Order saved successfully!");
       router.push(`/agent/order/status/${id}`);
     } catch (error) {
-      const axiosError = error as AxiosError<PlaceOrderError>;
-      if (axiosError.response?.data?.out_of_stock_items) {
-        setOutOfStockItems(axiosError.response.data.out_of_stock_items);
-        setShowOutOfStockModal(true);
-      } else {
-        toastError(axiosError.response?.data?.error || "Failed to save order");
-      }
+      const axiosError = error as AxiosError<{ error?: string; detail?: string }>;
+      toastError(
+        axiosError.response?.data?.error ||
+          axiosError.response?.data?.detail ||
+          "Failed to save order",
+      );
     } finally {
       setPlacingOrder(false);
     }
@@ -144,7 +123,9 @@ export default function EditOrderPage() {
     try {
       for (const group of duplicateGroups) {
         const firstItemId = group.items[0].id;
-        await orderApi.updateItem(firstItemId, { quantity: group.total });
+        await orderApi.updateItem(firstItemId, {
+          ordered_quantity: String(group.totalMetres),
+        });
         for (let i = 1; i < group.items.length; i++) {
           await orderApi.deleteItem(Number(id), group.items[i].id);
         }
@@ -162,13 +143,12 @@ export default function EditOrderPage() {
       toastSuccess("Order saved successfully!");
       router.push(`/agent/order/status/${id}`);
     } catch (error) {
-      const axiosError = error as AxiosError<PlaceOrderError>;
-      if (axiosError.response?.data?.out_of_stock_items) {
-        setOutOfStockItems(axiosError.response.data.out_of_stock_items);
-        setShowOutOfStockModal(true);
-      } else {
-        toastError(axiosError.response?.data?.error || "Failed to save order");
-      }
+      const axiosError = error as AxiosError<{ error?: string; detail?: string }>;
+      toastError(
+        axiosError.response?.data?.error ||
+          axiosError.response?.data?.detail ||
+          "Failed to save order",
+      );
     } finally {
       setPlacingOrder(false);
     }
@@ -322,7 +302,7 @@ export default function EditOrderPage() {
         {/* Items Section Header */}
         <div className="flex justify-between items-end mb-6">
           <div className="flex flex-col">
-            <h2 className="text-xl font-black text-gray-900">Order Items</h2>
+            <h2 className="text-xl font-black text-gray-900">Fabric Lines</h2>
             <div className="flex gap-2 items-center mt-1">
               <span className="text-gray-400 text-[10px] font-bold uppercase tracking-wider">
                 Selected
@@ -335,7 +315,7 @@ export default function EditOrderPage() {
             </div>
           </div>
           <StockFlowButton
-            text="Add Item"
+            text="Add Fabric"
             variant="filled"
             icon={<Plus className="size-4" />}
             onClick={() => router.push(`/agent/order/edit/${id}/scanner`)}
@@ -348,9 +328,9 @@ export default function EditOrderPage() {
           {!orders || orders.items.length === 0 ? (
             <div className="flex flex-col items-center justify-center py-16 bg-white rounded-3xl border border-dashed border-gray-200">
               <ShoppingBag size={48} className="text-gray-200 mb-4" />
-              <p className="text-gray-400 font-bold">No items added yet</p>
+              <p className="text-gray-400 font-bold">No fabrics added yet</p>
               <p className="text-[10px] text-gray-300 uppercase tracking-widest mt-1">
-                Scan QR codes to add products
+                Scan a fabric QR to add metres
               </p>
             </div>
           ) : (
@@ -360,7 +340,6 @@ export default function EditOrderPage() {
                 items={orders.items}
                 isDeletable={true}
                 isEditable={true}
-                outOfStockItemIds={outOfStockItemIds}
               />
             </div>
           )}
@@ -370,111 +349,13 @@ export default function EditOrderPage() {
         {orders && orders.items.length > 0 && (
           <div className="mt-8">
             <OrderTotals
-              totalSets={totalSets}
-              totalPieces={totalPieces}
+              totalMetres={totalMetres}
+              totalLines={orders.items.length}
               totalPrice={totalMoney}
               onPlaceOrder={handleSaveChanges}
               isLoading={placingOrder}
               buttonText="Save Changes"
             />
-          </div>
-        )}
-
-        {/* Out of Stock Modal */}
-        {showOutOfStockModal && (
-          <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-0">
-            <div className="bg-white rounded-3xl max-w-sm w-full p-6 shadow-2xl">
-              <div className="flex items-center justify-between mb-4">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-xl bg-red-100 flex items-center justify-center">
-                    <AlertTriangle className="text-red-500" size={20} />
-                  </div>
-                  <h3 className="text-lg font-black text-gray-900">
-                    Out of Stock
-                  </h3>
-                </div>
-                <button
-                  onClick={() => setShowOutOfStockModal(false)}
-                  className="p-2 hover:bg-gray-100 rounded-xl transition-colors"
-                >
-                  <X size={20} className="text-gray-400" />
-                </button>
-              </div>
-              <p className="text-sm text-gray-500 mb-4">
-                Some items are no longer available. Stock may have been taken by
-                another agent.
-              </p>
-              <div className="space-y-3 mb-6 max-h-48 overflow-y-auto">
-                {(() => {
-                  const grouped = outOfStockItems.reduce(
-                    (acc, item) => {
-                      const key = item.order_item_id;
-                      if (!acc[key]) {
-                        acc[key] = {
-                          item_name: item.item_name,
-                          size_group: item.size_group,
-                          required: item.required,
-                          available: item.available,
-                          order_item_id: item.order_item_id,
-                        };
-                      } else {
-                        acc[key].available = Math.min(
-                          acc[key].available,
-                          item.available,
-                        );
-                      }
-                      return acc;
-                    },
-                    {} as Record<
-                      number,
-                      {
-                        item_name: string;
-                        size_group: string;
-                        required: number;
-                        available: number;
-                        order_item_id: number;
-                      }
-                    >,
-                  );
-
-                  return Object.values(grouped).map((item, idx) => (
-                    <div
-                      key={idx}
-                      className="bg-red-50 rounded-xl p-3 border border-red-200"
-                    >
-                      <p className="font-bold text-gray-900 text-sm">
-                        {item.item_name}, {item.size_group}
-                      </p>
-                      <p className="text-xs mt-1">
-                        <span className="text-gray-500">Requested: </span>
-                        <span className="font-semibold text-gray-900">
-                          {item.required}
-                        </span>
-                        <span className="text-gray-400"> | </span>
-                        <span className="text-gray-500">Available: </span>
-                        <span className="font-semibold text-red-600">
-                          {item.available}
-                        </span>
-                      </p>
-                    </div>
-                  ));
-                })()}
-              </div>
-              <div className="flex gap-3">
-                <button
-                  onClick={() => setShowOutOfStockModal(false)}
-                  className="flex-1 py-3 rounded-xl border border-gray-200 text-gray-600 font-bold text-sm hover:bg-gray-50 transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  onClick={() => setShowOutOfStockModal(false)}
-                  className="flex-1 py-3 rounded-xl bg-primary text-white font-bold text-sm hover:opacity-90 transition-opacity"
-                >
-                  Remove Items
-                </button>
-              </div>
-            </div>
           </div>
         )}
 
@@ -488,7 +369,7 @@ export default function EditOrderPage() {
                     <AlertTriangle className="text-amber-500" size={20} />
                   </div>
                   <h3 className="text-lg font-black text-gray-900">
-                    Duplicate Items
+                    Duplicate Fabrics
                   </h3>
                 </div>
                 <button
@@ -499,8 +380,8 @@ export default function EditOrderPage() {
                 </button>
               </div>
               <p className="text-sm text-gray-500 mb-4">
-                Some items have the same color and size range. They will be
-                combined into one item with the total quantity.
+                The same colour was scanned more than once. They will be
+                combined into one line with the total metres.
               </p>
               <div className="space-y-3 mb-6 max-h-48 overflow-y-auto">
                 {duplicateGroups.map((group, idx) => (
@@ -509,13 +390,16 @@ export default function EditOrderPage() {
                     className="bg-amber-50 rounded-xl p-3 border border-amber-200"
                   >
                     <p className="font-bold text-gray-900 text-sm">
-                      {group.item_name} — {group.size_group}
+                      {group.fabric_name}
+                      {group.variant_display_order
+                        ? ` — ${group.variant_display_order}`
+                        : ""}
                     </p>
                     <p className="text-xs mt-1">
                       {group.items.map((item, i) => (
                         <span key={item.id}>
                           <span className="font-semibold text-gray-700">
-                            {item.quantity}
+                            {formatMeters(item.metres)} m
                           </span>
                           {i < group.items.length - 1 && (
                             <span className="text-gray-400"> + </span>
@@ -524,7 +408,7 @@ export default function EditOrderPage() {
                       ))}
                       <span className="text-gray-400"> = </span>
                       <span className="font-bold text-amber-600">
-                        {group.total} sets
+                        {formatMeters(group.totalMetres)} m
                       </span>
                     </p>
                   </div>

@@ -5,32 +5,28 @@ import { ArrowLeft, ImagePlus, X } from "lucide-react";
 import { Field, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import Image from "next/image";
-import heic2any from "heic2any";
-
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@/components/ui/select";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import CropModal from "./cropModal";
 import CommonDetailsBadge from "./commonDetailsBadge";
-import { ColorVariant, CommonDetails, FrontendSizeRange } from "@/types/item";
-import { getSizesForItemType } from "@/types/item";
+import { ColorVariant, FabricDetails } from "@/types/item";
+import { formatMeters } from "@/types/item";
 import { Modal, ModalButton } from "@/components/ui/custom/Modals";
 import { normalizeImageFile } from "@/lib/image-utils";
 
 interface Props {
   initial: ColorVariant;
-  common: CommonDetails;
+  common: FabricDetails;
   isEdit: boolean;
-  variantIndex: number; // for the "Variant #N" header label
+  variantIndex: number; // for the "Colour #N" header label
   onSave: (v: ColorVariant) => void;
   onBack: () => void;
 }
 
+/**
+ * One colour of a fabric. A colour *is* the stock-keeping unit here, so the
+ * opening metre count entered on this screen is the physical cloth on hand for
+ * that colour -- there is no size breakdown to fill in.
+ */
 export default function Step2AddColor({
   initial,
   common,
@@ -39,24 +35,13 @@ export default function Step2AddColor({
   onSave,
   onBack,
 }: Props) {
-  const availableSizes = getSizesForItemType(common.type, "item_creation");
-
-  const [variant, setVariant] = useState<ColorVariant>(() => {
-    if (common.type === "kids") {
-      const fullyInitialized = availableSizes.reduce(
-        (acc, size) => ({ ...acc, [size]: initial.perSizeStock?.[size] ?? 0 }),
-        {} as Record<string, number>,
-      );
-      return { ...initial, perSizeStock: fullyInitialized };
-    }
-    return { ...initial};
-  });
+  const [variant, setVariant] = useState<ColorVariant>({ ...initial });
   const [cropSrc, setCropSrc] = useState<string | null>(null);
-  const [stockInput, setStockInput] = useState(String(initial.stock));
+  const [stockInput, setStockInput] = useState(initial.stockMeters || "0");
+  const [stockError, setStockError] = useState<string | null>(null);
 
   const galleryRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
-
   const [showPicker, setShowPicker] = useState(false);
 
   const isMobile =
@@ -71,7 +56,6 @@ export default function Step2AddColor({
     if (!f) return;
 
     const normalisedFile = await normalizeImageFile(f);
-
     setCropSrc(URL.createObjectURL(normalisedFile));
     e.target.value = "";
   };
@@ -81,19 +65,32 @@ export default function Step2AddColor({
       ...v,
       image: file,
       imagePreview: URL.createObjectURL(file),
-      display_order: String(variantIndex)
     }));
     setCropSrc(null);
   };
 
   const handleStockChange = (raw: string) => {
     setStockInput(raw);
-    const parsed = parseInt(raw, 10);
-    set("stock", isNaN(parsed) ? 0 : parsed);
+    set("stockMeters", raw);
+    if (stockError) setStockError(null);
   };
 
   const handleStockBlur = () => {
-    setStockInput(String(variant.stock));
+    const metres = Number(stockInput);
+    if (stockInput === "" || Number.isNaN(metres) || metres < 0) {
+      setStockError("Enter the metres on hand, zero or more.");
+      setStockInput("0");
+      set("stockMeters", "0");
+    }
+  };
+
+  const handleSave = () => {
+    const metres = Number(stockInput);
+    if (stockInput === "" || Number.isNaN(metres) || metres < 0) {
+      setStockError("Enter the metres on hand, zero or more.");
+      return;
+    }
+    onSave({ ...variant, stockMeters: stockInput });
   };
 
   const handlePickerOpen = () => {
@@ -126,21 +123,20 @@ export default function Step2AddColor({
           </button>
           <div>
             <p className="text-[10px] text-gray-400 uppercase tracking-widest">
-              {isEdit ? "Edit variant" : "Step 2 of 2"}
+              {isEdit ? "Edit colour" : "Step 2 of 2"}
             </p>
             <h1 className="text-xl font-black leading-tight">
-              Variant #{variantIndex}
+              Colour #{variantIndex}
             </h1>
           </div>
         </div>
 
-        {/* Common details — read-only */}
         <CommonDetailsBadge common={common} />
 
         <div className="space-y-5 mt-6 flex-1">
           {/* Image */}
           <Field>
-            <FieldLabel>Product Image</FieldLabel>
+            <FieldLabel>Colour photo</FieldLabel>
             <button
               type="button"
               onClick={handlePickerOpen}
@@ -189,7 +185,7 @@ export default function Step2AddColor({
               </div>
             )}
           </Field>
-          {/* Gallery */}
+
           <input
             ref={galleryRef}
             type="file"
@@ -198,7 +194,6 @@ export default function Step2AddColor({
             onChange={handleFile}
           />
 
-          {/* Camera */}
           <input
             ref={cameraRef}
             type="file"
@@ -208,104 +203,58 @@ export default function Step2AddColor({
             onChange={handleFile}
           />
 
-          {/* Size range — filtered by common.type */}
-          {common.type === "kids" ? (
-            <Field>
-              <FieldLabel>Sizes & Stock</FieldLabel>
-              <div className="space-y-2">
-                {availableSizes.map((size) => {
-                  const stockVal = variant.perSizeStock![size] ?? 0;
+          {/* Colour name — this is what the picker shows on the order screen */}
+          <Field>
+            <FieldLabel>Colour / finish</FieldLabel>
+            <Input
+              placeholder="e.g. Maroon, Ivory, Navy"
+              value={variant.displayOrder}
+              onChange={(e) => set("displayOrder", e.target.value)}
+            />
+          </Field>
 
-                  const updateStock = (raw: string) => {
-                    const parsed = parseInt(raw, 10);
-                    set("perSizeStock", {
-                      ...variant.perSizeStock!,
-                      [size]: isNaN(parsed) ? 0 : parsed,
-                    });
-                  };
-
-                  return (
-                    <div
-                      key={size}
-                      className="flex items-center gap-3 rounded-xl border border-gray-200 px-4 py-3"
-                    >
-                      <span className="text-sm font-semibold w-16 flex-shrink-0">
-                        {size}
-                      </span>
-                      <div className="flex items-center gap-2 ml-auto">
-                        <span className="text-xs text-gray-400">Stock</span>
-                        <Input
-                          type="number"
-                          min={0}
-                          inputMode="numeric"
-                          value={String(stockVal)}
-                          placeholder="0"
-                          onChange={(e) => updateStock(e.target.value)}
-                          onFocus={(e) => e.target.select()}
-                          className="w-20 text-center"
-                        />
-                      </div>
-                    </div>
-                  );
-                })}
-              </div>
-            </Field>
-          ) : (
-            /* Gents — unchanged */
-            <>
-              <Field>
-                <FieldLabel>Size Range</FieldLabel>
-                <Select
-                  value={variant.sizeRange}
-                  onValueChange={(v) =>
-                    set("sizeRange", v as FrontendSizeRange)
-                  }
-                >
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {availableSizes.map((s) => (
-                      <SelectItem key={s} value={s}>
-                        {s}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </Field>
-
-              <Field>
-                <FieldLabel>Stock per size</FieldLabel>
-                <Input
-                  type="number"
-                  min={0}
-                  inputMode="numeric"
-                  value={stockInput}
-                  onChange={(e) => handleStockChange(e.target.value)}
-                  onBlur={handleStockBlur}
-                  onFocus={(e) => e.target.select()}
-                />
-              </Field>
-            </>
-          )}
+          {/* Opening stock */}
+          <Field>
+            <FieldLabel>Opening stock (metres)</FieldLabel>
+            <Input
+              type="number"
+              min={0}
+              step="0.5"
+              inputMode="decimal"
+              value={stockInput}
+              placeholder="0"
+              onChange={(e) => handleStockChange(e.target.value)}
+              onBlur={handleStockBlur}
+              onFocus={(e) => e.target.select()}
+            />
+            {stockError ? (
+              <p className="mt-1.5 text-xs text-red-600">{stockError}</p>
+            ) : (
+              <p className="mt-1.5 text-xs text-gray-400">
+                {formatMeters(stockInput)} m of this colour on hand. You can
+                change this later without touching the order history.
+              </p>
+            )}
+          </Field>
         </div>
 
         {/* CTA */}
         <div className="mt-auto pt-8 pb-6">
           <StockFlowButton
             variant="filled"
-            text={isEdit ? "Save Changes" : "Add Variant"}
-            onClick={() => onSave(variant)}
+            text={isEdit ? "Save Changes" : "Add Colour"}
+            onClick={handleSave}
             className="w-full h-14 rounded-2xl bg-primary text-white font-bold shadow-lg shadow-primary/20 flex items-center justify-center"
           />
         </div>
       </div>
+
       {showPicker && (
         <Modal
           icon={<ImagePlus className="text-black/20" />}
           iconBg="bg-yellow-100"
           title="Select Image Source"
-          description="Choose how you want to add the product image."
+          description="Choose how you want to add the colour photo."
           onClose={() => setShowPicker(false)}
           actions={
             <div className="flex gap-2 w-full">
@@ -318,7 +267,6 @@ export default function Step2AddColor({
               >
                 Open Camera
               </ModalButton>
-
               <ModalButton
                 variant="ghost"
                 onClick={() => {

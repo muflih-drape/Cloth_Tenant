@@ -4,10 +4,10 @@ import { ArrowLeft, Plus } from "lucide-react";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import ColorCard from "./colorCard";
 import CommonDetailsBadge from "./commonDetailsBadge";
-import type { ColorVariant, CommonDetails } from "@/types/item";
+import type { ColorVariant, FabricDetails } from "@/types/item";
 
 interface Props {
-  common: CommonDetails;
+  common: FabricDetails;
   variants: ColorVariant[];
   loading: boolean;
   onEditCommon: () => void;
@@ -91,7 +91,7 @@ export default function ColorListScreen({
       <div className="mt-auto pt-8 pb-6">
         <StockFlowButton
           variant="filled"
-          text={loading ? "Creating…" : "Create Item"}
+          text={loading ? "Creating…" : "Create Fabric"}
           disabled={variants.length === 0 || loading}
           onClick={onSubmit}
           className="w-full h-14 rounded-2xl bg-primary text-white font-bold shadow-lg shadow-primary/20 flex items-center justify-center"

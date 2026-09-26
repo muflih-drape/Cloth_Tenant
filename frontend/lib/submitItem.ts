@@ -1,57 +1,46 @@
-import { itemApi } from "@/lib/api/item";
-import { itemToFormData } from "@/lib/form-utils";
-import type {
-  CommonDetails,
-  ColorVariant,
-  FrontendSizeRange,
-} from "@/types/item";
-import { SIZE_RANGE_TO_SIZES } from "@/types/item";
+import { fabricApi } from "@/lib/api/item";
+import { fabricToFormData } from "@/lib/form-utils";
+import type { ColorVariant, FabricRequest, FabricVariantRequest } from "@/types/item";
+import { toMeters } from "@/types/item";
 
-export async function submitItem(
-  common: CommonDetails,
+/**
+ * Build the create payload for a fabric.
+ *
+ * Each colour is one variant carrying its own opening metre stock -- there is no
+ * size breakdown to expand, so a variant maps straight across.
+ */
+export function buildFabricPayload(
+  common: { name: string; description?: string; price_per_meter: string },
   variants: ColorVariant[],
-): Promise<void> {
-  const variantPayload = [];
-
-  for (const variant of variants) {
-    let sizesData: { size: string; stock: number }[];
-
-    if (common.type === "kids") {
-      sizesData = Object.entries(variant.perSizeStock).flatMap(
-        ([size, stock]) => {
-          const backendSizes = SIZE_RANGE_TO_SIZES[
-            size as FrontendSizeRange
-          ] || [size];
-          return backendSizes.map((s) => ({ size: s, stock }));
-        },
-      );
-    } else {
-      const sizes = SIZE_RANGE_TO_SIZES[variant.sizeRange] || [];
-      sizesData = sizes.map((size) => ({
-        size,
-        stock: variant.stock,
-      }));
-    }
-
-    variantPayload.push({
-      image: variant.image,
-      sizes: sizesData,
-      display_order: variant.display_order
-    });
-  }
-
-  const payload = {
+): FabricRequest {
+  const variantPayload: FabricVariantRequest[] = variants.map((variant) => ({
+    image: variant.image,
+    display_order: variant.displayOrder || null,
+    stock_meters: variant.stockMeters || "0",
+  }));
+  return {
     name: common.name,
-    price: Number(common.price),
     description: common.description || "",
-    type: common.type,
-    brand_id: common.brand_id,
+    price_per_meter: common.price_per_meter,
     variants: variantPayload,
   };
-
-  const fd = itemToFormData(payload);
-  await itemApi.create(fd);
 }
+
+export async function submitFabric(
+  common: { name: string; description?: string; price_per_meter: string },
+  variants: ColorVariant[],
+): Promise<void> {
+  await fabricApi.create(fabricToFormData(buildFabricPayload(common, variants)));
+}
+
+/** Reject a stock figure the warehouse cannot honour, before we bother the API. */
+export function validateStockMetres(raw: string): string | null {
+  const metres = toMeters(raw);
+  if (metres < 0) return "Stock cannot be negative.";
+  if (metres > 1_000_000) return "That looks too large. Check the number.";
+  return null;
+}
+
 // ─── Error helpers ────────────────────────────────────────────────────────────
 
 export class ApiError extends Error {

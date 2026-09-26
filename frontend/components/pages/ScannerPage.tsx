@@ -1,5 +1,6 @@
 "use client";
-import { itemApi } from "@/lib/api/item";
+import { fabricApi } from "@/lib/api/item";
+import { toMeters } from "@/types/item";
 import { toastError, toastSuccess } from "@/lib/toast";
 import { Scanner } from "@yudiel/react-qr-scanner";
 import { AlertTriangle, ArchiveX, QrCode, Sparkles, X } from "lucide-react";
@@ -10,15 +11,14 @@ import { Modal, ModalButton } from "../ui/custom/Modals";
 interface ScannerPageProps {
   id: string;
   basePath?: string;
-  orderId?: number | null;
 }
 
 const ScannerPage: React.FC<ScannerPageProps> = ({
   id,
   basePath = "/agent/order/new",
-  orderId,
 }) => {
   const [showLeaveConfirm, setShowLeaveConfirm] = useState(false);
+  const [outOfStockFabric, setOutOfStockFabric] = useState("");
   const [validating, setValidating] = useState(false);
   const router = useRouter();
 
@@ -44,17 +44,20 @@ const ScannerPage: React.FC<ScannerPageProps> = ({
                 const qrValue = data[0].rawValue;
                 setValidating(true);
                 try {
-                  const result = await itemApi.checkOutOfStock(
-                    qrValue,
-                    orderId,
+                  // Resolve the roll before sending the agent onward: an
+                  // empty roll cannot contribute metres, so stop them here
+                  // rather than on a form with nothing to enter.
+                  const fabric = await fabricApi.byQr(qrValue);
+                  const matched = fabric.variants.find(
+                    (variant) => variant.qr_code === qrValue,
                   );
 
-                  if (result.out_of_stock) {
+                  if (matched && toMeters(matched.stock_meters) <= 0) {
+                    setOutOfStockFabric(fabric.name);
                     setShowLeaveConfirm(true);
                     return;
                   }
 
-                  // await itemApi.byqr(qrValue);
                   router.push(`${basePath}/${id}/${qrValue}`);
                 } catch (e) {
                   toastError("Invalid QR code", e);
@@ -81,8 +84,8 @@ const ScannerPage: React.FC<ScannerPageProps> = ({
         </div>
         <h2 className="text-lg font-bold text-gray-800">Align QR Code</h2>
         <p className="text-sm text-gray-400 mt-2 max-w-[200px] mx-auto leading-relaxed font-medium">
-          Position the item&apos;s QR code within the frame to add it to the
-          order
+          Position the fabric roll&apos;s QR code within the frame to add it to
+          the order
         </p>
       </div>
 
@@ -98,7 +101,11 @@ const ScannerPage: React.FC<ScannerPageProps> = ({
           icon={<ArchiveX size={18} className="text-red-500" />}
           iconBg="bg-red-100"
           title="Out of Stock"
-          description="This item is out of stock, you can add other items though."
+          description={
+            outOfStockFabric
+              ? `${outOfStockFabric} has no cloth left in this colour.`
+              : "This colour has no cloth left."
+          }
           onClose={() => setShowLeaveConfirm(false)}
           actions={
             <>
@@ -123,7 +130,7 @@ const ScannerPage: React.FC<ScannerPageProps> = ({
         >
           <div className="bg-red-50 rounded-xl p-3 border border-amber-100">
             <p className="text-sm text-red-600 font-medium">
-              Continue adding other items?
+              Continue adding other fabrics?
             </p>
           </div>
         </Modal>

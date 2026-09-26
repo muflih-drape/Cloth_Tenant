@@ -2,8 +2,7 @@
 
 import { useState, useMemo, useCallback } from "react"; // ✅ added useCallback
 import { Plus, ShoppingBag, Search, QrCode, X } from "lucide-react";
-import { UIItem } from "@/types/item";
-import { UnpackedOrderItem } from "@/lib/api/order";
+import { OutstandingDemandRow, UIItem } from "@/types/item";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import ItemCard from "./ItemCard";
 import OrderedItemList from "./OrderedItemList";
@@ -29,8 +28,8 @@ interface ItemListProps {
     onOrder?: (variantId: number) => void;
     onPriceCheck?: () => void;
     title?: string;
-    orderedItems?: UnpackedOrderItem[];
-    onOrderItemClick?: (itemId: number) => void;
+    outstandingDemand?: OutstandingDemandRow[];
+    onOutstandingClick?: (fabricId: number) => void;
 }
 
 function filterItems(
@@ -45,21 +44,17 @@ function filterItems(
         filtered = filtered.filter((item) => !isItemOutOfStock(item));
         filtered = filtered.map((item) => ({
             ...item,
-            variants: item.variants.filter(
-                (v) => !isVariantOutOfStock(v, item.type),
-            ),
+            variants: item.variants.filter((v) => !isVariantOutOfStock(v)),
         }));
     } else if (tab === "out_of_stock") {
         filtered = filtered.filter(
             (item) =>
                 isItemOutOfStock(item) ||
-                item.variants.some((v) => isVariantOutOfStock(v, item.type)),
+                isItemPartiallyOutOfStock(item),
         );
         filtered = filtered.map((item) => ({
             ...item,
-            variants: item.variants.filter((v) =>
-                isVariantOutOfStock(v, item.type),
-            ),
+            variants: item.variants.filter((v) => isVariantOutOfStock(v)),
         }));
     }
 
@@ -92,8 +87,8 @@ export default function ItemList({
     onOrder,
     onPriceCheck,
     title,
-    orderedItems = [],
-    onOrderItemClick,
+    outstandingDemand = [],
+    onOutstandingClick,
 }: ItemListProps) {
     const [activeTab, setActiveTab] = useState<StockTab>(initialTab);
     const [searchQuery, setSearchQuery] = useState("");
@@ -146,13 +141,13 @@ export default function ItemList({
         return filterItems(items ?? [], activeTab, searchQuery, qrFilter);
     }, [items, activeTab, searchQuery, qrFilter]);
 
-    const filteredOrderedItems = useMemo(() => {
-        if (!searchQuery.trim()) return orderedItems;
+    const filteredOutstanding = useMemo(() => {
+        if (!searchQuery.trim()) return outstandingDemand;
         const query = searchQuery.toLowerCase();
-        return orderedItems.filter((item) =>
-            item.item_name.toLowerCase().includes(query),
+        return outstandingDemand.filter((row) =>
+            row.fabric.toLowerCase().includes(query),
         );
-    }, [orderedItems, searchQuery]);
+    }, [outstandingDemand, searchQuery]);
 
     const visibleItems = filteredItems.slice(0, visibleCount);
 
@@ -179,8 +174,6 @@ export default function ItemList({
     if (loading) {
         return <PageLoading />;
     }
-
-    console.log("Item :", items);
 
     return (
         <div>
@@ -245,8 +238,8 @@ export default function ItemList({
                             type="text"
                             placeholder={
                                 activeTab === "ordered"
-                                    ? "Search ordered items..."
-                                    : "Search items..."
+                                    ? "Search outstanding demand..."
+                                    : "Search fabrics..."
                             }
                             value={searchQuery}
                             onChange={(e) => setSearchQuery(e.target.value)}
@@ -286,7 +279,7 @@ export default function ItemList({
                                 : "text-gray-500 hover:text-gray-700"
                         }`}
                     >
-                        Stock In ({inStockCount})
+                        In Stock ({inStockCount})
                     </button>
                     <button
                         onClick={() => setActiveTab("out_of_stock")}
@@ -296,7 +289,7 @@ export default function ItemList({
                                 : "text-gray-500 hover:text-gray-700"
                         }`}
                     >
-                        Stock Out ({outOfStockCount})
+                        Out ({outOfStockCount})
                     </button>
                     {context === "admin" && (
                         <button
@@ -307,14 +300,18 @@ export default function ItemList({
                                     : "text-gray-500 hover:text-gray-700"
                             }`}
                         >
-                            Ordered ({searchQuery.trim() ? filteredOrderedItems.length : orderedItems.length})
+                            Outstanding (
+                        {searchQuery.trim()
+                            ? filteredOutstanding.length
+                            : outstandingDemand.length}
+                        )
                         </button>
                     )}
                 </div>
             </div>
             <div className="px-4 pb-8 space-y-2">
                 {activeTab === "ordered" ? (
-                    filteredOrderedItems.length === 0 ? (
+                    filteredOutstanding.length === 0 ? (
                         <div className="flex flex-col items-center justify-center py-16 text-gray-300">
                             <ShoppingBag size={48} className="mb-4" />
                             <h2 className="text-lg font-bold text-gray-400">
@@ -323,7 +320,7 @@ export default function ItemList({
                             <p className="text-sm text-gray-400 mt-1">
                                 {searchQuery.trim()
                                     ? "Try a different search"
-                                    : "No unpacked items found"}
+                                    : "No fabric is awaiting packing"}
                             </p>
                             {searchQuery.trim() && (
                                 <button
@@ -336,8 +333,8 @@ export default function ItemList({
                         </div>
                     ) : (
                         <OrderedItemList
-                            items={filteredOrderedItems}
-                            onItemClick={onOrderItemClick || (() => {})}
+                            items={filteredOutstanding}
+                            onItemClick={onOutstandingClick}
                         />
                     )
                 ) : filteredItems.length === 0 ? (

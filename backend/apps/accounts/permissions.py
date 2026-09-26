@@ -14,8 +14,6 @@ class IsAgentOrAdmin(BasePermission):
 
 class IsAdmin(BasePermission):
     def has_permission(self, request, view):
-
-        print(f"Role {request.user.role}")
         return request.user.is_authenticated and request.user.role == "ADMIN"
 
 
@@ -35,12 +33,12 @@ class IsAdminOrSelfAgent(BasePermission):
         return obj.user == request.user
 
 
-def admin_business(user):
-    """Return the business string for an admin user, or None for non-admins."""
-    return user.business if getattr(user, "role", None) == "ADMIN" else None
-
-
 def check_admin_pin(request):
+    """Require a PIN before a destructive admin action.
+
+    Superusers and agents are exempt. There is no business scoping any more --
+    the mill is single-tenant -- so this is purely an anti-mistake gate.
+    """
     if request.user.is_superuser:
         return None
     if request.user.role == "AGENT":

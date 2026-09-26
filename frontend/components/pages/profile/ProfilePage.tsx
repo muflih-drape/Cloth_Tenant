@@ -3,7 +3,7 @@ import { PageLoading } from "@/components/ui/Loading";
 import { useAuth } from "@/context/AuthContext";
 import { agentApi } from "@/lib/api/agents";
 import { authApi } from "@/lib/api/auth";
-import { itemApi } from "@/lib/api/item";
+import { fabricApi } from "@/lib/api/item";
 import { orderApi } from "@/lib/api/order";
 import { toastSuccess } from "@/lib/toast";
 import { AgentResponse } from "@/types/agent";
@@ -71,7 +71,7 @@ export default function ProfilePage() {
       setArchivesLoading(true);
       try {
         const [items, orders] = await Promise.all([
-          itemApi.getArchived(),
+          fabricApi.getArchived(),
           orderApi.getArchived(),
         ]);
         setArchivedItems(items as UIItem[]);

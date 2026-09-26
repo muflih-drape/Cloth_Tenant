@@ -2,7 +2,7 @@
 
 import { ChevronDown, ChevronUp, Info, Edit, QrCode } from "lucide-react";
 import { ImagePreview } from "@/components/pages/ImagePreview";
-import { ItemType, UIItem } from "@/types/item";
+import { UIItem } from "@/types/item";
 import { archiveCountdownLabel } from "@/util/archiveLabel";
 import VariantCard from "./VariantCard";
 import { isItemOutOfStock, isVariantOutOfStock } from "@/util/stockValidators";
@@ -26,9 +26,7 @@ function getItemImage(item: UIItem): string | null {
 }
 
 function hasOutOfStockVariants(item: UIItem): boolean {
-    return item.variants.some((variant) =>
-        isVariantOutOfStock(variant, item.type),
-    );
+    return item.variants.some((variant) => isVariantOutOfStock(variant));
 }
 
 export default function ItemCard({
@@ -45,7 +43,7 @@ export default function ItemCard({
 }: ItemCardProps) {
     const hasPartialOutOfStock = hasOutOfStockVariants(item);
     const image = getItemImage(item);
-    const price = item.price;
+    const pricePerMeter = item.price_per_meter;
 
     const itemStockOut = isItemOutOfStock(item);
 
@@ -80,11 +78,6 @@ export default function ItemCard({
                         <h6 className="font-bold text-gray-900 text-sm truncate leading-tight">
                             {item.name}
                         </h6>
-                        {item.type && (
-                            <span className="text-[9px] bg-gray-100 text-gray-500 px-1.5 py-0.5 rounded-md uppercase font-bold tracking-tighter border border-gray-200 flex-shrink-0">
-                                {item.type}
-                            </span>
-                        )}
                         {countdownDays != null && countdownDays >= 0 && (
                             <span
                                 className={`text-[9px] px-1.5 py-0.5 rounded-md uppercase font-bold tracking-tighter border flex-shrink-0 ${
@@ -99,14 +92,16 @@ export default function ItemCard({
                     </div>
                     <div className="flex items-center gap-2 mt-1">
                         <span className="text-xs text-gray-400">
-                            {item.variants.length} variant
+                            {item.variants.length} colour
                             {item.variants.length !== 1 ? "s" : ""}
                         </span>
-                        {price && context === "agent" && (
+                        {pricePerMeter && context === "agent" && (
                             <>
                                 <span className="text-gray-200">•</span>
                                 <span className="text-xs font-bold text-primary">
-                                    ₹{Number(price).toLocaleString("en-IN")}
+                                    ₹
+                                    {Number(pricePerMeter).toLocaleString("en-IN")}
+                                    /m
                                 </span>
                             </>
                         )}
@@ -131,7 +126,7 @@ export default function ItemCard({
                                     onEdit?.(item.id);
                                 }}
                                 className="p-2 bg-gray-100 text-gray-500 hover:bg-black hover:text-white hover:cursor-pointer rounded-md transition-colors"
-                                title="Edit Item"
+                                title="Edit fabric"
                             >
                                 <Edit size={14} />
                             </button>
@@ -171,7 +166,6 @@ export default function ItemCard({
                                 variant={variant}
                                 index={index}
                                 context={context}
-                                itemType={item.type as ItemType}
                                 onPrintQR={
                                     context === "admin" ? onPrintQR : undefined
                                 }

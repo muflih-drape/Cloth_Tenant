@@ -67,17 +67,11 @@ export default function AdminAnalyticsPage() {
           <TrendSparkline data={data.trend} from={from} to={to} />
           <TimeMetricsRow metrics={data.time_metrics} />
 
-          <CustomerBarChart
-            customers={data.top_customers.map((c) => ({
-              id: c.id,
-              name: c.name,
-              count: c.count,
-            }))}
-          />
+          <CustomerBarChart customers={data.top_customers} />
 
           <AgentHorizontalBarChart agents={data.top_agents} />
 
-          <ItemBarChart items={data.top_items} />
+          <ItemBarChart items={data.top_fabrics} />
         </>
       )}
     </div>

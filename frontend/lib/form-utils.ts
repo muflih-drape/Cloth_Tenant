@@ -1,6 +1,6 @@
 /**
  * Flatten a nested object into FormData compatible with Django REST Framework's multipart parser.
- * Handles nested arrays and objects like `variants[0]image` or `sizes[0]size`.
+ * Handles nested arrays and objects like `variants[0]image`.
  */
 export function objectToFormData(
   obj: Record<string, any>,
@@ -40,40 +40,62 @@ export function objectToFormData(
 }
 
 /**
- * Specifically tailored for ItemRequest structure in Django
+ * Build the multipart body for `CreateFabricSerializer` / `UpdateFabricSerializer`.
+ *
+ * A variant is one colour, so it carries its own `stock_meters` and nothing
+ * else -- there is no nested size list to flatten.
+ *
+ * Two subtleties on update, both of which silently do nothing if you skip them:
+ *  - `display_order` has to be sent even when blank, because the API only
+ *    rewrites a label when the key is present. Omitting it keeps the old label.
+ *  - `remove_image` is the only way to clear a photo; an absent `image` simply
+ *    means "leave the existing one alone".
  */
-export function itemToFormData(data: Record<string, any>): FormData {
+export function fabricToFormData(data: Record<string, any>): FormData {
   const formData = new FormData();
 
   formData.append("name", data.name as string);
   formData.append("description", (data.description as string) || "");
-  formData.append("price", String(data.price));
-  formData.append("type", data.type as string);
-
-  if (data.brand_id !== undefined && data.brand_id !== null) {
-    formData.append("brand_id", String(data.brand_id));
-  }
+  formData.append("price_per_meter", String(data.price_per_meter));
 
   (
     data.variants as Array<{
-      image?: File;
-      sizes: Array<{ size: string; stock: number }>;
-      display_order: string;
+      id?: number;
+      image?: File | string | null;
+      display_order?: string | null;
+      stock_meters?: string | number | null;
+      remove_image?: boolean;
     }>
   ).forEach((variant, index: number) => {
-    if (variant.image) {
+    if (variant.id !== undefined && variant.id !== null) {
+      formData.append(`variants[${index}]id`, String(variant.id));
+    }
+    // Only a freshly picked file is an upload. An existing photo already lives
+    // on the server, so its URL is never sent back as if it were a new file.
+    if (variant.image instanceof File) {
       formData.append(`variants[${index}]image`, variant.image);
     }
-    if (variant.display_order) {
-      formData.append(`variants[${index}]display_order`, variant.display_order);
+    if (variant.remove_image) {
+      formData.append(`variants[${index}]remove_image`, "true");
     }
-    variant.sizes.forEach((size, sizeIndex: number) => {
-      formData.append(`variants[${index}]sizes[${sizeIndex}]size`, size.size);
+    // Present-but-blank clears the label: the API reads "" as "no label".
+    if (variant.display_order !== undefined) {
       formData.append(
-        `variants[${index}]sizes[${sizeIndex}]stock`,
-        size.stock.toString(),
+        `variants[${index}]display_order`,
+        variant.display_order ?? "",
       );
-    });
+    }
+    // Only meaningful on create: the API ignores stock for existing variants so
+    // an edit cannot quietly overwrite the warehouse's live count.
+    if (
+      variant.id === undefined ||
+      variant.id === null
+    ) {
+      formData.append(
+        `variants[${index}]stock_meters`,
+        String(variant.stock_meters ?? 0),
+      );
+    }
   });
 
   return formData;

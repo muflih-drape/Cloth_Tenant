@@ -6,15 +6,16 @@ import {
   Image,
   StyleSheet,
 } from "@react-pdf/renderer";
+import { formatMeters, toMeters } from "@/types/item";
 
 export interface PDFVariant {
   variantId: number;
-  itemName: string;
-  itemType?: string;
-  itemPrice: string;
+  fabricName: string;
+  pricePerMeter: string;
   imageDataUrl: string | null;
   qrCode: string | null;
-  sizes: { size: string; stock: number }[];
+  colour: string;
+  stockMeters: string;
 }
 
 interface AssignedItemsPDFProps {
@@ -27,11 +28,10 @@ interface AssignedItemsPDFProps {
 const ACCENT = "#2563eb";
 const LIGHT_BG = "#f8faff";
 
-const variantPieces = (v: PDFVariant) =>
-  v.sizes.reduce((s, sz) => s + sz.stock, 0);
+const variantMetres = (v: PDFVariant) => toMeters(v.stockMeters);
 
-const totalStock = (variants: PDFVariant[]) =>
-  variants.reduce((sum, v) => sum + variantPieces(v), 0);
+const totalMetres = (variants: PDFVariant[]) =>
+  variants.reduce((sum, v) => sum + variantMetres(v), 0);
 
 const styles = StyleSheet.create({
   page: {
@@ -140,9 +140,8 @@ const styles = StyleSheet.create({
   },
   colImage: { width: 44 },
   colName: { flex: 1, paddingRight: 8 },
-  colType: { width: 56, paddingRight: 8 },
-  colSizes: { width: 90, paddingRight: 8 },
-  colPieces: { width: 40, alignItems: "flex-end", paddingRight: 4 },
+  colColour: { width: 90, paddingRight: 8 },
+  colMetres: { width: 60, alignItems: "flex-end", paddingRight: 4 },
   colPrice: { width: 70, alignItems: "flex-end" },
   itemImage: {
     width: 32,
@@ -186,13 +185,13 @@ const styles = StyleSheet.create({
     color: "#444",
     fontFamily: "Helvetica-Bold",
   },
-  piecesBadge: {
+  metresBadge: {
     backgroundColor: "#dbeafe",
     borderRadius: 3,
     paddingHorizontal: 5,
     paddingVertical: 2,
   },
-  piecesBadgeText: {
+  metresBadgeText: {
     fontSize: 8,
     fontFamily: "Helvetica-Bold",
     color: ACCENT,
@@ -223,7 +222,7 @@ export default function AssignedItemsPDF({
   tabLabel,
   generatedAt,
 }: AssignedItemsPDFProps) {
-  const stock = totalStock(variants);
+  const stock = totalMetres(variants);
 
   return (
     <Document>
@@ -249,14 +248,14 @@ export default function AssignedItemsPDF({
           <View style={styles.summaryDivider} />
           <View style={styles.summaryItem}>
             <Text style={styles.summaryValue}>{stock}</Text>
-            <Text style={styles.summaryLabel}>Total Pieces</Text>
+            <Text style={styles.summaryLabel}>Total Metres</Text>
           </View>
           <View style={styles.summaryDivider} />
           <View style={styles.summaryItem}>
             <Text style={styles.summaryValue}>
-              {new Set(variants.map((v) => v.itemType || "—")).size}
+              {new Set(variants.map((v) => v.fabricName)).size}
             </Text>
-            <Text style={styles.summaryLabel}>Types</Text>
+            <Text style={styles.summaryLabel}>Fabrics</Text>
           </View>
         </View>
 
@@ -264,10 +263,9 @@ export default function AssignedItemsPDF({
         <View style={styles.table}>
           <View style={styles.tableHeader}>
             <Text style={[styles.tableHeaderText, styles.colImage]}> </Text>
-            <Text style={[styles.tableHeaderText, styles.colName]}>Item</Text>
-            <Text style={[styles.tableHeaderText, styles.colType]}>Type</Text>
-            <Text style={[styles.tableHeaderText, styles.colSizes]}>Sizes</Text>
-            <Text style={[styles.tableHeaderText, styles.colPieces]}>Pcs</Text>
+            <Text style={[styles.tableHeaderText, styles.colName]}>Fabric</Text>
+            <Text style={[styles.tableHeaderText, styles.colColour]}>Colour</Text>
+            <Text style={[styles.tableHeaderText, styles.colMetres]}>Metres</Text>
             <Text style={[styles.tableHeaderText, styles.colPrice]}>Price</Text>
           </View>
 
@@ -285,37 +283,25 @@ export default function AssignedItemsPDF({
               </View>
 
               <View style={styles.colName}>
-                <Text style={styles.nameText}>{v.itemName}</Text>
+                <Text style={styles.nameText}>{v.fabricName}</Text>
               </View>
 
-              <View style={styles.colType}>
-                <Text style={styles.typeText}>{v.itemType || "—"}</Text>
+              <View style={styles.colColour}>
+                <Text style={styles.typeText}>{v.colour || "—"}</Text>
               </View>
 
-              <View style={styles.colSizes}>
-                {v.sizes.length > 0 ? (
-                  <View style={styles.sizesRow}>
-                    {v.sizes.map((s) => (
-                      <View key={s.size} style={styles.sizeChip}>
-                        <Text style={styles.sizeChipText}>
-                          {s.size}: {s.stock}
-                        </Text>
-                      </View>
-                    ))}
-                  </View>
-                ) : (
-                  <Text style={styles.typeText}>—</Text>
-                )}
-              </View>
-
-              <View style={styles.colPieces}>
-                <View style={styles.piecesBadge}>
-                  <Text style={styles.piecesBadgeText}>{variantPieces(v)}</Text>
+              <View style={styles.colMetres}>
+                <View style={styles.metresBadge}>
+                  <Text style={styles.metresBadgeText}>
+                    {formatMeters(v.stockMeters)} m
+                  </Text>
                 </View>
               </View>
 
               <View style={styles.colPrice}>
-                <Text style={styles.priceText}>Rs. {v.itemPrice}</Text>
+                <Text style={styles.priceText}>
+                  Rs. {v.pricePerMeter}/m
+                </Text>
               </View>
             </View>
           ))}
@@ -323,10 +309,10 @@ export default function AssignedItemsPDF({
 
         {/* Footer */}
         <View style={styles.footer}>
-          <Text style={styles.footerLeft}>Assigned Items · {agentName}</Text>
+          <Text style={styles.footerLeft}>Assigned Fabrics · {agentName}</Text>
           <Text style={styles.footerRight}>
-            {variants.length} color
-            {variants.length !== 1 ? "s" : ""} · {stock} pcs
+            {variants.length} colour{variants.length !== 1 ? "s" : ""} ·{" "}
+            {formatMeters(stock)} m
           </Text>
         </View>
       </Page>

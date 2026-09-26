@@ -1,92 +1,125 @@
 "use client";
 
-import { Trash2 } from "lucide-react";
+import { Trash2, ImagePlus, X } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import type { EditableVariant } from "@/types/item";
+import { formatMeters, toMeters } from "@/types/item";
+import { ImagePreview } from "@/components/pages/ImagePreview";
 
 interface Props {
   variant: EditableVariant;
-  /** @deprecated Not used but kept for API compatibility */
-  _index?: number;
+  index: number; // 0-based
   isOnly: boolean;
+  /** Existing colours keep their live warehouse count; it is read-only here. */
+  isNew: boolean;
   onChange: (updated: EditableVariant) => void;
   onDelete: () => void;
-}
-
-interface DisplayOrderFieldProps {
-  value: string;
-  placeholder?: string;
-  onChange: (value: string) => void;
+  onPickImage: () => void;
 }
 
 /**
- * Display-order input for one variant. Kept as a small fixed-width field: the
- * value may be an empty string (nullable display_order), and without an
- * explicit width it would otherwise stretch across the whole row as a long
- * blank bar.
+ * One colour row. The metre figure is the warehouse's live stock count for
+ * existing colours, so it is shown but not editable here -- correcting stock is
+ * a stock adjustment, not a catalogue edit, and overwriting it would clobber
+ * whatever packing has already moved.
  */
-export function DisplayOrderField({
-  value,
-  placeholder = "0",
-  onChange,
-}: DisplayOrderFieldProps) {
-  return (
-    <Input
-      type="number"
-      min={0}
-      value={value}
-      placeholder={placeholder}
-      onChange={(e) => onChange(e.target.value)}
-      className="h-8 w-24 shrink-0 text-sm"
-    />
-  );
-}
-
 export default function EditVariantRow({
   variant,
+  index,
   isOnly,
+  isNew,
   onChange,
   onDelete,
+  onPickImage,
 }: Props) {
   const set = <K extends keyof EditableVariant>(
     key: K,
     val: EditableVariant[K],
   ) => onChange({ ...variant, [key]: val });
 
-  return (
-    <div className="flex items-center gap-3 bg-gray-50 border border-gray-100 rounded-xl px-3 py-2">
-      {/* Size chip */}
-      <div className="flex-shrink-0 w-14 text-center">
-        <span className="inline-block bg-gray-100 text-gray-600 text-xs font-bold rounded-lg px-2 py-1">
-          {variant.size}
-        </span>
-      </div>
+  const imageSrc = variant.imagePreview ?? variant.imageUrl;
+  const label = variant.displayOrder.trim();
 
-      {/* Stock */}
-      <div className="flex-1 flex items-center gap-2">
-        <span className="text-xs text-gray-400 flex-shrink-0">Stock</span>
+  return (
+    <div className="flex items-center gap-3 bg-gray-50 border border-gray-100 rounded-xl px-3 py-2.5">
+      {/* Thumbnail */}
+      <button
+        type="button"
+        onClick={onPickImage}
+        className="flex-shrink-0 w-12 h-12 rounded-lg overflow-hidden bg-gray-100 flex items-center justify-center relative"
+        aria-label="Change photo"
+      >
+        {imageSrc ? (
+          <>
+            <ImagePreview src={imageSrc} alt={label || `Colour ${index + 1}`} />
+            <span className="absolute inset-0 bg-black/0 hover:bg-black/20 transition-colors flex items-center justify-center">
+              <ImagePlus size={13} className="text-white opacity-0 hover:opacity-100 transition-opacity" />
+            </span>
+          </>
+        ) : (
+          <ImagePlus size={15} className="text-gray-300" />
+        )}
+      </button>
+
+      <div className="flex-1 min-w-0 space-y-1.5">
         <Input
-          type="number"
-          min={0}
-          value={variant.stock === 0 ? "" : variant.stock}
-          placeholder="0"
-          onChange={(e) => set("stock", parseInt(e.target.value, 10) || 0)}
-          onFocus={(e) => e.target.select()}
+          value={variant.displayOrder}
+          placeholder="Colour / finish"
+          onChange={(e) => set("displayOrder", e.target.value)}
           className="h-8 text-sm"
         />
+
+        {isNew ? (
+          <div className="flex items-center gap-2">
+            <span className="text-[11px] text-gray-400 flex-shrink-0">Opening</span>
+            <Input
+              type="number"
+              min={0}
+              step="0.5"
+              inputMode="decimal"
+              value={variant.stockMeters}
+              placeholder="0"
+              onChange={(e) => set("stockMeters", e.target.value)}
+              onFocus={(e) => e.target.select()}
+              className="h-8 text-sm w-24"
+            />
+            <span className="text-[11px] text-gray-400">m</span>
+          </div>
+        ) : (
+          <p className="text-[11px] text-gray-400">
+            {formatMeters(variant.stockMeters)} m on hand · changed via stock
+            adjustment
+          </p>
+        )}
       </div>
 
-      {/* Delete row */}
-      {/*{!isOnly && (
-                <button
-                    type="button"
-                    onClick={onDelete}
-                    className="flex-shrink-0 p-2 rounded-md text-red-500 hover:text-white hover:bg-red-500 transition-colors"
-                    aria-label="Delete size"
-                >
-                    <Trash2 size={15} />
-                </button>
-            )}*/}
+      {imageSrc && (
+        <button
+          type="button"
+          onClick={() => onChange({ ...variant, imageUrl: null, imagePreview: null, newImage: null })}
+          className="flex-shrink-0 p-1.5 rounded-md text-gray-400 hover:text-red-500 hover:bg-red-50 transition-colors"
+          aria-label="Remove photo"
+          title="Remove photo"
+        >
+          <X size={14} />
+        </button>
+      )}
+
+      {!isOnly && (
+        <button
+          type="button"
+          onClick={onDelete}
+          className="flex-shrink-0 p-1.5 rounded-md text-red-400 hover:text-white hover:bg-red-400 transition-colors"
+          aria-label="Remove colour"
+        >
+          <Trash2 size={15} />
+        </button>
+      )}
     </div>
   );
+}
+
+/** Kept for the callers that still import it; metres live on the row itself now. */
+export function stockMetersOf(variant: EditableVariant): number {
+  return toMeters(variant.stockMeters);
 }

@@ -3,10 +3,10 @@
 import { useEffect, useState } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { agentApi } from "@/lib/api/agents";
-import { itemApi } from "@/lib/api/item";
+import { fabricApi } from "@/lib/api/item";
 import { toastSuccess, toastError } from "@/lib/toast";
 import { AgentResponse, AgentUpdateRequest, AssignedItem } from "@/types/agent";
-import { Item, ItemAllResponse } from "@/types/item";
+import type { Fabric } from "@/types/item";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
@@ -48,7 +48,7 @@ export default function AgentDetailPage() {
   const [deletingAllItems, setDeletingAllItems] = useState(false);
   const [deleteAllDialogOpen, setDeleteAllDialogOpen] = useState(false);
 
-  const [items, setItems] = useState<Item[]>([]);
+  const [items, setItems] = useState<Fabric[]>([]);
 
   // Single source of truth: mirrors exactly what is checked in the UI.
   // Seeded from the backend on load and re-synced after every save.
@@ -70,7 +70,7 @@ export default function AgentDetailPage() {
         const numericId = parseInt(id as string, 10);
         const [agentData, itemsData] = await Promise.all([
           agentApi.getOne(numericId),
-          itemApi.getAll(),
+          fabricApi.getAll(),
         ]);
         setAgent(agentData);
         setItems(itemsData);

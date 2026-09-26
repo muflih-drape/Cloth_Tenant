@@ -9,6 +9,7 @@ import OrderLogs from "@/components/pages/order/OrderLogs";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import { toastSuccess, toastError } from "@/lib/toast";
 import { Trash2, Package, Pencil } from "lucide-react";
+import { formatMeters, toMeters } from "@/types/item";
 import { useBackButton } from "@/util/useBackButton";
 import OrderSummary from "@/components/pages/order/OrderSummary";
 import { transportApi } from "@/lib/api/transport";
@@ -93,8 +94,12 @@ export default function Page() {
 
   if (loading) return <h2 className="flex justify-center mt-10">Loading...</h2>;
 
-  const isDeletable = data?.status === "PENDING";
-  const showPackingStatus = data?.status === "PACKED";
+  const isDeletable = data?.status === "PENDING" || data?.status === "EDITING";
+  // Agents want to see packing progress as soon as any cloth has moved, not
+  // only once the whole order is done.
+  const showPackingStatus = (data?.items ?? []).some(
+    (item) => toMeters(item.allocated_quantity) > 0,
+  );
 
   const getPreferredTransport = (id: string | number) => {
     return (
@@ -147,21 +152,26 @@ export default function Page() {
             </div>
             <div className="space-y-2">
               {data?.items.map((item) => {
-                const totalPieces = (item.piece_count || 1) * item.quantity;
-                const packedPieces = item.packed_quantity || 0;
-                const isFullyPacked = packedPieces >= totalPieces;
+                const ordered = toMeters(item.ordered_quantity);
+                const allocated = toMeters(item.allocated_quantity);
+                const isFullyPacked = toMeters(item.outstanding_quantity) === 0;
                 return (
                   <div
                     key={item.id}
-                    className="flex items-center justify-between text-xs"
+                    className="flex items-center justify-between text-xs gap-2"
                   >
                     <span className="text-black truncate flex-1">
-                      {item.item_name}
+                      {item.fabric_name}
+                      <span className="text-gray-400">
+                        {item.variant_display_order
+                          ? ` · ${item.variant_display_order}`
+                          : ""}
+                      </span>
                     </span>
                     <span
-                      className={`font-medium ${isFullyPacked ? "text-green-600" : "text-amber-600"}`}
+                      className={`font-medium shrink-0 ${isFullyPacked ? "text-green-600" : "text-amber-600"}`}
                     >
-                      {packedPieces} / {totalPieces} pcs
+                      {formatMeters(allocated)} / {formatMeters(ordered)} m
                     </span>
                   </div>
                 );

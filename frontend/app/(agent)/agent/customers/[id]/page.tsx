@@ -8,6 +8,7 @@ import { orderApi } from "@/lib/api/order";
 import { toastSuccess, toastError } from "@/lib/toast";
 import { CustomerResponse, CustomerUpdateRequest } from "@/types/customer";
 import type { OrderResponse } from "@/types/order";
+import { formatMeters } from "@/types/item";
 import { Field, FieldGroup, FieldLabel } from "@/components/ui/field";
 import { Input } from "@/components/ui/input";
 import { Textarea } from "@/components/ui/textarea";
@@ -441,7 +442,7 @@ export default function CustomerDetailPage() {
                                                     Order #{order.id}
                                                 </span>
                                                 <span className="text-xs text-gray-400 ml-2">
-                                                    {order.total_sets} sets
+                                                    {formatMeters(order.totals?.total_ordered_meters)} m
                                                 </span>
                                             </div>
                                         </div>

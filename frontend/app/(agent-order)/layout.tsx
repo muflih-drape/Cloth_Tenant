@@ -1,4 +1,3 @@
-import { SizeRangeProvider } from "@/context/SizeRangeContext";
 import { OrderFlowProvider } from "@/context/OrderFlowContext";
 
 export default function OrderLayout({
@@ -8,9 +7,7 @@ export default function OrderLayout({
 }) {
   return (
     <div className="admin-order-layout">
-      <SizeRangeProvider>
-        <OrderFlowProvider mode="agent">{children}</OrderFlowProvider>
-      </SizeRangeProvider>
+      <OrderFlowProvider mode="agent">{children}</OrderFlowProvider>
     </div>
   );
 }

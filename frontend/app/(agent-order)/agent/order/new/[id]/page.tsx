@@ -17,7 +17,8 @@ import {
 import { useParams, useRouter } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { orderApi } from "@/lib/api/order";
-import { OrderResponse, OutOfStockItem, PlaceOrderError } from "@/types/order";
+import { OrderResponse, PlaceOrderResponse, PlaceOrderShortfall } from "@/types/order";
+import { formatMeters, toMeters } from "@/types/item";
 import { PageLoading } from "@/components/ui/Loading";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import { AxiosError } from "axios";
@@ -41,8 +42,11 @@ export default function OrderDetailsPage() {
   const [orders, setOrders] = useState<OrderResponse>();
   const [loadError, setLoadError] = useState<LoadError | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
-  const [showOutOfStockModal, setShowOutOfStockModal] = useState(false);
-  const [outOfStockItems, setOutOfStockItems] = useState<OutOfStockItem[]>([]);
+  // Placing an order records demand; it never fails for want of cloth. Oversubscribed
+  // lines come back as a report, and packing decides who gets what.
+  const [showShortfallModal, setShowShortfallModal] = useState(false);
+  const [shortfallLines, setShortfallLines] = useState<PlaceOrderShortfall[]>([]);
+  const [shortfallNotice, setShortfallNotice] = useState<string | null>(null);
   const [showMergeWarning, setShowMergeWarning] = useState(false);
   const [expectedDeliveryDate, setExpectedDeliveryDate] = useState<string>("");
   const [preferredTransportID, setPreferredTransportID] = useState<
@@ -83,63 +87,47 @@ export default function OrderDetailsPage() {
   }, [expectedDeliveryDate, preferredTransportID, notes]);
 
   interface MergeGroup {
-    item_name: string;
-    size_group: string;
-    items: Array<{ id: number; quantity: number }>;
-    total: number;
+    fabric_name: string;
+    variant_display_order: string;
+    items: Array<{ id: number; metres: number }>;
+    totalMetres: number;
   }
 
+  /** The same colour scanned twice is really one line; the totals get combined. */
   const duplicateGroups = (() => {
     if (!orders?.items.length) return [];
     const map = new Map<
       string,
-      Array<{ id: number; quantity: number; item_name: string }>
+      { id: number; metres: number; fabric_name: string; variant_display_order: string }[]
     >();
     for (const item of orders.items) {
-      const key = `${item.item?.id ?? "unknown"}-${item.variant ?? "none"}-${item.size_group ?? "none"}`;
-      const group = map.get(key) || [];
+      const key = `${item.fabric ?? "unknown"}-${item.variant ?? "none"}`;
+      const group = map.get(key) ?? [];
       group.push({
         id: item.id,
-        quantity: item.quantity,
-        item_name: item.item?.name || item.item_name || "Unknown Item",
+        metres: toMeters(item.ordered_quantity),
+        fabric_name: item.fabric_name,
+        variant_display_order: item.variant_display_order,
       });
       map.set(key, group);
     }
     const groups: MergeGroup[] = [];
     for (const [, items] of map) {
       if (items.length > 1) {
-        const total = items.reduce((sum, i) => sum + i.quantity, 0);
         groups.push({
-          item_name: items[0].item_name,
-          size_group:
-            items[0].quantity > 0
-              ? orders.items.find((o) => o.id === items[0].id)?.size_group || ""
-              : "",
-          items: items.map((i) => ({ id: i.id, quantity: i.quantity })),
-          total,
+          fabric_name: items[0].fabric_name,
+          variant_display_order: items[0].variant_display_order,
+          items: items.map((i) => ({ id: i.id, metres: i.metres })),
+          totalMetres: items.reduce((sum, i) => sum + i.metres, 0),
         });
       }
     }
     return groups;
   })();
 
-  const outOfStockItemIds = outOfStockItems.map((item) => item.order_item_id);
-  const totalSets =
-    orders?.items.reduce((sum, item) => sum + item.quantity, 0) || 0;
-  const totalPieces =
-    orders?.items.reduce(
-      (sum, item) => sum + item.quantity * (item.piece_count || 1),
-      0,
-    ) || 0;
-  const totalMoney =
-    orders?.items.reduce(
-      (sum, item) =>
-        sum +
-        (Number(item.item_price) || 0) *
-          item.quantity *
-          (item.piece_count || 1),
-      0,
-    ) || 0;
+  const totalMetres =
+    orders?.items.reduce((sum, item) => sum + toMeters(item.ordered_quantity), 0) ?? 0;
+  const totalMoney = Number(orders?.totals.computed_total ?? 0);
 
   const handlePlaceOrder = async () => {
     const orderKey = localStorage.getItem("orderKey");
@@ -150,21 +138,28 @@ export default function OrderDetailsPage() {
     }
     setPlacingOrder(true);
     try {
-      await orderApi.placeOrder(Number(orderKey), {
+      const result = await orderApi.placeOrder(Number(orderKey), {
         expected_delivery_date: expectedDeliveryDate || null,
         preferred_transport: preferredTransportID || null,
         notes: notes || null,
       });
+      // The order is placed either way. Oversubscription is a packing decision,
+      // so say so plainly and send the agent to the order.
+      if (result.shortfall_lines?.length) {
+        setShortfallLines(result.shortfall_lines);
+        setShortfallNotice(result.notice);
+        setShowShortfallModal(true);
+        return;
+      }
       toastSuccess("Order placed successfully!");
       router.push(afterPlacePath(Number(orderKey)));
     } catch (error) {
-      const axiosError = error as AxiosError<PlaceOrderError>;
-      if (axiosError.response?.data?.out_of_stock_items) {
-        setOutOfStockItems(axiosError.response.data.out_of_stock_items);
-        setShowOutOfStockModal(true);
-      } else {
-        toastError(axiosError.response?.data?.error || "Failed to place order");
-      }
+      const axiosError = error as AxiosError<{ error?: string; detail?: string }>;
+      toastError(
+        axiosError.response?.data?.error ||
+          axiosError.response?.data?.detail ||
+          "Failed to place order",
+      );
     } finally {
       setPlacingOrder(false);
     }
@@ -176,26 +171,36 @@ export default function OrderDetailsPage() {
     if (!orderKey) return;
     setPlacingOrder(true);
     try {
+      // Fold each duplicate set into its first line, then drop the rest.
       for (const group of duplicateGroups) {
         const firstItemId = group.items[0].id;
-        await orderApi.updateItem(firstItemId, { quantity: group.total });
+        await orderApi.updateItem(firstItemId, {
+          ordered_quantity: String(group.totalMetres),
+        });
         for (let i = 1; i < group.items.length; i++) {
           await orderApi.deleteItem(Number(orderKey), group.items[i].id);
         }
       }
       const res = await orderApi.getOne(Number(orderKey));
       setOrders(res);
-      await orderApi.placeOrder(Number(orderKey));
+      const result: PlaceOrderResponse = await orderApi.placeOrder(
+        Number(orderKey),
+      );
+      if (result.shortfall_lines?.length) {
+        setShortfallLines(result.shortfall_lines);
+        setShortfallNotice(result.notice);
+        setShowShortfallModal(true);
+        return;
+      }
       toastSuccess("Order placed successfully!");
       router.push(afterPlacePath(Number(orderKey)));
     } catch (error) {
-      const axiosError = error as AxiosError<PlaceOrderError>;
-      if (axiosError.response?.data?.out_of_stock_items) {
-        setOutOfStockItems(axiosError.response.data.out_of_stock_items);
-        setShowOutOfStockModal(true);
-      } else {
-        toastError(axiosError.response?.data?.error || "Failed to place order");
-      }
+      const axiosError = error as AxiosError<{ error?: string; detail?: string }>;
+      toastError(
+        axiosError.response?.data?.error ||
+          axiosError.response?.data?.detail ||
+          "Failed to place order",
+      );
     } finally {
       setPlacingOrder(false);
     }
@@ -336,7 +341,7 @@ export default function OrderDetailsPage() {
               Order Details
             </h1>
             <p className="text-[10px] text-gray-400 font-bold uppercase tracking-widest mt-0.5">
-              Step 2 — Add Items
+              Step 2 — Add Fabrics
             </p>
           </div>
           {/* Item count pill in header */}
@@ -459,16 +464,16 @@ export default function OrderDetailsPage() {
           <div className="flex items-center justify-between mb-3">
             <div>
               <h2 className="text-base font-black text-gray-900">
-                Order Items
+                Fabric Lines
               </h2>
               <p className="text-[10px] font-bold uppercase tracking-widest text-gray-400 mt-0.5">
                 {orders?.items.length
-                  ? `${orders.items.length} item${orders.items.length !== 1 ? "s" : ""} added`
-                  : "No items yet"}
+                  ? `${orders.items.length} line${orders.items.length !== 1 ? "s" : ""} · ${formatMeters(totalMetres)} m`
+                  : "No fabrics yet"}
               </p>
             </div>
             <StockFlowButton
-              text="Add Item"
+              text="Add Fabric"
               variant="filled"
               icon={<Plus className="size-4" />}
               onClick={() => router.push(`${basePath}/${id}/scanner`)}
@@ -489,10 +494,10 @@ export default function OrderDetailsPage() {
                 />
               </div>
               <p className="text-gray-500 text-sm font-bold">
-                No items added yet
+                No fabrics added yet
               </p>
               <p className="text-xs text-gray-400 mt-1">
-                Tap to scan or search items
+                Tap to scan or search fabrics
               </p>
             </div>
           ) : (
@@ -502,7 +507,6 @@ export default function OrderDetailsPage() {
                 items={orders.items}
                 isDeletable={true}
                 isEditable={true}
-                outOfStockItemIds={outOfStockItemIds}
                 onDeleteItem={handleDeleteItem}
               />
             </div>
@@ -512,8 +516,8 @@ export default function OrderDetailsPage() {
         {/* Order Totals */}
         {orders && orders.items.length > 0 && (
           <OrderTotals
-            totalSets={totalSets}
-            totalPieces={totalPieces}
+            totalMetres={totalMetres}
+            totalLines={orders.items.length}
             totalPrice={totalMoney}
             onPlaceOrder={handlePlaceOrder}
             isLoading={placingOrder}
@@ -524,91 +528,86 @@ export default function OrderDetailsPage() {
 
       {/* ── Modals ── */}
 
-      {/* Out of Stock Modal */}
-      {showOutOfStockModal && (
+      {/* Shortfall report -- the order is placed, packing decides the split */}
+      {showShortfallModal && (
         <Modal
-          icon={<AlertTriangle size={18} className="text-red-500" />}
-          iconBg="bg-red-100"
-          title="Out of Stock"
-          description="Some items are unavailable. Stock may have been taken by another agent."
-          onClose={() => setShowOutOfStockModal(false)}
+          icon={<AlertTriangle size={18} className="text-amber-500" />}
+          iconBg="bg-amber-100"
+          title="Order placed"
+          description={
+            shortfallNotice ??
+            "Some of this order asks for more cloth than we hold. Packing will allocate what is available."
+          }
+          onClose={() => {
+            setShowShortfallModal(false);
+            router.push(afterPlacePath(Number(localStorage.getItem("orderKey"))));
+          }}
           actions={
             <>
               <ModalButton
                 variant="ghost"
-                onClick={() => setShowOutOfStockModal(false)}
+                onClick={() => {
+                  setShowShortfallModal(false);
+                  router.push(afterPlacePath(Number(localStorage.getItem("orderKey"))));
+                }}
               >
-                Cancel
+                View order
               </ModalButton>
               <ModalButton
                 variant="primary"
-                onClick={() => setShowOutOfStockModal(false)}
+                onClick={() => {
+                  setShowShortfallModal(false);
+                  router.push(afterPlacePath(Number(localStorage.getItem("orderKey"))));
+                }}
               >
-                Remove Items
+                Got it
               </ModalButton>
             </>
           }
         >
-          {(() => {
-            const grouped = outOfStockItems.reduce(
-              (acc, item) => {
-                const key = item.order_item_id;
-                if (!acc[key]) {
-                  acc[key] = {
-                    item_name: item.item_name,
-                    size_group: item.size_group,
-                    required: item.required,
-                    available: item.available,
-                    order_item_id: item.order_item_id,
-                  };
-                } else {
-                  acc[key].available = Math.min(
-                    acc[key].available,
-                    item.available,
-                  );
-                }
-                return acc;
-              },
-              {} as Record<
-                number,
-                {
-                  item_name: string;
-                  size_group: string;
-                  required: number;
-                  available: number;
-                  order_item_id: number;
-                }
-              >,
-            );
-
-            return Object.values(grouped).map((item, idx) => (
+          <div className="space-y-2">
+            {shortfallLines.map((line) => (
               <div
-                key={idx}
-                className="bg-red-50 rounded-xl p-3 border border-red-100"
+                key={line.order_item_id}
+                className="bg-amber-50 rounded-xl p-3 border border-amber-100"
               >
                 <p className="font-bold text-gray-900 text-sm">
-                  {item.item_name}
+                  {line.fabric_name}
                 </p>
-                <p className="text-xs text-gray-500 mt-0.5">
-                  {item.size_group}
-                </p>
-                <div className="flex gap-4 mt-2">
-                  <span className="text-xs text-gray-500">
-                    Requested:{" "}
+                {line.variant_display_order && (
+                  <p className="text-xs text-gray-500 mt-0.5">
+                    {line.variant_display_order}
+                  </p>
+                )}
+                <div className="flex gap-4 mt-2 text-xs text-gray-500 flex-wrap">
+                  <span>
+                    You asked:{" "}
                     <span className="font-bold text-gray-800">
-                      {item.required}
+                      {formatMeters(line.required)} m
                     </span>
                   </span>
-                  <span className="text-xs text-gray-500">
-                    Available:{" "}
+                  <span>
+                    Everyone wants:{" "}
+                    <span className="font-bold text-gray-800">
+                      {formatMeters(line.total_demand)} m
+                    </span>
+                  </span>
+                  <span>
+                    We hold:{" "}
+                    <span className="font-bold text-amber-700">
+                      {formatMeters(line.available)} m
+                    </span>
+                  </span>
+                  <span>
+                    Short by:{" "}
                     <span className="font-bold text-red-600">
-                      {item.available}
+                      {formatMeters(line.shortfall)} m
                     </span>
                   </span>
                 </div>
               </div>
-            ));
-          })()}
+            ))}
+          </div>
         </Modal>
       )}
 
@@ -617,8 +616,8 @@ export default function OrderDetailsPage() {
         <Modal
           icon={<AlertTriangle size={18} className="text-amber-500" />}
           iconBg="bg-amber-100"
-          title="Duplicate Items"
-          description="Some items share the same colour and size range. They'll be combined into one entry with the total quantity."
+          title="Duplicate Fabrics"
+          description="The same colour was scanned more than once. They'll be combined into one line with the total metres."
           onClose={() => setShowMergeWarning(false)}
           actions={
             <>
@@ -644,14 +643,18 @@ export default function OrderDetailsPage() {
               className="bg-amber-50 rounded-xl p-3 border border-amber-100"
             >
               <p className="font-bold text-gray-900 text-sm">
-                {group.item_name}
+                {group.fabric_name}
               </p>
-              <p className="text-xs text-gray-500 mt-0.5">{group.size_group}</p>
+              {group.variant_display_order && (
+                <p className="text-xs text-gray-500 mt-0.5">
+                  {group.variant_display_order}
+                </p>
+              )}
               <div className="flex items-center gap-1.5 mt-2 flex-wrap">
                 {group.items.map((item, i) => (
                   <span key={item.id} className="flex items-center gap-1.5">
                     <span className="text-xs font-bold bg-white border border-amber-200 text-amber-700 rounded-lg px-2 py-0.5">
-                      {item.quantity} sets
+                      {formatMeters(item.metres)} m
                     </span>
                     {i < group.items.length - 1 && (
                       <span className="text-gray-400 text-xs">+</span>
@@ -660,7 +663,7 @@ export default function OrderDetailsPage() {
                 ))}
                 <span className="text-gray-400 text-xs mx-0.5">=</span>
                 <span className="text-xs font-black text-amber-600 bg-amber-100 border border-amber-200 rounded-lg px-2 py-0.5">
-                  {group.total} sets
+                  {formatMeters(group.totalMetres)} m
                 </span>
               </div>
             </div>

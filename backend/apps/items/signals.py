@@ -1,50 +1,38 @@
-import os
+"""Keep a fabric's out_of_stock_since flag in step with its cloth on hand.
+
+Stock moves in several places (packing rounds, manual restocks, admin edits), so
+the flag is recomputed from the variants after any change rather than being
+incremented at each call site.
+"""
+
 from django.db.models.signals import post_delete, post_save
 from django.dispatch import receiver
-from django.db.models import Sum
-from django.utils import timezone
-from .models import ItemVariant, ItemVariantSize
+
+from .models import Fabric, FabricVariant
+from .services import sync_out_of_stock, touch_catalog
 
 
-@receiver(post_delete, sender=ItemVariant)
+@receiver(post_save, sender=FabricVariant)
+def sync_fabric_after_variant_save(sender, instance, **kwargs):
+    sync_out_of_stock(instance.fabric)
+
+
+@receiver(post_delete, sender=FabricVariant)
 def delete_variant_image(sender, instance, **kwargs):
-    if instance.image:
-        if hasattr(instance.image, 'path') and instance.image.path:
-            file_path = instance.image.path
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-    # Update item stock status after variant deletion
-    item = instance.item
-    total_stock = ItemVariantSize.objects.filter(
-        item_variant__item=item
-    ).aggregate(total=Sum('stock'))['total'] or 0
+    """Drop the variant's image file and re-check the parent fabric."""
+    if instance.image and hasattr(instance.image, "path"):
+        path = instance.image.path
+        if path:
+            try:
+                import os
 
-    if total_stock == 0 and not item.out_of_stock_since:
-        item.out_of_stock_since = timezone.now()
-        item.save(update_fields=['out_of_stock_since'])
-    elif total_stock > 0 and item.out_of_stock_since:
-        item.out_of_stock_since = None
-        item.save(update_fields=['out_of_stock_since'])
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError:
+                # A missing or unreadable file must not block the delete.
+                pass
 
-    from .services import touch_catalog
-    touch_catalog(item)
-
-
-@receiver(post_save, sender=ItemVariantSize)
-def update_item_stock_status(sender, instance, **kwargs):
-    """Update item's out_of_stock_since when stock changes."""
-    from .services import touch_catalog
-
-    item = instance.item_variant.item
-    total_stock = ItemVariantSize.objects.filter(
-        item_variant__item=item
-    ).aggregate(total=Sum('stock'))['total'] or 0
-
-    if total_stock == 0 and not item.out_of_stock_since:
-        item.out_of_stock_since = timezone.now()
-        item.save(update_fields=['out_of_stock_since'])
-        touch_catalog(item)
-    elif total_stock > 0 and item.out_of_stock_since:
-        item.out_of_stock_since = None
-        item.save(update_fields=['out_of_stock_since'])
-        touch_catalog(item)
+    fabric = Fabric.objects.filter(pk=instance.fabric_id).first()
+    if fabric is not None:
+        sync_out_of_stock(fabric)
+        touch_catalog(fabric)

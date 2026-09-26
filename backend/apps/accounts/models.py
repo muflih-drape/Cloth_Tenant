@@ -3,26 +3,18 @@ from django.contrib.auth.hashers import check_password, make_password
 from django.contrib.auth.models import AbstractUser
 from django.db import models
 
-# Create your models here.
-
 
 class User(AbstractUser):
+    """A mill staff account.
+
+    Single-tenant: the mill's legal identity lives in :class:`business.Brand`
+    (used for invoicing), not on the user. Admins see the whole catalogue.
+    """
+
     ROLE_CHOICES = (("ADMIN", "Admin"), ("AGENT", "Agent"))
-    BUSINESS_CHOICES = (
-        ("gents", "Gents"),
-        ("kids", "Kids"),
-    )
 
     email = models.EmailField(unique=True)
     role = models.CharField(max_length=10, choices=ROLE_CHOICES, blank=True)
-    business = models.CharField(max_length=10, choices=BUSINESS_CHOICES, blank=True)
-    brand = models.ForeignKey(
-        "business.Brand",
-        related_name="users",
-        on_delete=models.SET_NULL,
-        null=True,
-        blank=True,
-    )
     display_name = models.CharField(max_length=255, blank=True, default="")
     pin = models.CharField(max_length=128, blank=True, default="")
 

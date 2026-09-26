@@ -4,30 +4,28 @@ from django.contrib.auth.hashers import make_password
 from rest_framework import serializers
 
 from apps.accounts.models import User
-from apps.items.models import Item, ItemVariant
+from apps.items.models import FabricVariant
 
 from .models import Agent, AgentItem
 
 
-class VariantSizeRangeSerializer(serializers.Serializer):
-    size_range = serializers.CharField()
-    stock = serializers.IntegerField()
-
-
 class VariantColorSerializer(serializers.Serializer):
+    """A colour/finish an agent may sell, with the cloth on hand for it."""
+
     id = serializers.IntegerField()
     image = serializers.CharField(allow_null=True)
-    size_ranges = VariantSizeRangeSerializer(many=True)
     qr_code = serializers.CharField(allow_null=True)
     created_at = serializers.CharField(allow_null=True)
     display_order = serializers.CharField(allow_null=True)
+    stock_meters = serializers.DecimalField(max_digits=14, decimal_places=3)
 
 
-class AgentItemListSerializer(serializers.Serializer):
+class AgentFabricListSerializer(serializers.Serializer):
+    """A fabric the agent is assigned, grouped with its assigned colours."""
+
     id = serializers.IntegerField()
     name = serializers.CharField()
-    type = serializers.CharField()
-    price = serializers.DecimalField(max_digits=10, decimal_places=2)
+    price_per_meter = serializers.DecimalField(max_digits=10, decimal_places=2)
     variants = VariantColorSerializer(many=True)
 
     @staticmethod
@@ -39,39 +37,37 @@ class AgentItemListSerializer(serializers.Serializer):
         return None
 
     @classmethod
-    def from_assigned_variants(cls, item, agent_items, request=None):
-        variants_data = []
-        for ai in agent_items:
-            variant = ai.variant
-            sizes = variant.sizes.all() if hasattr(variant, "sizes") else []
-            variants_data.append(
-                {
-                    "id": variant.id,
-                    "image": cls.get_image_url(variant.image, request),
-                    "qr_code": str(variant.qr_code),
-                    "size_ranges": [
-                        {"size_range": s.size, "stock": s.stock} for s in sizes
-                    ],
-                    "created_at": ai.created_at.isoformat(),
-                    "display_order": variant.display_order,
-                }
-            )
+    def from_assigned_variants(cls, fabric, agent_items, request=None):
+        variants_data = [
+            {
+                "id": ai.variant.id,
+                "image": cls.get_image_url(ai.variant.image, request),
+                "qr_code": str(ai.variant.qr_code),
+                "created_at": ai.created_at.isoformat(),
+                "display_order": ai.variant.display_order,
+                "stock_meters": str(ai.variant.stock_meters),
+            }
+            for ai in agent_items
+        ]
 
         return cls(
             {
-                "id": item.id,
-                "name": item.name,
-                "type": item.type,
-                "price": item.price,
+                "id": fabric.id,
+                "name": fabric.name,
+                "price_per_meter": fabric.price_per_meter,
                 "variants": variants_data,
             }
         ).data
 
 
+#: Kept as an alias so existing import sites keep working.
+AgentItemListSerializer = AgentFabricListSerializer
+
+
 class AgentItemSerializer(serializers.ModelSerializer):
     variant = VariantColorSerializer(read_only=True)
     variant_id = serializers.PrimaryKeyRelatedField(
-        queryset=ItemVariant.objects.all(),
+        queryset=FabricVariant.objects.all(),
         source="variant",
         write_only=True,
     )
@@ -137,24 +133,20 @@ class AgentSerializer(serializers.ModelSerializer):
     def get_assigned_items(self, obj):
         request = self.context.get("request")
         qs = (
-            obj.assigned_items.select_related("variant__item")
-            .prefetch_related("variant__sizes")
-            .filter(variant__item__is_deleted=False)
+            obj.assigned_items.select_related("variant__fabric")
+            .filter(variant__fabric__is_deleted=False)
             .order_by("-created_at")
         )
-        item_groups = defaultdict(list)
+        fabric_groups = defaultdict(list)
         for ai in qs:
-            item_groups[ai.variant.item_id].append(ai)
+            fabric_groups[ai.variant.fabric_id].append(ai)
 
-        result = []
-        for item_id, agent_items in item_groups.items():
-            item_obj = agent_items[0].variant.item
-            result.append(
-                AgentItemListSerializer.from_assigned_variants(
-                    item_obj, agent_items, request
-                )
+        return [
+            AgentFabricListSerializer.from_assigned_variants(
+                agent_items[0].variant.fabric, agent_items, request
             )
-        return result
+            for agent_items in fabric_groups.values()
+        ]
 
     def create(self, validated_data):
         display_name = validated_data.pop("display_name", "")

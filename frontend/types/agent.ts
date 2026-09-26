@@ -8,31 +8,20 @@ export interface AgentUser {
     display_name?: string;
 }
 
-export interface VariantSize {
-    id: number;
-    size: string;
-    stock: number;
-}
-
-export interface AssignedVariantSize {
-    id: number;
-    size_range: string;
-    stock: number;
-}
-
 export interface AgentItemVariant {
     id: number;
     image: string | null;
     qr_code: string | null;
-    size_ranges: AssignedVariantSize[];
+    display_order?: string;
+    /** Physical metres on the roll, as a string from the API. */
+    stock_meters: string;
     created_at: string;
 }
 
 export interface AssignedItem {
     id: number;
     name: string;
-    type: string;
-    price: string;
+    price_per_meter: string;
     variants: AgentItemVariant[];
 }
 

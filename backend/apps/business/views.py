@@ -1,68 +1,59 @@
-from django.utils import timezone
 from rest_framework import status
-from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.viewsets import ModelViewSet
-from rest_framework.permissions import IsAuthenticated
-from apps.accounts.permissions import IsSuperuser, check_admin_pin
-from apps.items.models import Item
-from apps.accounts.models import User
+
+from apps.accounts.permissions import IsSuperuser
+
 from .models import Brand
 from .serializers import BrandSerializer
 
 
 class BrandViewSet(ModelViewSet):
-    queryset = Brand.objects.filter(is_active=True)
+    """The mill's company profile.
+
+    Read for any signed-in user (invoices need it); write for superusers only.
+    There is no delete -- ``Brand.delete()`` refuses, and ``destroy`` returns 405
+    -- because invoicing would break without a company name.
+    """
+
     serializer_class = BrandSerializer
 
+    def get_queryset(self):
+        return Brand.objects.all()
+
     def get_permissions(self):
-        if self.request.method in ['POST', 'PUT', 'PATCH', 'DELETE']:
+        if self.request.method in ["POST", "PUT", "PATCH"]:
             return [IsSuperuser()]
         return [IsAuthenticated()]
 
-    @action(detail=True, methods=["get"])
-    def delete_info(self, request, pk=None):
-        brand = self.get_object()
-        items_count = Item.objects.filter(brand=brand).count()
-        users_count = User.objects.filter(brand=brand).count()
-        other_brands = Brand.objects.filter(is_active=True).exclude(id=brand.id)
-        transferable_brands = [
-            {"id": b.id, "name": b.name} for b in other_brands
-        ]
-        return Response({
-            "items_count": items_count,
-            "users_count": users_count,
-            "transferable_brands": transferable_brands,
-        })
+    def list(self, request, *args, **kwargs):
+        """Always return exactly the one profile, creating it if absent."""
+        return Response([self.get_serializer(Brand.load()).data])
+
+    def create(self, request, *args, **kwargs):
+        """Update the singleton instead of adding a second company."""
+        serializer = self.get_serializer(Brand.load(), data=request.data)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data, status=status.HTTP_200_OK)
+
+    def update(self, request, *args, **kwargs):
+        partial = kwargs.pop("partial", False)
+        instance = self.get_object()
+        serializer = self.get_serializer(instance, data=request.data, partial=partial)
+        serializer.is_valid(raise_exception=True)
+        serializer.save()
+        return Response(serializer.data)
+
+    def partial_update(self, request, *args, **kwargs):
+        return self.update(request, *args, partial=True, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
-        pin_error = check_admin_pin(request)
-        if pin_error:
-            return pin_error
-
-        brand = self.get_object()
-        action = request.data.get("action", "deactivate")
-
-        if action == "transfer":
-            transfer_to_id = request.data.get("transfer_to_id")
-            if not transfer_to_id:
-                return Response(
-                    {"error": "transfer_to_id is required for transfer action."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            try:
-                target_brand = Brand.objects.get(id=transfer_to_id, is_active=True)
-            except Brand.DoesNotExist:
-                return Response(
-                    {"error": "Target brand not found."},
-                    status=status.HTTP_404_NOT_FOUND,
-                )
-
-            Item.objects.filter(brand=brand).update(brand=target_brand)
-            User.objects.filter(brand=brand).update(brand=target_brand)
-            return super().destroy(request, *args, **kwargs)
-
-        brand.is_active = False
-        brand.deactivated_at = timezone.now()
-        brand.save(update_fields=["is_active", "deactivated_at"])
-        return Response(status=status.HTTP_204_NO_CONTENT)
+        return Response(
+            {
+                "error": "The company profile is required for invoicing and "
+                "cannot be deleted. Clear the fields instead."
+            },
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )

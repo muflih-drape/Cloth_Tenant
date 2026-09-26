@@ -1,6 +1,8 @@
 "use client";
 
 import { Order, OrderStatus } from "@/types/order";
+import { formatMeters, toMeters } from "@/types/item";
+import { outstandingMeters } from "@/lib/utils/orderItemSort";
 import { useRouter } from "next/navigation";
 import StockflowAvatar from "../ui/custom/stockflowAvatar";
 import { markOrderAsViewed } from "@/lib/viewedOrders";
@@ -50,10 +52,10 @@ export default function OrderCard({
   const router = useRouter();
   const status = statusConfig[order.status || "PENDING"];
 
-  const totalSets = order.total_sets || 0;
-  const totalPieces = order.total_pieces || 0;
-  const unpackedCount =
-    order.items?.filter((item) => (item.packed_quantity ?? 0) === 0).length ?? 0;
+  const totalOrderedMeters = toMeters(order.totals?.total_ordered_meters);
+  const totalOutstandingMeters = toMeters(order.totals?.total_outstanding_meters);
+  const awaitingPackingCount =
+    order.items?.filter((item) => outstandingMeters(item) > 0).length ?? 0;
 
   const formatDate = (dateStr: string) => {
     const date = new Date(dateStr);
@@ -94,7 +96,7 @@ export default function OrderCard({
               {order.customer_details?.name || "Unknown Customer"}
             </h6>
             <p className="text-xs text-gray-400 mt-0.5">
-              {order.agent_details.username}
+              {order.agent_details?.username ?? "Unassigned"}
             </p>
             <p className="text-xs text-gray-400 mt-0.5">
               {formatDate(order.created_at)}
@@ -113,9 +115,10 @@ export default function OrderCard({
           >
             ID #{order.id}
           </div>
-          {unpackedCount > 0 && (
-            <div className="px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide flex-shrink-0 bg-green-100 text-green-700 mt-1">
-              <span className="text-xl " >{unpackedCount}</span> Unpacked
+          {awaitingPackingCount > 0 && (
+            <div className="px-2 py-1 rounded-full text-[10px] font-bold uppercase tracking-wide flex-shrink-0 bg-amber-100 text-amber-700 mt-1">
+              <span className="text-xl">{awaitingPackingCount}</span> Awaiting
+              packing
             </div>
           )}
         </div>
@@ -137,28 +140,25 @@ export default function OrderCard({
           </div>
           <div>
             <span className="text-base font-black text-gray-900">
-              {totalSets}
+              {formatMeters(totalOrderedMeters)}
             </span>
-            <span className="text-xs text-gray-400"> Sets</span>
-            <span className="text-gray-300 mx-1">•</span>
-            <span className="text-sm font-bold text-gray-600">{totalPieces}</span>
-            <span className="text-xs text-gray-400"> pcs</span>
+            <span className="text-xs text-gray-400"> m</span>
+            {totalOutstandingMeters > 0 && (
+              <>
+                <span className="text-gray-300 mx-1">•</span>
+                <span className="text-sm font-bold text-amber-600">
+                  {formatMeters(totalOutstandingMeters)}
+                </span>
+                <span className="text-xs text-amber-600"> m to pack</span>
+              </>
+            )}
           </div>
         </div>
 
         <div className="text-right">
           <span className="text-sm font-black text-primary">
             ₹
-            {order.items
-              ?.reduce(
-                (sum, item) =>
-                  sum +
-                  (Number(item.item_price) || 0) *
-                    item.quantity *
-                    (item.piece_count || 1),
-                0,
-              )
-              .toLocaleString("en-IN")}
+            {Number(order.totals?.effective_total || 0).toLocaleString("en-IN")}
           </span>
         </div>
       </div>
