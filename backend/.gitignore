@@ -1,6 +1,5 @@
 # Django
 db.sqlite3
-media/
 local_settings.py
 
 # Python
