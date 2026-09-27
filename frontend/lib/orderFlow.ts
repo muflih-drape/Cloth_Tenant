@@ -30,6 +30,16 @@ export function buildOrderCreatePayload(
 }
 
 /**
+ * An agent must not send `agent`: the server attaches the signed-in agent's own
+ * record, so a value from the client could only ever be wrong.
+ */
+export function buildAgentOrderCreatePayload(
+  customerId: number,
+): OrderRegisterRequest {
+  return { customer: customerId, status: "DRAFT" };
+}
+
+/**
  * Pulls the first human-readable message out of a DRF error body, which may be
  * `{ error }`, `{ detail }`, or field errors like `{ agent: ["..."] }`.
  */

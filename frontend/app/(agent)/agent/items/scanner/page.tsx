@@ -8,6 +8,7 @@ import { fabricApi } from "@/lib/api/item";
 import { customerApi } from "@/lib/api/customer";
 import { PageLoading } from "@/components/ui/Loading";
 import { toastError } from "@/lib/toast";
+import { createDraftOrder } from "@/lib/draftOrder";
 import { extractErrorMessage } from "@/lib/orderFlow";
 import {
   ArrowLeft,
@@ -31,6 +32,7 @@ export default function PriceCheckScannerPage() {
   const [showCustomerSelect, setShowCustomerSelect] = useState(false);
   const [customers, setCustomers] = useState<CustomerAllResponse>([]);
   const [scanned, setScanned] = useState(false);
+  const [creating, setCreating] = useState(false);
 
   useEffect(() => {
     const fetchCustomers = async () => {
@@ -76,12 +78,28 @@ export default function PriceCheckScannerPage() {
     }
   };
 
-  const handleSelectCustomer = (customerId: number) => {
-    if (scanResult && selectedVariant) {
-      const qrCode = selectedVariant.qr_code;
-      if (qrCode) {
-        router.push(`/agent/order/new/${customerId}/${qrCode}`);
-      }
+  const handleSelectCustomer = async (customerId: number) => {
+    if (creating) return;
+    const qrCode = selectedVariant?.qr_code;
+    if (!scanResult || !qrCode) return;
+    // Create the draft here. Pushing straight to the add-item page left it
+    // resolving the target order from session storage, so a quick order from the
+    // price-check scanner could append its line to a placed order left over
+    // from earlier in the session.
+    setCreating(true);
+    try {
+      await createDraftOrder(customerId);
+      router.push(`/agent/order/new/${customerId}/${qrCode}`);
+    } catch (err) {
+      console.error("Error creating order:", err);
+      toastError(
+        extractErrorMessage(
+          (err as { response?: { data?: unknown } })?.response?.data,
+          "Error creating order. Please try again.",
+        ),
+        err,
+      );
+      setCreating(false);
     }
   };
 

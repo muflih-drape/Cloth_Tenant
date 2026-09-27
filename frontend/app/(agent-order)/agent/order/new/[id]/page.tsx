@@ -23,9 +23,11 @@ import { PageLoading } from "@/components/ui/Loading";
 import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import { AxiosError } from "axios";
 import { OrderTotals } from "@/components/order";
+import PriceOverrideDialog from "@/components/order/PriceOverrideDialog";
 import { useBackButton } from "@/util/useBackButton";
 import { Modal, ModalButton } from "@/components/ui/custom/Modals";
 import { useOrderFlow } from "@/context/OrderFlowContext";
+import { persistDraftOrderId, readDraftOrderId } from "@/lib/draftOrder";
 import { extractErrorMessage } from "@/lib/orderFlow";
 
 type LoadError = { kind: "notfound" | "error"; message?: string };
@@ -48,6 +50,8 @@ export default function OrderDetailsPage() {
   const [shortfallLines, setShortfallLines] = useState<PlaceOrderShortfall[]>([]);
   const [shortfallNotice, setShortfallNotice] = useState<string | null>(null);
   const [showMergeWarning, setShowMergeWarning] = useState(false);
+  const [showPriceDialog, setShowPriceDialog] = useState(false);
+  const [savingTotal, setSavingTotal] = useState(false);
   const [expectedDeliveryDate, setExpectedDeliveryDate] = useState<string>("");
   const [preferredTransportID, setPreferredTransportID] = useState<
     number | null
@@ -67,15 +71,18 @@ export default function OrderDetailsPage() {
 
   const isReady = useRef(false);
 
+  // The order this screen is working on, already validated against the customer
+  // in the route. Everything below addresses the order through this rather than
+  // re-reading storage, which can be repointed between render and click.
+  const activeOrderId = orders?.id ?? null;
+
   useEffect(() => {
     if (!isReady.current) return; // skip until data is loaded
-
-    const key = localStorage.getItem("orderKey");
-    if (!key) return;
+    if (activeOrderId === null) return;
 
     const timer = setTimeout(() => {
       orderApi
-        .update(Number(key), {
+        .update(activeOrderId, {
           expected_delivery_date: expectedDeliveryDate || null,
           preferred_transport: preferredTransportID || null,
           notes: notes || null,
@@ -84,7 +91,7 @@ export default function OrderDetailsPage() {
     }, 600);
 
     return () => clearTimeout(timer);
-  }, [expectedDeliveryDate, preferredTransportID, notes]);
+  }, [expectedDeliveryDate, preferredTransportID, notes, activeOrderId]);
 
   interface MergeGroup {
     fabric_name: string;
@@ -127,18 +134,58 @@ export default function OrderDetailsPage() {
 
   const totalMetres =
     orders?.items.reduce((sum, item) => sum + toMeters(item.ordered_quantity), 0) ?? 0;
-  const totalMoney = Number(orders?.totals.computed_total ?? 0);
+  // Bill what the order is actually worth, which is the agreed total once one
+  // is set, not the raw line arithmetic.
+  const totalMoney = Number(orders?.totals.effective_total ?? 0);
+  const computedTotal = Number(orders?.totals.computed_total ?? 0);
+  const isPriceOverridden = orders?.totals.is_price_overridden ?? false;
+  // The total may only be set while the order is still a draft, and only while
+  // there is something to bill -- an empty order has nothing to discount.
+  const canSetTotal = orders?.status === "DRAFT" && totalMetres > 0;
+
+  /**
+   * Agree a total with the customer before the order is placed. The server caps
+   * an agent at the line arithmetic; this only relays the number and refetches
+   * so the summary reflects what was actually saved.
+   */
+  const handleSaveTotal = async (total: number, reason: string) => {
+    if (activeOrderId === null) return;
+
+    setSavingTotal(true);
+    try {
+      await orderApi.setPrice(activeOrderId, {
+        final_total: total.toFixed(2),
+        ...(reason ? { reason } : {}),
+      });
+      setShowPriceDialog(false);
+      setOrders(await orderApi.getOne(activeOrderId));
+      toastSuccess(
+        Math.abs(total - computedTotal) < 0.005
+          ? "Order total reset"
+          : "Order total updated",
+      );
+    } catch (error) {
+      const axiosError = error as AxiosError<{ error?: string; detail?: string }>;
+      toastError(
+        extractErrorMessage(
+          axiosError.response?.data,
+          "Could not update the order total",
+        ),
+      );
+    } finally {
+      setSavingTotal(false);
+    }
+  };
 
   const handlePlaceOrder = async () => {
-    const orderKey = localStorage.getItem("orderKey");
-    if (!orderKey) return;
+    if (activeOrderId === null) return;
     if (duplicateGroups.length > 0) {
       setShowMergeWarning(true);
       return;
     }
     setPlacingOrder(true);
     try {
-      const result = await orderApi.placeOrder(Number(orderKey), {
+      const result = await orderApi.placeOrder(activeOrderId, {
         expected_delivery_date: expectedDeliveryDate || null,
         preferred_transport: preferredTransportID || null,
         notes: notes || null,
@@ -152,7 +199,7 @@ export default function OrderDetailsPage() {
         return;
       }
       toastSuccess("Order placed successfully!");
-      router.push(afterPlacePath(Number(orderKey)));
+      router.push(afterPlacePath(activeOrderId));
     } catch (error) {
       const axiosError = error as AxiosError<{ error?: string; detail?: string }>;
       toastError(
@@ -167,24 +214,29 @@ export default function OrderDetailsPage() {
 
   const handleProceedWithPlaceOrder = async () => {
     setShowMergeWarning(false);
-    const orderKey = localStorage.getItem("orderKey");
-    if (!orderKey) return;
+    if (activeOrderId === null) return;
     setPlacingOrder(true);
     try {
-      // Fold each duplicate set into its first line, then drop the rest.
+      // Fold each duplicate set into one line. The server sums the metres in
+      // Decimal and does the whole group in a single transaction -- summing in
+      // JS gives values like 0.30000000000000004 that the serializer rejects,
+      // and a failure halfway through a per-line loop leaves the order billing
+      // for metres twice.
       for (const group of duplicateGroups) {
-        const firstItemId = group.items[0].id;
-        await orderApi.updateItem(firstItemId, {
-          ordered_quantity: String(group.totalMetres),
+        await orderApi.mergeItems(activeOrderId, {
+          keep_item_id: group.items[0].id,
+          drop_item_ids: group.items.slice(1).map((i) => i.id),
         });
-        for (let i = 1; i < group.items.length; i++) {
-          await orderApi.deleteItem(Number(orderKey), group.items[i].id);
-        }
       }
-      const res = await orderApi.getOne(Number(orderKey));
+      const res = await orderApi.getOne(activeOrderId);
       setOrders(res);
       const result: PlaceOrderResponse = await orderApi.placeOrder(
-        Number(orderKey),
+        activeOrderId,
+        {
+          expected_delivery_date: expectedDeliveryDate || null,
+          preferred_transport: preferredTransportID || null,
+          notes: notes || null,
+        },
       );
       if (result.shortfall_lines?.length) {
         setShortfallLines(result.shortfall_lines);
@@ -193,7 +245,7 @@ export default function OrderDetailsPage() {
         return;
       }
       toastSuccess("Order placed successfully!");
-      router.push(afterPlacePath(Number(orderKey)));
+      router.push(afterPlacePath(activeOrderId));
     } catch (error) {
       const axiosError = error as AxiosError<{ error?: string; detail?: string }>;
       toastError(
@@ -208,14 +260,32 @@ export default function OrderDetailsPage() {
 
   useEffect(() => {
     setLoading(true);
+    // Drop the previous order before fetching. Without this, `orders` keeps the
+    // last order's value for the whole fetch, so any non-happy path renders
+    // another customer's lines.
+    setOrders(undefined);
+    isReady.current = false;
     const fetchData = async () => {
       try {
         const numericId = parseInt(id, 10);
         const response = await customerApi.getOne(numericId);
         setData(response);
-        const key = localStorage.getItem("orderKey");
-        if (key) {
-          const res2 = await orderApi.getOne(Number(key));
+        const orderId = readDraftOrderId();
+        if (orderId) {
+          const res2 = await orderApi.getOne(orderId);
+          // The route names the customer; storage names the order. If they
+          // disagree the stored order belongs to somebody else, so refuse it
+          // rather than editing (or emptying) it. See createDraftOrder.
+          //
+          // `customer` is write-only on the serializer, so it never comes back
+          // in a response -- the owning customer only arrives nested as
+          // customer_details. Reading res2.customer here would be undefined
+          // and refuse every legitimate draft.
+          if (res2.customer_details?.id !== numericId) {
+            persistDraftOrderId(null);
+            setLoadError({ kind: "notfound" });
+            return;
+          }
           setOrders(res2);
           setPreferredTransportID(
             res2.preferred_transport || response.preferred_transport,
@@ -223,7 +293,9 @@ export default function OrderDetailsPage() {
           setExpectedDeliveryDate(res2.expected_delivery_date || "");
           setNotes(res2.notes || "");
           isReady.current = true;
-        } else if (isAdmin) {
+        } else {
+          // No draft in storage at all, so there is nothing to edit. Say so
+          // rather than rendering an empty order whose every save would fail.
           setLoadError({ kind: "notfound" });
         }
       } catch (e) {
@@ -232,6 +304,10 @@ export default function OrderDetailsPage() {
         const status = axiosError.response?.status;
         console.error("Order details load failed:", status ?? "network error");
         if (status === 404) {
+          // A reaped or removed draft leaves a dead id in storage, which would
+          // make this page fail forever. Clear it so picking a customer again
+          // starts from a clean slate.
+          persistDraftOrderId(null);
           setLoadError({ kind: "notfound" });
         } else {
           setLoadError({
@@ -279,15 +355,21 @@ export default function OrderDetailsPage() {
 
   useEffect(() => {
     if (loadError && !isAdmin) {
-      toastError("Server Error");
-      router.push(`${basePath}/`);
+      // Both roles now get the recovery screen below, so this banner is a
+      // nudge only -- do not bounce the agent off a page they can act on.
+      toastError("That order is no longer available.");
     }
   }, [loadError, isAdmin, router, basePath]);
 
   if (loading) return <PageLoading />;
 
-  if (loadError && isAdmin) {
+  if (loadError) {
     const isNotFound = loadError.kind === "notfound";
+    // An agent has no customer picker to hand, so their way back is the customer
+    // list rather than a prefilled screen.
+    const startOverPath = isAdmin
+      ? `/admin/order/new?customer=${id}`
+      : `${basePath}`;
     return (
       <div className="min-h-screen flex items-center justify-center px-6">
         <div className="text-center max-w-sm">
@@ -306,7 +388,7 @@ export default function OrderDetailsPage() {
             <StockFlowButton
               text="Start new order"
               variant="filled"
-              onClick={() => router.push(`/admin/order/new?customer=${id}`)}
+              onClick={() => router.push(startOverPath)}
               className="w-full h-12 rounded-2xl"
             />
           ) : (
@@ -522,11 +604,27 @@ export default function OrderDetailsPage() {
             onPlaceOrder={handlePlaceOrder}
             isLoading={placingOrder}
             buttonText="Place Order"
+            computedTotal={computedTotal}
+            isPriceOverridden={isPriceOverridden}
+            onEditTotal={canSetTotal ? () => setShowPriceDialog(true) : undefined}
           />
         )}
       </div>
 
       {/* ── Modals ── */}
+
+      {/* Agreed total -- only reachable while the order is still a draft */}
+      {showPriceDialog && (
+        <PriceOverrideDialog
+          computedTotal={computedTotal}
+          currentTotal={totalMoney}
+          isOverridden={isPriceOverridden}
+          canRaise={isAdmin}
+          isSaving={savingTotal}
+          onSave={handleSaveTotal}
+          onClose={() => setShowPriceDialog(false)}
+        />
+      )}
 
       {/* Shortfall report -- the order is placed, packing decides the split */}
       {showShortfallModal && (
@@ -540,7 +638,7 @@ export default function OrderDetailsPage() {
           }
           onClose={() => {
             setShowShortfallModal(false);
-            router.push(afterPlacePath(Number(localStorage.getItem("orderKey"))));
+            if (activeOrderId !== null) router.push(afterPlacePath(activeOrderId));
           }}
           actions={
             <>
@@ -548,7 +646,7 @@ export default function OrderDetailsPage() {
                 variant="ghost"
                 onClick={() => {
                   setShowShortfallModal(false);
-                  router.push(afterPlacePath(Number(localStorage.getItem("orderKey"))));
+                  if (activeOrderId !== null) router.push(afterPlacePath(activeOrderId));
                 }}
               >
                 View order
@@ -557,7 +655,7 @@ export default function OrderDetailsPage() {
                 variant="primary"
                 onClick={() => {
                   setShowShortfallModal(false);
-                  router.push(afterPlacePath(Number(localStorage.getItem("orderKey"))));
+                  if (activeOrderId !== null) router.push(afterPlacePath(activeOrderId));
                 }}
               >
                 Got it

@@ -21,8 +21,6 @@ const formatDate = (dateStr: string) => {
 };
 
 export default function OrderCard({ order, onClick }: OrderCardProps) {
-  if (order.items.length === 0) return null;
-
   const viewed = true; // Temporary removal
 
   const handleClick = () => {
@@ -32,6 +30,10 @@ export default function OrderCard({ order, onClick }: OrderCardProps) {
 
   const totalOrderedMeters = toMeters(order.totals?.total_ordered_meters);
   const totalOutstandingMeters = toMeters(order.totals?.total_outstanding_meters);
+  // An order can be stranded with no lines at all. It still has to be listed --
+  // hiding it makes the order count and the rows disagree -- but flag it so it
+  // reads as broken rather than as a normal zero-metre order.
+  const hasItems = (order.items?.length ?? 0) > 0;
 
   return (
     <div
@@ -64,11 +66,19 @@ export default function OrderCard({ order, onClick }: OrderCardProps) {
 
       <div className="flex items-center justify-between mt-4 pt-3 border-t border-gray-50">
         <div className="flex items-center gap-1.5">
-          <span className="text-base font-black text-gray-900">
-            {formatMeters(totalOrderedMeters)}
-          </span>
-          <span className="text-xs text-gray-400">m</span>
-          {totalOutstandingMeters > 0 && (
+          {hasItems ? (
+            <>
+              <span className="text-base font-black text-gray-900">
+                {formatMeters(totalOrderedMeters)}
+              </span>
+              <span className="text-xs text-gray-400">m</span>
+            </>
+          ) : (
+            <span className="text-xs font-semibold text-red-500">
+              No items on this order
+            </span>
+          )}
+          {hasItems && totalOutstandingMeters > 0 && (
             <>
               <span className="text-gray-300 mx-1">•</span>
               <span className="text-sm font-bold text-amber-600">

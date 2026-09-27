@@ -6,9 +6,8 @@ import { ArrowRight, MapPin, Search, User } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { PageLoading } from "../ui/Loading";
-import { useAuth } from "@/context/AuthContext";
-import { agentApi } from "@/lib/api/agents";
-import { orderApi } from "@/lib/api/order";
+import { createDraftOrder } from "@/lib/draftOrder";
+import { extractErrorMessage } from "@/lib/orderFlow";
 import { toastError } from "@/lib/toast";
 import Pagination from "../ui/Pagination";
 import { PaginatedResponse } from "@/types/global";
@@ -55,7 +54,6 @@ function clearCache() {
 }
 
 const ListCustomer: React.FC = () => {
-  const { user } = useAuth();
   const [data, setData] = useState<CustomerAllResponse>([]);
   const [loading, setLoading] = useState(true);
   const [search, setSearch] = useState("");
@@ -68,6 +66,8 @@ const ListCustomer: React.FC = () => {
 
   const router = useRouter();
   const hasMounted = useRef(false);
+  // Stops a double tap on a customer from creating two drafts.
+  const creatingRef = useRef(false);
 
   const fetchCustomers = async (opts: {
     page: number;
@@ -146,21 +146,25 @@ const ListCustomer: React.FC = () => {
   };
 
   const handleSubmit = async (id: number) => {
+    if (creatingRef.current) return;
+    creatingRef.current = true;
     try {
       setLoading(true);
-      router.push(`/agent/order/new/${id}`);
-      const res = await agentApi.getProfile(user!.id);
-      const res1 = await orderApi.create({
-        customer: id,
-        status: "DRAFT",
-        agent: res.id,
-      });
+      // Create first, navigate second. The wizard reads the active order id from
+      // storage the moment it mounts, so pushing the route before the order
+      // existed made it load whatever order the last session had left behind --
+      // which is how an agent ended up editing and emptying a placed order.
+      await createDraftOrder(id);
       clearCache(); // order created — customer data may change, bust cache
-
-      if (res1.id) localStorage.setItem("orderKey", String(res1.id));
-    } catch {
-      toastError("Error creating order. Please try again.");
+      router.push(`/agent/order/new/${id}`);
+    } catch (e) {
+      toastError(extractErrorMessage(
+        (e as { response?: { data?: unknown } })?.response?.data,
+        "Error creating order. Please try again.",
+      ));
       setLoading(false);
+    } finally {
+      creatingRef.current = false;
     }
   };
 

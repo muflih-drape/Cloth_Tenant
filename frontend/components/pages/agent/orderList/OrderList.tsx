@@ -110,10 +110,14 @@ export default function AgentOrderList({
   // Client-side filter by active tab — same logic as Home page
   // Cloth moves through the warehouse before it ships, so the useful split is
   // "is any metre still waiting to be packed" rather than a product category.
+  // An order with no lines has no packing state at all, so it belongs to neither
+  // bucket: `some()` on an empty list is false, which would otherwise file it
+  // under "Fully Packed" and hide it from the agent who has to fix it.
   const filteredData =
     activeTab === "all"
       ? sortedData
       : sortedData.filter((order) => {
+          if ((order.items?.length ?? 0) === 0) return false;
           const awaiting = order.items.some(
             (item) => outstandingMeters(item) > 0,
           );
@@ -264,6 +268,11 @@ export default function AgentOrderList({
               order={order}
               onClick={() => {
                 if (order.status == "DRAFT") {
+                  // The wizard resolves which order to edit from localStorage,
+                  // not from the route -- the route only carries the customer.
+                  // Point it at this draft so reopening the card cannot land on
+                  // whatever order a previous session left behind.
+                  localStorage.setItem("orderKey", String(order.id));
                   router.push(`/agent/order/new/${order.customer_details.id}`);
                 } else {
                   router.push(`/agent/order/status/${order.id}`);

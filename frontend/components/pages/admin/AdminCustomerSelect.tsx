@@ -5,8 +5,8 @@ import { useRouter, useSearchParams } from "next/navigation";
 import { AxiosError } from "axios";
 import { ArrowLeft, ArrowRight, MapPin, Plus, Search, User } from "lucide-react";
 import { customerApi } from "@/lib/api/customer";
-import { orderApi } from "@/lib/api/order";
-import { buildOrderCreatePayload, extractErrorMessage } from "@/lib/orderFlow";
+import { createDraftOrder } from "@/lib/draftOrder";
+import { extractErrorMessage } from "@/lib/orderFlow";
 import { toastError } from "@/lib/toast";
 import type { CustomerAllResponse } from "@/types/customer";
 import { PageLoading } from "@/components/ui/Loading";
@@ -89,10 +89,7 @@ export default function AdminCustomerSelect() {
     creatingRef.current = true;
     setCreating(true);
     try {
-      const res = await orderApi.create(
-        buildOrderCreatePayload(customerId, agentId),
-      );
-      if (res.id) localStorage.setItem("orderKey", String(res.id));
+      await createDraftOrder(customerId, agentId);
       router.push(`/admin/order/new/${customerId}`);
     } catch (error) {
       const axiosError = error as AxiosError;

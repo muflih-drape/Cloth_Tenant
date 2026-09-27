@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { AlertTriangle, Info } from "lucide-react";
 import { fabricApi } from "@/lib/api/item";
 import { orderApi } from "@/lib/api/order";
+import { readDraftOrderId } from "@/lib/draftOrder";
 import { PageLoading } from "@/components/ui/Loading";
 import { toastSuccess, toastError } from "@/lib/toast";
 import type { FabricQRResponse, FabricVariant } from "@/types/item";
@@ -42,6 +43,10 @@ export default function ProductDetailPage() {
     const [existingMetres, setExistingMetres] = useState<
         Record<number, number>
     >({});
+    /** The line id already on the order for a given colour, per colour. */
+    const [lineIdByVariant, setLineIdByVariant] = useState<
+        Record<number, number>
+    >({});
     const [existingLineId, setExistingLineId] = useState<number | null>(null);
 
     const isEditMode = existingLineId !== null;
@@ -59,11 +64,17 @@ export default function ProductDetailPage() {
                 const [fabricResponse, orderResponse] = await Promise.all([
                     fabricApi.byQr(params.qr, agentId),
                     (async () => {
-                        const orderKey = localStorage.getItem("orderKey");
-                        if (orderKey) {
-                            return orderApi.getOne(parseInt(orderKey, 10));
-                        }
-                        return null;
+                        const orderId = readDraftOrderId();
+                        if (!orderId) return null;
+                        const order = await orderApi.getOne(orderId);
+                        // Never write to an order that belongs to another
+                        // customer, however the storage key came to point here.
+                        // `customer` is write-only server-side, so the owning
+                        // customer only arrives as customer_details.
+                        return order.customer_details?.id ===
+                            parseInt(id, 10)
+                            ? order
+                            : null;
                     })(),
                 ]);
 
@@ -78,22 +89,24 @@ export default function ProductDetailPage() {
                 if (orderResponse && matched) {
                     // Same colour already on the order: editing beats adding a
                     // second line for it, which is what the merge flow did.
-                    const sameVariant = orderResponse.items.find(
-                        (item) => item.variant === matched.id,
-                    );
                     const byVariant: Record<number, number> = {};
+                    const lineIds: Record<number, number> = {};
                     for (const line of orderResponse.items) {
-                        if (line.variant) {
-                            byVariant[line.variant] =
-                                (byVariant[line.variant] ?? 0) +
-                                toMeters(line.ordered_quantity);
-                        }
+                        if (!line.variant) continue;
+                        byVariant[line.variant] =
+                            (byVariant[line.variant] ?? 0) +
+                            toMeters(line.ordered_quantity);
+                        lineIds[line.variant] = line.id;
                     }
                     setExistingMetres(byVariant);
-                    if (sameVariant) {
-                        setExistingLineId(sameVariant.id);
-                        setMetres(sameVariant.ordered_quantity);
-                    }
+                    setLineIdByVariant(lineIds);
+                    // Follow the matched colour, not the first colour scanned.
+                    setExistingLineId(lineIds[matched.id] ?? null);
+                    setMetres(
+                        byVariant[matched.id]
+                            ? String(byVariant[matched.id])
+                            : "",
+                    );
                 }
             } catch (e: any) {
                 const errorMsg = e?.response?.data?.error || "";
@@ -107,15 +120,21 @@ export default function ProductDetailPage() {
             }
         };
         fetchData();
-    }, [params.qr, agentId]);
+    }, [params.qr, agentId, id]);
 
     const handleVariantSelect = (variant: FabricVariant) => {
         setSelectedVariant(variant);
         setValidationError(null);
-        // Switching colour switches which line is being edited, so the metre
-        // figure has to follow the line, not the previous colour.
-        const onOrder = existingMetres[variant.id];
-        if (onOrder) setMetres(String(onOrder));
+        // Switching colour switches which line is being edited, so both the line
+        // id and the metre figure have to follow the colour. Leaving the line id
+        // on the previously matched colour made "Add to Order" overwrite that
+        // other colour's metres, and the new colour was never added at all.
+        setExistingLineId(lineIdByVariant[variant.id] ?? null);
+        setMetres(
+            existingMetres[variant.id]
+                ? String(existingMetres[variant.id])
+                : "",
+        );
     };
 
     const onHandMetres = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
@@ -142,8 +161,8 @@ export default function ProductDetailPage() {
 
         setValidationError(null);
 
-        const orderKey = localStorage.getItem("orderKey");
-        if (!orderKey) {
+        const orderId = readDraftOrderId();
+        if (orderId === null) {
             setValidationError(
                 "Order session not found. Please restart the order.",
             );
@@ -152,8 +171,6 @@ export default function ProductDetailPage() {
 
         setSubmitting(true);
         try {
-            const orderId = parseInt(orderKey, 10);
-
             if (existingLineId !== null) {
                 await orderApi.updateItem(existingLineId, {
                     ordered_quantity: metres,

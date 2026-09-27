@@ -1,6 +1,7 @@
 "use client";
 
 import { formatMeters, toMeters } from "@/types/item";
+import { EditTotalButton } from "./PriceOverrideDialog";
 
 interface OrderTotalsProps {
   /** Total metres across every line, as a display string from the API. */
@@ -11,6 +12,12 @@ interface OrderTotalsProps {
   isLoading?: boolean;
   buttonText?: string;
   showButton?: boolean;
+  /** The line arithmetic, shown struck through when the total was adjusted. */
+  computedTotal?: number;
+  isPriceOverridden?: boolean;
+  /** Omitted when the order is not in a state where the total may be set. */
+  onEditTotal?: () => void;
+  isEditTotalDisabled?: boolean;
 }
 
 export default function OrderTotals({
@@ -21,6 +28,10 @@ export default function OrderTotals({
   isLoading = false,
   buttonText = "Place Order",
   showButton = true,
+  computedTotal,
+  isPriceOverridden = false,
+  onEditTotal,
+  isEditTotalDisabled = false,
 }: OrderTotalsProps) {
   return (
     <div className="bg-gradient-to-r from-primary/5 to-primary/10 rounded-3xl p-4 border border-primary/20">
@@ -46,9 +57,23 @@ export default function OrderTotals({
             </span>
           </div>
           <span className="text-gray-300 text-sm">|</span>
-          <span className="text-xl font-black text-primary leading-none">
-            ₹{Number(totalPrice || 0).toLocaleString("en-IN")}
-          </span>
+          <div className="flex items-baseline gap-2">
+            {isPriceOverridden && computedTotal !== undefined && (
+              <span className="text-sm font-bold text-gray-400 line-through">
+                ₹{Number(computedTotal).toLocaleString("en-IN")}
+              </span>
+            )}
+            <span className="text-xl font-black text-primary leading-none">
+              ₹{Number(totalPrice || 0).toLocaleString("en-IN")}
+            </span>
+            {onEditTotal && (
+              <EditTotalButton
+                onClick={onEditTotal}
+                isOverridden={isPriceOverridden}
+                disabled={isEditTotalDisabled}
+              />
+            )}
+          </div>
         </div>
 
         {showButton && onPlaceOrder && (

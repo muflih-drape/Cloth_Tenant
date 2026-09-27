@@ -1,6 +1,7 @@
 import type {
   AddOrderItemRequest,
   DispatchResponse,
+  MergeOrderItemsRequest,
   OrderAllResponse,
   OrderRegisterRequest,
   OrderRegisterResponse,
@@ -159,6 +160,17 @@ export const orderApi = {
     return api.delete(`/api/orders/${orderId}/delete-item/${itemId}/`).then((r) => r.data);
   },
 
+  /**
+   * Fold duplicate lines into one. Done server-side in a single transaction so
+   * the metres are summed as decimals and a failure cannot leave the order
+   * holding the group's metres twice.
+   */
+  mergeItems(orderId: number, data: MergeOrderItemsRequest): Promise<void> {
+    return api
+      .post(`/api/orders/${orderId}/merge-items/`, data)
+      .then((r) => r.data);
+  },
+
   invoiceOrder(id: number): Promise<InvoiceResponse> {
     return api.get<InvoiceResponse>(`/api/orders/${id}/invoice/`).then((r) => r.data);
   },
@@ -198,10 +210,14 @@ export const orderApi = {
     return api.post<DispatchResponse>(`/api/orders/${id}/dispatch/`, data).then((r) => r.data);
   },
 
-  /** Override the billed total. `reason` is mandatory and gets audited. */
+  /**
+   * Set or clear the billed total of a draft order. Posting the computed total
+   * clears an existing adjustment. `reason` is optional but always audited.
+   * The server caps an agent at the line arithmetic; only an admin may raise it.
+   */
   setPrice(
     id: number,
-    data: { final_total: string; reason: string },
+    data: { final_total: string; reason?: string },
   ): Promise<PriceOverrideResponse> {
     return api.post<PriceOverrideResponse>(`/api/orders/${id}/set-price/`, data).then((r) => r.data);
   },

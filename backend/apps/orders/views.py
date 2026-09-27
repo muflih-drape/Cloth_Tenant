@@ -9,7 +9,7 @@ from django.db.models import F, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
-from rest_framework import status
+from rest_framework import serializers, status
 from rest_framework.decorators import action
 from rest_framework.exceptions import ValidationError
 from rest_framework.pagination import PageNumberPagination
@@ -21,7 +21,12 @@ from rest_framework.viewsets import ModelViewSet
 from apps.accounts.permissions import IsAdmin, IsAgent, IsAgentOrAdmin, check_admin_pin
 from apps.agents.models import Agent, AgentItem
 from apps.notification.utils import notify_user_safely
-from apps.orders.pricing import recompute_order_total, set_final_total
+from apps.orders.pricing import (
+    METRE,
+    order_computed_total,
+    recompute_order_total,
+    set_final_total,
+)
 from apps.orders.stock import (
     backorder_report,
     return_to_stock,
@@ -378,8 +383,15 @@ class SaveEditView(APIView):
 class SetOrderPriceView(APIView):
     """Override the billed total of an order.
 
-    Both agents (on their own order) and admins (on any order) may do this from
-    PENDING through PACKED. A reason is mandatory and the change is logged.
+    Only a draft can be repriced, for everyone. Once placed, the number an agent
+    puts on paper is a commitment, so the figure is frozen and any change to it
+    has to go through dispatching or cancelling the order. This keeps the audit
+    trail honest: nobody can quietly reprice stock that packing has moved.
+
+    An agent may only discount -- their total is capped at the line arithmetic.
+    An admin may set any amount, which is how a goodwill gesture is recorded.
+
+    The reason is optional, but every change is logged either way.
     """
 
     permission_classes = [IsAgentOrAdmin]
@@ -394,11 +406,11 @@ class SetOrderPriceView(APIView):
         if not _may_touch(request.user, order):
             return Response({"error": "Unauthorized"}, status=403)
 
-        if order.status not in ("PENDING", "PACKED"):
+        if order.status != "DRAFT":
             return Response(
                 {
-                    "error": "The total can only be changed while the order is "
-                    "pending or packed"
+                    "error": "The total can only be changed before the order "
+                    "is placed"
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
@@ -416,6 +428,20 @@ class SetOrderPriceView(APIView):
                 {"error": "final_total must be a number"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # An agent may reduce the bill but never inflate it. Compare against the
+        # live line arithmetic rather than the stored column, so a draft whose
+        # lines changed since the last recompute is still capped correctly.
+        if request.user.role == "AGENT":
+            computed = order_computed_total(order)
+            if new_total > computed:
+                return Response(
+                    {
+                        "error": "An agent total cannot be higher than the order "
+                        f"total of {computed:,.2f}"
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
 
         try:
             set_final_total(order, new_total, request.user, request.data.get("reason"))
@@ -786,7 +812,10 @@ class AddOrderItemView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if order.status != "EDITING" and not _is_creator(request.user, order):
+        # Ownership is unconditional. This used to be skipped for EDITING
+        # orders, which let any agent append lines to another agent's order the
+        # moment its owner opened it for editing.
+        if not _may_touch(request.user, order):
             return Response(
                 {"error": "You can only add items to your own orders"},
                 status=status.HTTP_403_FORBIDDEN,
@@ -834,6 +863,212 @@ class AddOrderItemView(APIView):
         )
 
 
+def _remove_order_line(request, order, order_item):
+    """Take one line off an order, refusing anything that would strand the order.
+
+    Shared by DeleteOrderItemView and OrderItemViewSet.destroy so the status,
+    ownership, packing and empty-order rules can only exist in one place. The
+    generic viewset used to delete through ModelViewSet with none of them, which
+    cascaded the allocation rows away and left the roll debited forever.
+    """
+    if order.status not in ("DRAFT", "EDITING", "PENDING"):
+        return Response(
+            {
+                "error": "Lines can only be removed from a DRAFT, EDITING or "
+                "PENDING order"
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    if not _may_touch(request.user, order):
+        return Response(
+            {"error": "You can only edit your own orders"},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    if order_item.allocated_quantity > ZERO:
+        # Cloth has physically moved; undo the packing round instead so the
+        # allocation record and the roll stay in step.
+        return Response(
+            {
+                "error": f"{order_item.allocated_quantity} m of this fabric "
+                f"has already been packed. Cancel the packing round to remove it."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    # A placed order exists to be packed, dispatched and invoiced. Removing its
+    # final line leaves demand nothing to fulfil, and no later step can put the
+    # cloth back, so the last line of a placed order is fixed.
+    if (
+        order.status == "PENDING"
+        and not order.items.exclude(id=order_item.id).exists()
+    ):
+        return Response(
+            {
+                "error": "This is the only line left on a placed order. Add a "
+                "line before removing it, or cancel the order instead."
+            },
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    with transaction.atomic():
+        OrderLog.record(
+            order,
+            "ITEM_DELETED",
+            details={
+                "fabric_name": order_item.fabric_name,
+                "ordered_quantity": str(order_item.ordered_quantity),
+                "metres_removed": str(order_item.ordered_quantity),
+            },
+            performed_by=request.user,
+        )
+        order_item.delete()
+        recompute_order_total(order)
+
+    return Response({"message": "Item Deleted Successfully"})
+
+
+class MergeOrderItemsSerializer(serializers.Serializer):
+    """Fold duplicate lines of one colour into a single line."""
+
+    keep_item_id = serializers.IntegerField(min_value=1)
+    drop_item_ids = serializers.ListField(
+        child=serializers.IntegerField(min_value=1), allow_empty=True
+    )
+
+    def validate(self, attrs):
+        keep = attrs["keep_item_id"]
+        if keep in attrs["drop_item_ids"]:
+            raise serializers.ValidationError(
+                "The line being kept cannot also be dropped."
+            )
+        if len(set(attrs["drop_item_ids"])) != len(attrs["drop_item_ids"]):
+            raise serializers.ValidationError("A line cannot be dropped twice.")
+        return attrs
+
+
+class MergeOrderItemsView(APIView):
+    """Combine duplicate lines of the same colour, in one transaction.
+
+    The wizard used to sum the metres in JavaScript and then issue one request
+    per line: `0.1 + 0.2` serialises as `0.30000000000000004`, which the
+    serializer rejects, and a failure part-way through left the order holding
+    the group's metres twice while the agent was told placement had failed.
+    """
+
+    permission_classes = [IsAgentOrAdmin]
+
+    @extend_schema(
+        summary="Merge duplicate lines of an order into one",
+        request=MergeOrderItemsSerializer,
+        responses={200: None, 400: None, 403: None, 404: None},
+    )
+    def post(self, request, order_id):
+        serializer = MergeOrderItemsSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        keep_id = serializer.validated_data["keep_item_id"]
+        drop_ids = serializer.validated_data["drop_item_ids"]
+
+        with transaction.atomic():
+            order = Order.objects.select_for_update().filter(id=order_id).first()
+            if order is None:
+                return Response(
+                    {"error": "Order not found"}, status=status.HTTP_404_NOT_FOUND
+                )
+
+            if order.status not in ("DRAFT", "EDITING"):
+                return Response(
+                    {
+                        "error": "Lines can only be merged on a DRAFT or EDITING "
+                        "order"
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            if not _may_touch(request.user, order):
+                return Response(
+                    {"error": "You can only edit your own orders"},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
+            if _has_allocations(order):
+                return Response(
+                    {
+                        "error": "Part of this order has already been packed, so "
+                        "lines can no longer be merged."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            wanted = [keep_id, *drop_ids]
+            lines = list(order.items.filter(id__in=wanted))
+            if len(lines) != len(wanted):
+                return Response(
+                    {"error": "One or more lines are not on this order"},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
+
+            keeper = next(line for line in lines if line.id == keep_id)
+            dropping = [line for line in lines if line.id != keep_id]
+
+            variants = {line.variant_id for line in lines}
+            if len(variants) > 1:
+                return Response(
+                    {
+                        "error": "Only lines of the same colour can be merged."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            # Decimals all the way: the metres are stored to three places, so
+            # the sum must be too.
+            merged = sum(
+                (line.ordered_quantity for line in lines), ZERO
+            ).quantize(METRE)
+
+            if merged > ZERO:
+                if merged < keeper.allocated_quantity:
+                    return Response(
+                        {
+                            "error": "The merged total is below the metres already "
+                            "packed for this line. Cancel the packing round first."
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                keeper.ordered_quantity = merged
+                keeper.save(update_fields=["ordered_quantity"])
+
+            for line in dropping:
+                OrderLog.record(
+                    order,
+                    "ITEM_MERGED",
+                    details={
+                        "fabric_name": line.fabric_name,
+                        "metres_merged": str(line.ordered_quantity),
+                        "into_item_id": keep_id,
+                    },
+                    performed_by=request.user,
+                )
+                line.delete()
+
+            OrderLog.record(
+                order,
+                "ORDER_EDITED",
+                details={
+                    "item_id": keep_id,
+                    "fabric_name": keeper.fabric_name,
+                    "old_quantity": str(lines[0].ordered_quantity),
+                    "new_quantity": str(merged),
+                    "merged_lines": len(dropping),
+                },
+                performed_by=request.user,
+            )
+            recompute_order_total(order)
+
+        return Response({"message": "Lines merged", "ordered_quantity": str(merged)})
+
+
 class DeleteOrderItemView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -843,48 +1078,8 @@ class DeleteOrderItemView(APIView):
     )
     def delete(self, request, order_id, item_id):
         order = get_object_or_404(Order, id=order_id)
-
-        if order.status not in ("DRAFT", "EDITING", "PENDING"):
-            return Response(
-                {"error": "Lines can only be removed from a DRAFT, EDITING or "
-                "PENDING order"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if order.status != "EDITING" and not _may_touch(request.user, order):
-            return Response(
-                {"error": "You can only edit your own orders"},
-                status=status.HTTP_403_FORBIDDEN,
-            )
-
         order_item = get_object_or_404(OrderItem, id=item_id, order=order)
-
-        if order_item.allocated_quantity > ZERO:
-            # Cloth has physically moved; undo the packing round instead so the
-            # allocation record and the roll stay in step.
-            return Response(
-                {
-                    "error": f"{order_item.allocated_quantity} m of this fabric "
-                    "has already been packed. Cancel the packing round to remove it."
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        with transaction.atomic():
-            OrderLog.record(
-                order,
-                "ITEM_DELETED",
-                details={
-                    "fabric_name": order_item.fabric_name,
-                    "ordered_quantity": str(order_item.ordered_quantity),
-                    "metres_removed": str(order_item.ordered_quantity),
-                },
-                performed_by=request.user,
-            )
-            order_item.delete()
-            recompute_order_total(order)
-
-        return Response({"message": "Item Deleted Successfully"})
+        return _remove_order_line(request, order, order_item)
 
 
 class InvoiceView(APIView):
@@ -892,12 +1087,19 @@ class InvoiceView(APIView):
 
     @extend_schema(
         summary="Get the invoice for an order",
-        responses={200: InvoiceSerializer, 404: None},
+        responses={200: InvoiceSerializer, 403: None, 404: None},
     )
     def get(self, request, order_id):
         order = get_object_or_404(
             Order.objects.prefetch_related("items__variant__fabric"), id=order_id
         )
+
+        # An invoice carries the customer's name, address and GSTIN, so it follows
+        # the same ownership rule as the order logs and the price override: an
+        # admin may read any, an agent only their own.
+        if not _may_touch(request.user, order):
+            return Response({"error": "Unauthorized"}, status=403)
+
         return Response(InvoiceSerializer(order, context={"request": request}).data)
 
 
@@ -940,6 +1142,20 @@ class OrderItemViewSet(ModelViewSet):
             return qs.filter(order__agent__user=user)
         return qs
 
+    def create(self, request, *args, **kwargs):
+        # Lines are born through AddOrderItemView, which derives the fabric from
+        # the scanned QR, snapshots the rate and checks agent assignment. This
+        # route could not target an order at all, so it only ever 500'd.
+        return Response(
+            {"error": "Use the order add-item endpoint to add a line"},
+            status=status.HTTP_405_METHOD_NOT_ALLOWED,
+        )
+
+    def destroy(self, request, *args, **kwargs):
+        # Route through the same guarded removal as DeleteOrderItemView.
+        order_item = self.get_object()
+        return _remove_order_line(request, order_item.order, order_item)
+
     def update(self, request, *args, **kwargs):
         order_item = self.get_object()
         order = order_item.order
@@ -953,7 +1169,7 @@ class OrderItemViewSet(ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        if order.status != "EDITING" and not _may_touch(request.user, order):
+        if not _may_touch(request.user, order):
             return Response(
                 {"error": "You can only edit your own orders"},
                 status=status.HTTP_403_FORBIDDEN,
@@ -986,10 +1202,19 @@ class OrderItemViewSet(ModelViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        # Validate before writing anything. The quantity was previously saved
+        # first and the serializer validated afterwards, so a bad payload came
+        # back as a 400 with the change already committed -- the agent was told
+        # the edit failed while the order had in fact moved. Read `partial`
+        # without popping it: super().update() needs it to keep PATCH sparse.
+        partial = kwargs.get("partial", False)
+        self.get_serializer(
+            order_item, data=request.data, partial=partial
+        ).is_valid(raise_exception=True)
+
         with transaction.atomic():
+            response = super().update(request, *args, **kwargs)
             if old_quantity != new_quantity:
-                order_item.ordered_quantity = new_quantity
-                order_item.save(update_fields=["ordered_quantity"])
                 OrderLog.record(
                     order,
                     "ORDER_EDITED",
@@ -1001,6 +1226,7 @@ class OrderItemViewSet(ModelViewSet):
                     },
                     performed_by=request.user,
                 )
+            # After the write, so a changed colour or rate is billed correctly.
             recompute_order_total(order)
 
-        return super().update(request, *args, **kwargs)
+        return response

@@ -97,6 +97,49 @@ class OrderItemSerializer(serializers.ModelSerializer):
     def get_allocation_count(self, obj):
         return obj.allocations.count()
 
+    def validate(self, attrs):
+        """Keep the line internally consistent and its snapshots honest.
+
+        ``variant`` was writable without being cross-checked against ``fabric``,
+        so a PATCH could re-point a line at another fabric's cloth while
+        ``fabric_name`` and ``rate_per_meter`` -- both read-only -- kept
+        describing the old one. The order then billed fabric A's rate for
+        fabric B's metres, and the packing board queued the line against a
+        variant that had never been paid for.
+        """
+        variant = attrs.get("variant")
+        if variant is None:
+            if "fabric" in attrs and self.instance is not None:
+                raise serializers.ValidationError(
+                    {"variant": "A colour is required to change the fabric."}
+                )
+            return attrs
+
+        if variant.fabric.is_deleted:
+            raise serializers.ValidationError(
+                {"variant": "This fabric has been deleted."}
+            )
+
+        if (
+            self.instance is not None
+            and self.instance.variant_id != variant.id
+            and self.instance.allocations.exists()
+        ):
+            raise serializers.ValidationError(
+                {
+                    "variant": "This line has already been packed, so the colour "
+                    "cannot be changed. Cancel the packing round first."
+                }
+            )
+
+        # The variant is the source of truth for the fabric and the rate.
+        attrs["fabric"] = variant.fabric
+        attrs["fabric_name"] = variant.fabric.name
+        attrs["rate_per_meter"] = variant.fabric.price_per_meter
+        attrs["variant_display_order"] = variant.display_order or ""
+
+        return attrs
+
     def to_representation(self, instance):
         data = super().to_representation(instance)
         request = self.context.get("request")
@@ -108,6 +151,35 @@ class OrderItemSerializer(serializers.ModelSerializer):
             data["variant_image"] = request.build_absolute_uri(variant_image)
 
         return data
+
+
+def order_totals_payload(order):
+    """The one totals shape every order endpoint returns, as JSON-safe values.
+
+    Both the order and the invoice payloads render money, so they must agree
+    key for key -- a consumer reading ``totals.effective_total`` has to find it
+    on both. This used to be spelled out twice and the copies drifted, which is
+    what left the invoice subtotal, GST and grand total rendering as zero.
+    """
+    totals = order_totals(order)
+    return {
+        "total_ordered_meters": str(totals["total_ordered_meters"]),
+        "total_allocated_meters": str(totals["total_allocated_meters"]),
+        "total_outstanding_meters": str(totals["total_outstanding_meters"]),
+        "computed_total": str(totals["computed_total"]),
+        "final_total": (
+            str(totals["final_total"]) if totals["final_total"] is not None else None
+        ),
+        "effective_total": str(totals["effective_total"]),
+        "is_price_overridden": totals["is_price_overridden"],
+        "price_override_reason": totals["price_override_reason"],
+        "price_overridden_by": totals["price_overridden_by"],
+        "price_overridden_at": (
+            totals["price_overridden_at"].isoformat()
+            if totals["price_overridden_at"]
+            else None
+        ),
+    }
 
 
 class OrderSerializer(serializers.ModelSerializer):
@@ -125,26 +197,25 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = "__all__"
-        read_only_fields = ("created_by",)
+        # Money and lifecycle are server-owned. The total is reachable only via
+        # SetOrderPriceView, which caps an agent at the line arithmetic, allows
+        # the change on drafts only, and writes an audit entry. Leaving these
+        # writable let a plain PATCH skip every one of those rules.
+        read_only_fields = (
+            "created_by",
+            "computed_total",
+            "final_total",
+            "price_override_reason",
+            "price_overridden_by",
+            "price_overridden_at",
+            "status",
+            "shortfall_reason",
+            "edit_snapshot",
+            "editing_started_at",
+        )
 
     def get_totals(self, obj):
-        totals = order_totals(obj)
-        return {
-            **totals,
-            "total_ordered_meters": str(totals["total_ordered_meters"]),
-            "total_allocated_meters": str(totals["total_allocated_meters"]),
-            "total_outstanding_meters": str(totals["total_outstanding_meters"]),
-            "computed_total": str(totals["computed_total"]),
-            "final_total": (
-                str(totals["final_total"]) if totals["final_total"] is not None else None
-            ),
-            "effective_total": str(totals["effective_total"]),
-            "price_overridden_at": (
-                totals["price_overridden_at"].isoformat()
-                if totals["price_overridden_at"]
-                else None
-            ),
-        }
+        return order_totals_payload(obj)
 
 
 class AddOrderItemSerializer(serializers.Serializer):
@@ -233,16 +304,4 @@ class InvoiceSerializer(serializers.ModelSerializer):
         return SimpleBrandSerializer(brand, context=self.context).data
 
     def get_totals(self, obj):
-        totals = order_totals(obj)
-        return {
-            "total_ordered_meters": str(totals["total_ordered_meters"]),
-            "total_allocated_meters": str(totals["total_allocated_meters"]),
-            "total_outstanding_meters": str(totals["total_outstanding_meters"]),
-            "computed_total": str(totals["computed_total"]),
-            "final_total": (
-                str(totals["final_total"]) if totals["final_total"] is not None else None
-            ),
-            "total_price": str(totals["effective_total"]),
-            "is_price_overridden": totals["is_price_overridden"],
-            "price_override_reason": totals["price_override_reason"],
-        }
+        return order_totals_payload(obj)

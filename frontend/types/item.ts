@@ -174,3 +174,13 @@ export function formatMeters(value: string | number | null | undefined): string 
   const metres = toMeters(value);
   return Number.isInteger(metres) ? String(metres) : metres.toFixed(3).replace(/0+$/, "");
 }
+
+/**
+ * Quantise to the 3-decimal precision the backend stores metres at. Summing
+ * 0.1 + 0.2 in floating point drifts past the roll's stock and would raise a
+ * false "you have over-allocated" warning, so every client-side total and
+ * comparison goes through this first.
+ */
+export function roundMetres(value: string | number | null | undefined): number {
+  return Math.round((toMeters(value) + Number.EPSILON) * 1000) / 1000;
+}

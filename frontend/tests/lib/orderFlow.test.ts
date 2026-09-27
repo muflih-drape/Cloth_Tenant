@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  buildAgentOrderCreatePayload,
   buildOrderCreatePayload,
   extractErrorMessage,
   getOrderAfterPlacePath,
@@ -41,6 +42,16 @@ describe("buildOrderCreatePayload", () => {
       status: "DRAFT",
       agent: 3,
     });
+  });
+});
+
+describe("buildAgentOrderCreatePayload", () => {
+  it("omits the agent so the server assigns the signed-in one", () => {
+    expect(buildAgentOrderCreatePayload(7)).toEqual({
+      customer: 7,
+      status: "DRAFT",
+    });
+    expect(buildAgentOrderCreatePayload(7)).not.toHaveProperty("agent");
   });
 });
 

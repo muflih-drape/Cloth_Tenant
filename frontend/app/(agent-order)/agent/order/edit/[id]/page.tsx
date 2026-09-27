@@ -85,7 +85,9 @@ export default function EditOrderPage() {
 
   const totalMetres =
     orders?.items.reduce((sum, item) => sum + toMeters(item.ordered_quantity), 0) ?? 0;
-  const totalMoney = Number(orders?.totals.computed_total ?? 0);
+  // Show what the order bills. An agreed total set before placing survives the
+  // edit, so showing the raw line arithmetic here would contradict the invoice.
+  const totalMoney = Number(orders?.totals.effective_total ?? 0);
 
   const handleSaveChanges = async () => {
     if (duplicateGroups.length > 0) {

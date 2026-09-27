@@ -35,6 +35,9 @@ export default function EditProductDetailPage() {
   const [existingMetres, setExistingMetres] = useState<Record<number, number>>(
     {},
   );
+  const [lineIdByVariant, setLineIdByVariant] = useState<Record<number, number>>(
+    {},
+  );
   const [existingLineId, setExistingLineId] = useState<number | null>(null);
 
   const isEditMode = existingLineId !== null;
@@ -45,13 +48,7 @@ export default function EditProductDetailPage() {
       try {
         const [fabricResponse, orderResponse] = await Promise.all([
           fabricApi.byQr(params.qr),
-          (async () => {
-            const orderKey = localStorage.getItem("orderKey");
-            if (orderKey) {
-              return orderApi.getOne(parseInt(orderKey, 10));
-            }
-            return null;
-          })(),
+          orderApi.getOne(parseInt(id, 10)),
         ]);
 
         setData(fabricResponse);
@@ -64,23 +61,21 @@ export default function EditProductDetailPage() {
 
         if (orderResponse && matched) {
           const byVariant: Record<number, number> = {};
+          const lineIds: Record<number, number> = {};
           for (const line of orderResponse.items) {
-            if (line.variant) {
-              byVariant[line.variant] =
-                (byVariant[line.variant] ?? 0) + toMeters(line.ordered_quantity);
-            }
+            if (!line.variant) continue;
+            byVariant[line.variant] =
+              (byVariant[line.variant] ?? 0) + toMeters(line.ordered_quantity);
+            lineIds[line.variant] = line.id;
           }
           setExistingMetres(byVariant);
+          setLineIdByVariant(lineIds);
 
           // Reuse this colour's line if the order already has one, so scanning
-          // the same roll twice adjusts it rather than duplicating it.
-          const sameVariant = orderResponse.items.find(
-            (line) => line.variant === matched.id,
-          );
-          if (sameVariant) {
-            setExistingLineId(sameVariant.id);
-            setMetres(sameVariant.ordered_quantity);
-          }
+          // the same roll twice adjusts it rather than duplicating it. The line
+          // follows the selected colour, not the colour first scanned.
+          setExistingLineId(lineIds[matched.id] ?? null);
+          setMetres(byVariant[matched.id] ? String(byVariant[matched.id]) : "");
         }
       } catch (e) {
         console.error("Error fetching fabric details:", e);
@@ -89,13 +84,17 @@ export default function EditProductDetailPage() {
       }
     };
     fetchData();
-  }, [params.qr]);
+  }, [params.qr, id]);
 
   const handleVariantSelect = (variant: FabricVariant) => {
     setSelectedVariant(variant);
     setValidationError(null);
-    const onOrder = existingMetres[variant.id];
-    if (onOrder) setMetres(String(onOrder));
+    // Both the target line and the metre figure belong to the selected colour;
+    // carrying the previous colour's line id overwrote the wrong line.
+    setExistingLineId(lineIdByVariant[variant.id] ?? null);
+    setMetres(
+      existingMetres[variant.id] ? String(existingMetres[variant.id]) : "",
+    );
   };
 
   const onHandMetres = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
@@ -119,13 +118,9 @@ export default function EditProductDetailPage() {
 
     try {
       setLoading(true);
-      const orderKey = localStorage.getItem("orderKey");
-      if (!orderKey) {
-        setValidationError("Order session not found. Please restart the order.");
-        setLoading(false);
-        return;
-      }
-      const orderId = parseInt(orderKey, 10);
+      // On this route the id *is* the order id, so there is no session key to
+      // consult and no way to act on an order the agent is not editing.
+      const orderId = parseInt(id, 10);
 
       if (existingLineId !== null) {
         await orderApi.updateItem(existingLineId, {

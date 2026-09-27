@@ -9,7 +9,7 @@ import { InvoicePDF } from "@/components/pages/InvoicePdf";
 import { useBackButton } from "@/util/useBackButton";
 
 import OrderForm from "@/components/pages/order-form/OrderFormView";
-import { Download, Printer, Share2 } from "lucide-react";
+import { AlertTriangle, Download, Printer, Share2 } from "lucide-react";
 import { PageLoading } from "@/components/ui/Loading";
 
 const urlToDataUrl = async (url: string): Promise<string | null> => {
@@ -56,6 +56,7 @@ export default function InvoicePage() {
     const [pdfBlob, setPdfBlob] = useState<Blob | null>(null);
     const [pdfBlobUrl, setPdfBlobUrl] = useState<string | null>(null);
     const [pdfGenerating, setPdfGenerating] = useState(true);
+    const [pdfError, setPdfError] = useState<string | null>(null);
 
     useBackButton({
         onBack: () => {
@@ -119,10 +120,19 @@ export default function InvoicePage() {
 
                 setPdfBlob(blob);
                 setPdfBlobUrl(URL.createObjectURL(blob));
+                setPdfError(null);
                 setPdfGenerating(false);
             } catch (e) {
                 console.error("Failed to generate PDF preview:", e);
                 if (!cancelled) {
+                    // Surface this. Previously the failure was swallowed, so the
+                    // preview stayed a blank iframe and Print/Download silently
+                    // stayed disabled with nothing to tell the agent why.
+                    setPdfError(
+                        e instanceof Error
+                            ? e.message
+                            : "The order form preview could not be generated",
+                    );
                     setPdfGenerating(false);
                 }
             }
@@ -321,6 +331,22 @@ export default function InvoicePage() {
                         <p className="text-sm text-slate-400">
                             Generating preview…
                         </p>
+                    </div>
+                ) : pdfError ? (
+                    <div className="flex flex-col items-center justify-center h-96 gap-3 px-6 text-center">
+                        <div className="w-10 h-10 rounded-full bg-red-50 flex items-center justify-center">
+                            <AlertTriangle size={20} className="text-red-500" />
+                        </div>
+                        <p className="text-sm font-bold text-gray-900">
+                            The order form preview could not be generated
+                        </p>
+                        <p className="text-xs text-gray-500 max-w-xs">{pdfError}</p>
+                        <button
+                            onClick={() => window.location.reload()}
+                            className="mt-1 text-xs font-bold text-primary hover:underline"
+                        >
+                            Try again
+                        </button>
                     </div>
                 ) : (
                     <iframe

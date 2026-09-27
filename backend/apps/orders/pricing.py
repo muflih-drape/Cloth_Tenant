@@ -17,6 +17,10 @@ from apps.orders.models import Order, OrderItem, OrderLog
 
 ZERO = Decimal("0")
 
+# Metres are stored to three decimal places; anything summed for storage has to
+# land on the same grid or the serializer rejects it.
+METRE = Decimal("0.001")
+
 
 def line_value(order_item):
     return (order_item.ordered_quantity or ZERO) * (order_item.rate_per_meter or ZERO)
@@ -69,14 +73,17 @@ def set_final_total(order, new_total, user, reason):
 
     Passing ``new_total`` equal to the computed total clears the override
     instead of recording a no-op adjustment.
+
+    ``reason`` is optional -- an agent adjusting a draft should not be forced to
+    invent a justification. The audit entry records who changed the total, when,
+    and from what to what regardless, so the numbers are always traceable even
+    when the narrative is empty.
     """
     new_total = Decimal(str(new_total)).quantize(Decimal("0.01"))
     if new_total < ZERO:
         raise ValueError("The final total cannot be negative")
 
     reason = (reason or "").strip()
-    if not reason:
-        raise ValueError("A reason is required when changing the order total")
     if len(reason) > 200:
         raise ValueError("The reason must be 200 characters or fewer")
 

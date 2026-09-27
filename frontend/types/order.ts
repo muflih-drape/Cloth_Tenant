@@ -57,7 +57,12 @@ export interface Order {
   items: OrderItem[];
   agent: number | null;
   agent_details: SimpleAgent | null;
-  customer: number;
+  /**
+   * Write-only on the serializer: accepted when creating an order, but never
+   * present in a response. Use `customer_details.id` to read the owning
+   * customer back off a fetched order.
+   */
+  customer?: number;
   customer_details: SimpleCustomer;
   status: OrderStatus;
   totals: OrderTotals;
@@ -142,6 +147,12 @@ export interface UpdateOrderRequest {
 export interface UpdateOrderItemRequest {
   ordered_quantity?: string;
   variant?: number | null;
+}
+
+/** Collapse duplicate lines of the same colour into the one kept. */
+export interface MergeOrderItemsRequest {
+  keep_item_id: number;
+  drop_item_ids: number[];
 }
 
 export type OrderAllResponse = Order[];
