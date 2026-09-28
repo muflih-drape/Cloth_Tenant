@@ -24,6 +24,12 @@ type Props = {
   /** Hide unfulfilled lines -- used on the dispatch screen. */
   onlyFullyPacked?: boolean;
   outstandingItemIds?: number[];
+  /**
+   * Rendered inside each line's own card. The admin order page uses it to hang
+   * the per-line packing control off the line it packs, so the control lives in
+   * the same card as the line rather than in a card of its own.
+   */
+  renderLineFooter?: (item: OrderItemType) => React.ReactNode;
 };
 
 /**
@@ -42,6 +48,7 @@ const OrderItem: React.FC<Props> = ({
   onDeleteItem,
   onlyFullyPacked = false,
   outstandingItemIds = [],
+  renderLineFooter,
 }) => {
   const [deleting, setDeleting] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -155,6 +162,7 @@ const OrderItem: React.FC<Props> = ({
               isOutOfStock={outstandingItemIds.includes(item.id)}
               onDelete={(deleteItemId) => onDelete(deleteItemId)}
               onEdit={isEditable ? handleEditItem : undefined}
+              footer={renderLineFooter?.(item)}
             />
           );
         })}

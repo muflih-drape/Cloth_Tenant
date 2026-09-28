@@ -241,3 +241,24 @@ export interface PlanOverrideEntry {
   order_item: number;
   metres: string;
 }
+
+/* ------------------------------------------------------------------ */
+/* Packing a single order line                                         */
+/* ------------------------------------------------------------------ */
+
+/**
+ * What packing one line from the order page gives back.
+ *
+ * `item` is the whole line as the server now sees it, and `stock_meters` is what
+ * is left on the roll, so the page can update both in place instead of
+ * refetching the order. `round` is the packing round the backend built to do it,
+ * which is what makes the shortcut auditable rather than a private shortcut.
+ */
+export interface PackLineResponse {
+  message: string;
+  round: number;
+  order: number;
+  order_status: OrderStatus;
+  item: OrderItem;
+  stock_meters: string;
+}

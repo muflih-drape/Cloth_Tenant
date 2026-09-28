@@ -6,6 +6,10 @@ line still waiting on that roll, ranked by how much each customer buys.
 check who gets the leftover metres before committing. ``create_round`` freezes a
 plan (optionally hand-adjusted) as a DRAFT round; ``confirm`` moves the stock and
 writes the audit trail; ``cancel`` reverses it.
+
+``pack_line`` is the shortcut for filling one order line from the order page
+without opening the board. It is not a second way of moving stock: it builds the
+same one-entry round and hands it to the same applier, so the trail is identical.
 """
 
 from decimal import Decimal, InvalidOperation
@@ -22,6 +26,7 @@ from rest_framework.response import Response
 from apps.accounts.permissions import IsAdmin
 from apps.items.models import FabricVariant
 from apps.orders.allocation import (
+    OPEN_STATUSES,
     build_plan,
     cancel_round,
     confirm_round,
@@ -30,7 +35,11 @@ from apps.orders.allocation import (
     sync_order_after_allocation,
 )
 from apps.orders.models import Allocation, Order, OrderItem, PackingRound
-from apps.orders.serializers import AllocationSerializer
+from apps.orders.serializers import (
+    MIN_ORDER_METERS,
+    AllocationSerializer,
+    OrderItemSerializer,
+)
 
 ZERO = Decimal("0")
 
@@ -159,6 +168,19 @@ class _CreateRoundSerializer(serializers.Serializer):
             )
         attrs["plan_override"] = cleaned
         return attrs
+
+
+class _PackLineSerializer(serializers.Serializer):
+    """Metres to hand one order line, typed in from the order page."""
+
+    metres = serializers.DecimalField(max_digits=14, decimal_places=3)
+
+    def validate_metres(self, value):
+        if value < MIN_ORDER_METERS:
+            raise serializers.ValidationError(
+                f"Must be at least {MIN_ORDER_METERS.normalize()} m."
+            )
+        return value
 
 
 @extend_schema(
@@ -310,7 +332,7 @@ def confirm(request, pk):
     """Apply a round's frozen plan.
 
     Stock is locked and re-checked first, so a round created a while ago can
-    never overdraw the roll or hand out metres a line no longer needs.
+    never overdraw the roll.
     """
     packing_round = get_object_or_404(PackingRound, pk=pk)
     if packing_round.status != "DRAFT":
@@ -358,7 +380,11 @@ def confirm(request, pk):
 
 
 def _apply_plan(packing_round, stored, user, note=""):
-    """Apply the exact per-line metres the admin approved."""
+    """Apply the exact per-line metres the admin approved.
+
+    The only hard limit is physical stock: a roll is cut whole, so a plan may
+    hand out more metres than a line had outstanding.
+    """
     from apps.orders.allocation import _adjust_stock, _lock_round
 
     packing_round = _lock_round(packing_round)
@@ -397,11 +423,10 @@ def _apply_plan(packing_round, stored, user, note=""):
         if line is None:
             continue
         metres = Decimal(str(entry["metres"]))
-        if line.outstanding_quantity < metres:
-            raise ValueError(
-                f"Order #{line.order_id} no longer needs {metres} m of "
-                f"{line.fabric_name}."
-            )
+        # No check against what the line still owes: a roll is cut whole, so
+        # handing over more than was ordered is allowed and `allocated_quantity`
+        # may legitimately pass `ordered_quantity`. The only hard limit is the
+        # metres physically on the roll, which is enforced above.
         Allocation.objects.create(
             round=packing_round,
             order_item=line,
@@ -426,6 +451,112 @@ def _apply_plan(packing_round, stored, user, note=""):
         sync_order_after_allocation(order, user, packing_round)
 
     return packing_round
+
+
+@extend_schema(
+    methods=["POST"],
+    summary="Pack a single order line straight from the order page",
+    request=_PackLineSerializer,
+)
+@api_view(["POST"])
+@permission_classes([IsAdmin])
+def pack_line(request, order_id, item_id):
+    """Fill one order line without opening the packing board.
+
+    This is the same stock-moving event as a multi-order round, just scoped to a
+    single line: the metres go out as a one-entry ``PackingRound`` and are applied
+    by :func:`_apply_plan`, the very function ``confirm`` uses for a hand-adjusted
+    plan. So the round, the ``Allocation``, the ``_adjust_stock`` call and the
+    ``ALLOCATION_MADE`` order log all land exactly as they would from
+    ``/admin/packing``, and the round is visible (and cancellable) in the same
+    history. The note says where it came from, so a single-line pack is
+    distinguishable from a board round after the fact.
+
+    Unlike placing an order, this really does take cloth off the roll, so a
+    figure the warehouse cannot cover is refused rather than reported. That is
+    the *only* limit: the admin may enter less than the line still owes (leaving
+    the remainder owed) or more than it owes (a roll is cut whole, and rounding it
+    up is deliberate). Either way exactly the metres entered come off the roll.
+    """
+    order = get_object_or_404(Order, pk=order_id)
+    line = get_object_or_404(
+        OrderItem.objects.select_related("variant__fabric"),
+        pk=item_id,
+        order=order,
+    )
+
+    if line.variant_id is None:
+        return Response(
+            {"error": f"Order #{order.pk} line #{line.pk} has no fabric variant."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if order.status not in OPEN_STATUSES:
+        return Response(
+            {"error": f"Order #{order.pk} is {order.status.lower()}, not open for packing."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    serializer = _PackLineSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    metres = serializer.validated_data["metres"]
+
+    plan = [{"order_item": line.pk, "metres": str(metres)}]
+    note = f"Packed directly from order #{order.pk}"
+
+    try:
+        with transaction.atomic():
+            # Re-read the roll under a lock: a round confirmed from the packing
+            # board, or another single-line pack, may have moved it since the
+            # checks above ran. Every ValueError raised from here on leaves the
+            # block, so the transaction rolls back rather than half-applying the
+            # plan. The order line is locked by _apply_plan itself.
+            locked_variant = FabricVariant.objects.select_for_update().get(
+                pk=line.variant_id
+            )
+
+            # Physical stock is the only hard limit, and it is read under the
+            # same lock the deduction will take it with.
+            if metres > locked_variant.stock_meters:
+                raise ValueError(
+                    f"That is {metres} m but only {locked_variant.stock_meters} m of "
+                    f"{locked_variant.fabric.name} "
+                    f"({locked_variant.display_order or 'unlabelled'}) are in stock."
+                )
+
+            packing_round = PackingRound.objects.create(
+                variant=locked_variant,
+                round_size=metres,
+                status="DRAFT",
+                note=note,
+                plan_override=plan,
+                created_by=request.user,
+            )
+            # Moves the stock, writes the allocation, promotes the order and logs
+            # it. Deliberately the only writer of stock_meters on this path.
+            _apply_plan(packing_round, plan, request.user)
+    except ValueError as exc:
+        return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    # _apply_plan works on its own instances of these rows, and may have promoted
+    # the order to PACKED, so re-read before answering.
+    line.refresh_from_db()
+    order.refresh_from_db()
+    locked_variant.refresh_from_db()
+
+    return Response(
+        {
+            "message": (
+                f"Packed {metres} m of {line.fabric_name}"
+                f"{f' ({line.variant_display_order})' if line.variant_display_order else ''}"
+                f" for order #{order.pk}"
+            ),
+            "round": packing_round.pk,
+            "order": order.pk,
+            "order_status": order.status,
+            "item": OrderItemSerializer(line).data,
+            "stock_meters": str(locked_variant.stock_meters),
+        }
+    )
 
 
 @extend_schema(

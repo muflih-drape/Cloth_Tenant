@@ -3,7 +3,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import { orderApi } from "@/lib/api/order";
 import { transportApi } from "@/lib/api/transport";
-import { OrderResponse } from "@/types/order";
+import { OrderResponse, OrderStatus } from "@/types/order";
 import { formatMeters, toMeters } from "@/types/item";
 import OrderSummary from "@/components/pages/order/OrderSummary";
 import OrderItemsSection from "@/components/pages/order/OrderItemsSection";
@@ -77,6 +77,13 @@ export default function Page() {
   const handleItemsChange = useCallback(async () => {
     await fetchData();
   }, [fetchData]);
+
+  // A line packed from this page can fill the last of the order's metres, which
+  // promotes it to PACKED server-side. Apply that here so the header, the footer
+  // and the lines all agree without refetching the order.
+  const handleOrderStatusChange = useCallback((status: OrderStatus) => {
+    setData((prev) => (prev ? { ...prev, status } : prev));
+  }, []);
 
   const handleConfirmDispatch = async () => {
     if (isPartial && !shortfallReason.trim()) {
@@ -207,6 +214,7 @@ export default function Page() {
           status={data?.status}
           orderId={Number(id)}
           onItemsChange={handleItemsChange}
+          onOrderStatusChange={handleOrderStatusChange}
         />
 
         <OrderLogs orderId={Number(id)} />

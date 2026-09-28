@@ -174,7 +174,8 @@ class OrderItem(models.Model):
     Quantities are metres. ``ordered_quantity`` is what the customer asked for;
     ``allocated_quantity`` is how much of it packing has actually handed over.
     The gap between the two is the outstanding demand that the packing queue
-    works through.
+    works through. Packing may overshoot ``ordered_quantity`` -- a roll is cut
+    whole -- so the gap is clamped at zero rather than allowed to go negative.
     """
 
     order = models.ForeignKey(Order, related_name="items", on_delete=models.CASCADE)
@@ -201,7 +202,15 @@ class OrderItem(models.Model):
 
     @property
     def outstanding_quantity(self):
-        return self.ordered_quantity - self.allocated_quantity
+        """Metres of this line packing has not yet handed over.
+
+        Floored at zero: packing is allowed to overshoot what was ordered, since
+        a roll is cut whole and rounding it up is a deliberate choice. Once
+        ``allocated_quantity`` passes ``ordered_quantity`` the line is satisfied
+        and the negative remainder is meaningless -- nobody owes cloth back.
+        """
+        gap = self.ordered_quantity - self.allocated_quantity
+        return gap if gap > 0 else Decimal("0")
 
     def __str__(self):
         return f"{self.fabric_name} x {self.ordered_quantity}m"

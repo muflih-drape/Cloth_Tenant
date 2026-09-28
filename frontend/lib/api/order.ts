@@ -10,6 +10,7 @@ import type {
   PackingPlan,
   PackingQueue,
   PackingRoundSummary,
+  PackLineResponse,
   PlaceOrderResponse,
   PlanOverrideEntry,
   UpdateOrderItemRequest,
@@ -334,6 +335,26 @@ export const packingApi = {
         `/api/orders/packing-rounds/${roundId}/cancel/`,
         {},
       )
+      .then((r) => r.data);
+  },
+
+  /**
+   * Pack one order line from the order page, without opening the board.
+   *
+   * This really does move cloth, so the server builds a one-entry packing round
+   * and confirms it through the same engine the board uses: same stock rules,
+   * same Allocation row, same ALLOCATION_MADE log entry, and a round that can
+   * still be cancelled if the admin changes their mind.
+   */
+  packLine(
+    orderId: number,
+    itemId: number,
+    metres: string,
+  ): Promise<PackLineResponse> {
+    return api
+      .post<PackLineResponse>(`/api/orders/${orderId}/items/${itemId}/pack/`, {
+        metres,
+      })
       .then((r) => r.data);
   },
 };

@@ -8,9 +8,11 @@ is deleted. So "2400 m on hand, two 1400 m orders" is a legal, expected state.
 
 from decimal import Decimal
 
+import threading
+
 from django.contrib.auth import get_user_model
-from django.db import transaction
-from django.test import TestCase
+from django.db import connections, transaction
+from django.test import TestCase, TransactionTestCase
 from django.conf import settings
 from rest_framework import status
 from rest_framework.test import APIClient
@@ -20,7 +22,7 @@ from apps.agents.models import Agent, AgentItem
 from apps.customers.models import Customer
 from apps.items.models import Fabric, FabricVariant
 from apps.orders.models import Allocation, Order, OrderItem, OrderLog, PackingRound
-from apps.orders.pricing import recompute_order_total
+from apps.orders.pricing import order_totals, recompute_order_total
 
 User = get_user_model()
 
@@ -740,17 +742,15 @@ class PackingRoundAPITests(OrderTestBase):
         self.order_b.refresh_from_db()
         self.assertEqual(self.order_b.status, "PENDING")
 
-    def test_a_round_cannot_exceed_what_one_order_still_needs(self):
-        """A typed figure larger than the line's demand is refused on confirm.
+    def test_a_stale_draft_cannot_overdraw_the_roll_at_confirm(self):
+        """A plan frozen while the roll was full must be re-checked against stock.
 
-        The board screens for this before saving, but a round can be left as a
-        draft and confirmed later, by which time the check has to still hold.
+        The board screens a plan before saving it, but a round can be left as a
+        draft and confirmed later, by which time the roll may have shrunk. Cloth
+        on the roll is the one hard limit, so that is what has to still hold.
         """
         self.auth(self.admin)
-        stock_before = self.variant.stock_meters
 
-        # line_a only ever needs 1400 and 2000 is on the roll, so freezing this
-        # is legal; it is only the later shrink that makes it stale.
         create = self.client.post(
             "/api/orders/packing-rounds/",
             {
@@ -764,25 +764,72 @@ class PackingRoundAPITests(OrderTestBase):
         )
         self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.data)
 
-        # Shrink what the order needs, then try to apply the stale plan.
-        OrderItem.objects.filter(pk=self.line_a.pk).update(
-            ordered_quantity=Decimal("500.000")
+        # Something else takes most of the roll while this one sits as a draft.
+        FabricVariant.objects.filter(pk=self.variant.pk).update(
+            stock_meters=Decimal("500.000")
         )
+
         confirm = self.client.post(
             f"/api/orders/packing-rounds/{create.data['id']}/confirm/",
             {},
             format="json",
         )
         self.assertEqual(confirm.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("in stock", confirm.data["error"])
 
         # The refusal rolled the whole thing back: no allocation, no stock moved.
         self.variant.refresh_from_db()
-        self.assertEqual(self.variant.stock_meters, stock_before)
+        self.assertEqual(self.variant.stock_meters, Decimal("500.000"))
         self.line_a.refresh_from_db()
         self.assertEqual(self.line_a.allocated_quantity, ZERO)
         self.assertFalse(
             Allocation.objects.filter(order_item=self.line_a).exists()
         )
+
+    def test_a_stale_draft_may_hand_out_more_than_the_line_now_needs(self):
+        """Handing over more than a line owes is allowed, so a stale plan applies.
+
+        The order was shrunk after the round was drafted, leaving the plan
+        over-paying the line by a wide margin. That is no longer a reason to
+        refuse: a roll is cut whole, rounding up is deliberate, and the only
+        limit is whether the cloth is physically there. The line settles at zero
+        outstanding rather than going negative.
+        """
+        self.auth(self.admin)
+        stock_before = self.variant.stock_meters
+
+        create = self.client.post(
+            "/api/orders/packing-rounds/",
+            {
+                "variant": self.variant.pk,
+                "round_size": "2000",
+                "allocations": [
+                    {"order_item": self.line_a.pk, "metres": "2000"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(create.status_code, status.HTTP_201_CREATED, create.data)
+
+        OrderItem.objects.filter(pk=self.line_a.pk).update(
+            ordered_quantity=Decimal("500.000")
+        )
+
+        confirm = self.client.post(
+            f"/api/orders/packing-rounds/{create.data['id']}/confirm/",
+            {},
+            format="json",
+        )
+        self.assertEqual(confirm.status_code, status.HTTP_200_OK, confirm.data)
+
+        # The full plan is honoured, and the whole of it came off the roll.
+        self.variant.refresh_from_db()
+        self.assertEqual(
+            self.variant.stock_meters, stock_before - Decimal("2000.000")
+        )
+        self.line_a.refresh_from_db()
+        self.assertEqual(self.line_a.allocated_quantity, Decimal("2000.000"))
+        self.assertEqual(self.line_a.outstanding_quantity, Decimal("0.000"))
 
     def test_agents_cannot_reach_the_packing_api(self):
         self.auth(self.agent_user)
@@ -801,6 +848,512 @@ class PackingRoundAPITests(OrderTestBase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK)
         self.assertEqual(len(resp.data), 1)
         self.assertEqual(resp.data[0]["status"], "DRAFT")
+
+
+class PackSingleLineTests(OrderTestBase):
+    """Packing one order line straight from the order page.
+
+    The shortcut is only allowed to be a shortcut: it must leave the same trail
+    a board round does (PackingRound -> Allocation -> OrderLog) and move the roll
+    through the same code, so these tests check the audit trail as closely as the
+    quantities.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.order = self.make_draft()
+        self.line = self.add_line(self.order, 1400)
+        self.place(self.order)
+
+        # A second customer on the same colour, to prove a single-line pack
+        # touches only the line it was aimed at.
+        self.customer_b = Customer.objects.create(
+            name="XYZ Garments", contact="3333333333", agent=self.agent
+        )
+        self.order_b = self.make_draft(customer=self.customer_b)
+        self.line_b = self.add_line(self.order_b, 900)
+        self.place(self.order_b)
+
+    def pack_url(self, order=None, line=None):
+        order = order or self.order
+        line = line or self.line
+        return f"/api/orders/{order.pk}/items/{line.pk}/pack/"
+
+    def pack(self, metres, order=None, line=None):
+        self.auth(self.admin)
+        return self.client.post(
+            self.pack_url(order, line), {"metres": str(metres)}, format="json"
+        )
+
+    def test_pack_single_line_from_order_page(self):
+        resp = self.pack(600)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("600.000"))
+        self.assertEqual(self.line.outstanding_quantity, Decimal("800.000"))
+
+        # Cloth really left the roll, and only what was handed over.
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("1800.000"))
+
+        # The response carries the new figures so the page can update in place.
+        self.assertEqual(resp.data["item"]["allocated_quantity"], "600.000")
+        self.assertEqual(resp.data["item"]["outstanding_quantity"], "800.000")
+        self.assertEqual(resp.data["stock_meters"], "1800.000")
+        self.assertEqual(resp.data["order_status"], "PENDING")
+
+        # The trail is a normal round, tagged with where it was packed from.
+        packing_round = PackingRound.objects.get(pk=resp.data["round"])
+        self.assertEqual(packing_round.status, "CONFIRMED")
+        self.assertEqual(packing_round.variant_id, self.variant.pk)
+        self.assertEqual(packing_round.note, f"Packed directly from order #{self.order.pk}")
+        allocation = Allocation.objects.get(round=packing_round)
+        self.assertEqual(allocation.order_item_id, self.line.pk)
+        self.assertEqual(allocation.metres, Decimal("600.000"))
+        self.assertEqual(allocation.sequence, 1)
+        self.assertFalse(allocation.is_priority_award)
+
+        log = OrderLog.objects.filter(
+            order_ref=self.order.pk, action="ALLOCATION_MADE"
+        ).latest("created_at")
+        self.assertEqual(log.details["round"], packing_round.pk)
+        self.assertEqual(log.details["allocated_meters"], "600.000")
+        self.assertEqual(log.performed_by_id, self.admin.pk)
+
+    def test_pack_single_line_leaves_other_orders_on_the_colour_alone(self):
+        resp = self.pack(600)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line_b.refresh_from_db()
+        self.assertEqual(self.line_b.allocated_quantity, ZERO)
+        self.assertFalse(Allocation.objects.filter(order_item=self.line_b).exists())
+        self.order_b.refresh_from_db()
+        self.assertEqual(self.order_b.status, "PENDING")
+
+    def test_packing_the_last_metres_promotes_the_order_to_packed(self):
+        self.pack(1000)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "PENDING")
+
+        resp = self.pack(400)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data["order_status"], "PACKED")
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "PACKED")
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("1000.000"))
+
+    def test_packing_more_than_the_line_owes_is_allowed(self):
+        """A roll is cut whole, so rounding a line up is a legitimate pack.
+
+        The line is ordered 1400 m; handing over 1500 m takes 1500 m off the roll
+        and leaves the line settled rather than negative.
+        """
+        resp = self.pack(1500)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("1500.000"))
+
+        # Nothing is owed back, and the API says so with a plain zero.
+        self.assertEqual(self.line.outstanding_quantity, Decimal("0.000"))
+        self.assertEqual(resp.data["item"]["outstanding_quantity"], "0.000")
+
+        # Every metre handed over came off the roll -- the overage is not free.
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("900.000"))
+
+        allocation = Allocation.objects.get(order_item=self.line)
+        self.assertEqual(allocation.metres, Decimal("1500.000"))
+
+    def test_packing_less_than_the_line_owes_leaves_the_remainder(self):
+        resp = self.pack(500)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("500.000"))
+        self.assertEqual(self.line.outstanding_quantity, Decimal("900.000"))
+        self.assertEqual(resp.data["item"]["outstanding_quantity"], "900.000")
+
+        # A partial pack is not a finished one, so the order stays open.
+        self.assertEqual(resp.data["order_status"], "PENDING")
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("1900.000"))
+
+    def test_cannot_pack_more_than_available_stock(self):
+        self.variant.stock_meters = Decimal("500.000")
+        self.variant.save(update_fields=["stock_meters"])
+
+        resp = self.pack(700)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("in stock", resp.data["error"])
+
+        # Stock is the one hard limit, and it is enforced before anything moves.
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, ZERO)
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("500.000"))
+        self.assertEqual(Allocation.objects.filter(order_item=self.line).count(), 0)
+        self.assertEqual(PackingRound.objects.filter(note__startswith="Packed directly").count(), 0)
+
+    def test_a_fully_packed_line_can_still_be_packed(self):
+        """Settling a line does not freeze it; the roll decides.
+
+        The line is already handed over in full, so its outstanding demand is
+        zero, but the roll still has cloth on it and the admin is allowed to cut
+        more for this line rather than opening a fresh one.
+        """
+        self.pack(1400)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "PACKED")
+
+        resp = self.pack(100)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("1500.000"))
+        self.assertEqual(self.line.outstanding_quantity, Decimal("0.000"))
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("900.000"))
+
+    def test_cannot_pack_a_dispatched_order(self):
+        self.pack(1400)
+        self.order.refresh_from_db()
+        Order.objects.filter(pk=self.order.pk).update(status="DISPATCHED")
+
+        resp = self.pack(100)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not open for packing", resp.data["error"])
+
+    def test_cannot_pack_a_draft_order(self):
+        draft = self.make_draft()
+        line = self.add_line(draft, 500)
+
+        resp = self.pack(500, order=draft, line=line)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not open for packing", resp.data["error"])
+
+    def test_packing_less_than_a_millimetre_is_refused(self):
+        resp = self.pack(0.0004)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("metres", resp.data)
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2400.000"))
+
+    def test_zero_and_negative_metres_are_refused(self):
+        for metres in ("0", "-5"):
+            resp = self.pack(metres)
+            self.assertEqual(
+                resp.status_code, status.HTTP_400_BAD_REQUEST, f"metres={metres}"
+            )
+
+    def test_a_line_from_another_order_is_not_reachable(self):
+        resp = self.pack(100, order=self.order, line=self.line_b)
+
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+
+    def test_a_line_with_no_variant_cannot_be_packed(self):
+        order = self.make_draft()
+        line = OrderItem.objects.create(
+            order=order,
+            fabric=self.fabric,
+            variant=None,
+            fabric_name=self.fabric.name,
+            rate_per_meter=self.fabric.price_per_meter,
+            ordered_quantity=Decimal("500"),
+        )
+        Order.objects.filter(pk=order.pk).update(status="PENDING")
+
+        resp = self.pack(100, order=order, line=line)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("no fabric variant", resp.data["error"])
+
+    def test_agents_cannot_reach_this_endpoint(self):
+        self.auth(self.agent_user)
+        resp = self.client.post(
+            self.pack_url(), {"metres": "600"}, format="json"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, ZERO)
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2400.000"))
+
+    def test_anonymous_cannot_reach_this_endpoint(self):
+        self.client.force_authenticate(user=None)
+        resp = self.client.post(self.pack_url(), {"metres": "600"}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_401_UNAUTHORIZED)
+
+    def test_a_single_line_pack_round_can_be_cancelled_like_any_other(self):
+        resp = self.pack(600)
+        round_id = resp.data["round"]
+
+        self.auth(self.admin)
+        cancel = self.client.post(
+            f"/api/orders/packing-rounds/{round_id}/cancel/", {}, format="json"
+        )
+        self.assertEqual(cancel.status_code, status.HTTP_200_OK, cancel.data)
+
+        # Reversal goes through the ordinary cancel path, which is the point: the
+        # shortcut created a round like any other, not a private ledger entry.
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, ZERO)
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2400.000"))
+        self.assertTrue(
+            OrderLog.objects.filter(
+                order_ref=self.order.pk, action="ALLOCATION_REVERSED"
+            ).exists()
+        )
+
+
+class PackLineQuantityTests(OrderTestBase):
+    """The packed figure is whatever was actually cut, in every direction.
+
+    A roll is cut whole, so the metres handed over are not bounded by what the
+    line was ordered for: the warehouse may cut short, land exactly on the figure,
+    or overshoot and keep the surplus. Whatever is entered has to be what is
+    stored, returned and displayed, and the still-owed remainder is floored at
+    zero rather than turned into a negative.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.order = self.make_draft()
+        self.line = self.add_line(self.order, 50)
+        self.place(self.order)
+
+    def pack(self, metres):
+        self.auth(self.admin)
+        return self.client.post(
+            f"/api/orders/{self.order.pk}/items/{self.line.pk}/pack/",
+            {"metres": str(metres)},
+            format="json",
+        )
+
+    def cancel_round(self, round_id):
+        self.auth(self.admin)
+        return self.client.post(
+            f"/api/orders/packing-rounds/{round_id}/cancel/", {}, format="json"
+        )
+
+    def test_packing_past_the_ordered_figure_keeps_every_metre(self):
+        resp = self.pack(55)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+
+        # All 55 m came off the roll, not just the 50 m that were ordered.
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2345.000"))
+
+        # And all 55 m are recorded against the line, with the surplus kept.
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("55.000"))
+        self.assertEqual(Allocation.objects.get().metres, Decimal("55.000"))
+
+        # The line is satisfied, so nothing is owed and the gap never goes
+        # negative.
+        self.assertEqual(self.line.outstanding_quantity, Decimal("0.000"))
+
+        # The response reports the real figures, not a figure capped at ordered.
+        self.assertEqual(resp.data["item"]["allocated_quantity"], "55.000")
+        self.assertEqual(resp.data["item"]["outstanding_quantity"], "0.000")
+        self.assertEqual(resp.data["stock_meters"], "2345.000")
+
+        # The order is settled, and its own totals carry the real packed figure.
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.status, "PACKED")
+        totals = order_totals(self.order)
+        self.assertEqual(totals["total_ordered_meters"], Decimal("50.000"))
+        self.assertEqual(totals["total_allocated_meters"], Decimal("55.000"))
+        self.assertEqual(totals["total_outstanding_meters"], ZERO)
+
+    def test_packing_short_leaves_the_difference_owed(self):
+        resp = self.pack(49)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2351.000"))
+
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("49.000"))
+        self.assertEqual(self.line.outstanding_quantity, Decimal("1.000"))
+        self.assertEqual(Allocation.objects.get().metres, Decimal("49.000"))
+
+        self.assertEqual(resp.data["item"]["allocated_quantity"], "49.000")
+        self.assertEqual(resp.data["item"]["outstanding_quantity"], "1.000")
+        self.assertEqual(resp.data["order_status"], "PENDING")
+
+    def test_packing_exactly_the_ordered_figure_settles_the_line(self):
+        resp = self.pack(50)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("50.000"))
+        self.assertEqual(self.line.outstanding_quantity, ZERO)
+        self.assertEqual(resp.data["item"]["allocated_quantity"], "50.000")
+
+    def test_a_long_pack_can_be_cut_back_down_by_repacking(self):
+        """A roll cut too long is corrected by cancelling and re-packing.
+
+        The engine has no in-place decrease -- ``pack_line`` only ever adds -- so
+        the supported way to land on a smaller figure is to reverse the round
+        (which credits the metres back to the roll) and pack the new figure.
+        """
+        first = self.pack(55)
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+
+        cancelled = self.cancel_round(first.data["round"])
+        self.assertEqual(cancelled.status_code, status.HTTP_200_OK, cancelled.data)
+
+        # The 55 m are back on the roll and off the line.
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2400.000"))
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, ZERO)
+
+        second = self.pack(52)
+        self.assertEqual(second.status_code, status.HTTP_200_OK, second.data)
+
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2348.000"))
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("52.000"))
+        self.assertEqual(self.line.outstanding_quantity, ZERO)
+        self.assertEqual(second.data["item"]["allocated_quantity"], "52.000")
+
+    def test_a_long_pack_is_still_limited_by_the_roll(self):
+        """Over-packing has no ceiling but the metres physically on the roll."""
+        resp = self.pack(2600)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, ZERO)
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2400.000"))
+
+
+class PackSingleLineConcurrencyTests(TransactionTestCase):
+    """The order page and the packing board must not both spend the same roll.
+
+    ``TestCase`` wraps each test in a transaction that ``select_for_update``
+    cannot meaningfully contend with, so this runs on ``TransactionTestCase``
+    with two real connections racing.
+    """
+
+    reset_sequences = True
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            username="admin1", email="admin1@test.com",
+            password="pass1234", role="ADMIN",
+        )
+        self.agent_user = User.objects.create_user(
+            username="agent1", email="agent1@test.com",
+            password="pass1234", role="AGENT",
+        )
+        agent = Agent.objects.create(user=self.agent_user, contact="111")
+        customer = Customer.objects.create(
+            name="ABC Fashions", contact="2222222222", agent=agent
+        )
+        self.fabric = Fabric.objects.create(
+            name="Cotton Cambric 140 GSM", price_per_meter=Decimal("9.00")
+        )
+        self.variant = FabricVariant.objects.create(
+            fabric=self.fabric,
+            display_order="Natural",
+            stock_meters=Decimal("1000.000"),
+        )
+        AgentItem.objects.create(agent=agent, variant=self.variant)
+
+        self.order = Order.objects.create(
+            customer=customer, agent=agent, created_by=self.agent_user, status="PENDING"
+        )
+        self.line = OrderItem.objects.create(
+            order=self.order,
+            fabric=self.fabric,
+            variant=self.variant,
+            fabric_name=self.fabric.name,
+            rate_per_meter=self.fabric.price_per_meter,
+            variant_display_order=self.variant.display_order,
+            ordered_quantity=Decimal("1000.000"),
+        )
+        recompute_order_total(self.order)
+
+    def test_packing_from_order_page_and_packing_round_screen_lock_correctly_under_concurrency(self):
+        # 800 + 800 against 1000 m: without the row lock both requests read the
+        # same stock and the roll would go overdrawn.
+        single_line_url = f"/api/orders/{self.order.pk}/items/{self.line.pk}/pack/"
+        board_round = PackingRound.objects.create(
+            variant=self.variant,
+            round_size=Decimal("800.000"),
+            status="DRAFT",
+            note="Board round racing the order page",
+            plan_override=[{"order_item": self.line.pk, "metres": "800"}],
+            created_by=self.admin,
+        )
+        header_a = get_auth_header(self.admin)
+        header_b = get_auth_header(self.admin)
+        barrier = threading.Barrier(2)
+        statuses = []
+        guard = threading.Lock()
+
+        def pack(url, header, body):
+            client = APIClient()
+            client.credentials(**header)
+            try:
+                barrier.wait(timeout=20)
+                resp = client.post(url, body, format="json")
+                code = resp.status_code
+            except Exception as exc:  # pragma: no cover - surfaced in the assert
+                code = repr(exc)
+            finally:
+                connections.close_all()
+            with guard:
+                statuses.append(code)
+
+        threads = [
+            threading.Thread(
+                target=pack, args=(single_line_url, header_a, {"metres": "800"})
+            ),
+            threading.Thread(
+                target=pack,
+                args=(
+                    f"/api/orders/packing-rounds/{board_round.pk}/confirm/",
+                    header_b,
+                    {},
+                ),
+            ),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        self.assertEqual(len(statuses), 2, statuses)
+        self.assertEqual(
+            statuses.count(status.HTTP_200_OK), 1, f"both or neither may win: {statuses}"
+        )
+        self.assertEqual(
+            statuses.count(status.HTTP_400_BAD_REQUEST), 1, f"one must be refused: {statuses}"
+        )
+
+        # The invariant that matters: the roll never goes overdrawn and the line
+        # is never filled past what the customer ordered.
+        self.variant.refresh_from_db()
+        self.line.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("200.000"))
+        self.assertEqual(self.line.allocated_quantity, Decimal("800.000"))
+        self.assertEqual(self.line.outstanding_quantity, Decimal("200.000"))
 
 
 class EditFlowTests(OrderTestBase):

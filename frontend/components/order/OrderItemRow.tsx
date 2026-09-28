@@ -13,6 +13,7 @@ import { formatMeters, toMeters } from "@/types/item";
 import { orderItemColorSuffix } from "@/lib/colorLabel";
 import { Spinner } from "../ui/spinner";
 import { outstandingMeters } from "@/lib/utils/orderItemSort";
+import type { ReactNode } from "react";
 
 // ─── Delete Confirmation Dialog ───────────────────────────────────────────────
 interface DeleteConfirmDialogProps {
@@ -133,6 +134,13 @@ interface OrderItemRowProps {
   isPacked?: boolean;
   isOutOfStock?: boolean;
   isLoading?: boolean;
+  /**
+   * Rendered inside this line's card, underneath the summary row. Used by the
+   * admin order page to hang the per-line packing control off the same card
+   * instead of a second card beside it. Left undefined everywhere else, so
+   * every other screen renders exactly as before.
+   */
+  footer?: ReactNode;
 }
 
 export default function OrderItemRow({
@@ -146,6 +154,7 @@ export default function OrderItemRow({
   isPacked = false,
   isOutOfStock = false,
   isLoading = false,
+  footer,
 }: OrderItemRowProps) {
   const [showDeleteDialog, setShowDeleteDialog] = useState(false);
   const [isDeleting, setIsDeleting] = useState(false);
@@ -176,98 +185,102 @@ export default function OrderItemRow({
       />
 
       <div
-        className={`flex items-center gap-3 border-b border-gray-50 py-4 px-1 ${
+        className={`border-b border-gray-50 ${
           isPacked ? "bg-green-50" : isOutOfStock ? "bg-red-50" : "bg-white"
         }`}
       >
-        <div>
-          {showEdit && onEdit && (
+        <div className="flex items-center gap-3 py-4 px-1">
+          <div>
+            {showEdit && onEdit && (
+              <button
+                onClick={() => onEdit(item)}
+                className="flex items-center justify-center p-2 flex-shrink-0"
+              >
+                <Pencil className="text-primary w-4 h-4" />
+              </button>
+            )}
+            {showDelete && onDelete && (
+              <button
+                onClick={() => setShowDeleteDialog(true)}
+                className="flex items-center justify-center p-2 flex-shrink-0 hover:cursor-pointer"
+              >
+                <Trash2 className="text-red-500 w-4 h-4" />
+              </button>
+            )}
+          </div>
+
+          {showPackedToggle && onTogglePacked && (
             <button
-              onClick={() => onEdit(item)}
-              className="flex items-center justify-center p-2 flex-shrink-0"
+              onClick={() => !isLoading && onTogglePacked(item.id, !isPacked)}
+              className="flex items-center justify-center p-2 mr-1 flex-shrink-0"
             >
-              <Pencil className="text-primary w-4 h-4" />
+              {isLoading ? (
+                <Spinner className="w-6 h-6" />
+              ) : isPacked ? (
+                <CheckCircle2 className="text-green-600 w-6 h-6" />
+              ) : (
+                <Circle className="text-gray-300 w-6 h-6 hover:text-primary/50 transition-colors" />
+              )}
             </button>
           )}
-          {showDelete && onDelete && (
-            <button
-              onClick={() => setShowDeleteDialog(true)}
-              className="flex items-center justify-center p-2 flex-shrink-0 hover:cursor-pointer"
+
+          <div className="relative w-12 h-12 rounded-lg overflow-hidden flex-shrink-0 border border-gray-100 bg-gray-50">
+            {item.variant_image ? (
+              <ImagePreview src={item.variant_image} alt={item.fabric_name} />
+            ) : (
+              <div className="w-full h-full bg-gray-100" />
+            )}
+          </div>
+
+          <div className="flex-1 min-w-0">
+            <h6
+              className={`font-semibold text-sm truncate ${
+                isPacked
+                  ? "text-green-700"
+                  : isOutOfStock
+                    ? "text-red-700"
+                    : "text-gray-900"
+              }`}
             >
-              <Trash2 className="text-red-500 w-4 h-4" />
-            </button>
-          )}
+              {item.fabric_name}
+              {orderItemColorSuffix(item.variant_display_order)}
+            </h6>
+            <p
+              className={`text-xs font-medium mt-1 ${
+                isPacked
+                  ? "text-green-600"
+                  : isOutOfStock
+                    ? "text-red-600"
+                    : "text-gray-600"
+              }`}
+            >
+              {formatMeters(ordered)} m ordered
+              {outstanding > 0 ? (
+                <>
+                  {" · "}
+                  <span className="font-bold text-amber-600">
+                    {formatMeters(outstanding)} m awaiting packing
+                  </span>
+                </>
+              ) : (
+                <span className="text-green-600"> · fully packed</span>
+              )}
+            </p>
+            <p className="text-[10px] text-gray-400 mt-0.5">
+              ₹{Number(item.rate_per_meter || 0).toLocaleString("en-IN")}/m
+            </p>
+          </div>
+
+          <div className="text-right flex-shrink-0">
+            <span
+              className={`text-base font-black ${isOutOfStock ? "text-red-700" : "text-gray-900"}`}
+            >
+              ₹{Number(item.line_total || 0).toLocaleString("en-IN")}
+            </span>
+          </div>
         </div>
 
-        {showPackedToggle && onTogglePacked && (
-          <button
-            onClick={() => !isLoading && onTogglePacked(item.id, !isPacked)}
-            className="flex items-center justify-center p-2 mr-1 flex-shrink-0"
-          >
-            {isLoading ? (
-              <Spinner className="w-6 h-6" />
-            ) : isPacked ? (
-              <CheckCircle2 className="text-green-600 w-6 h-6" />
-            ) : (
-              <Circle className="text-gray-300 w-6 h-6 hover:text-primary/50 transition-colors" />
-            )}
-          </button>
-        )}
-
-        <div className="relative w-12 h-12 rounded-lg overflow-hidden flex-shrink-0 border border-gray-100 bg-gray-50">
-          {item.variant_image ? (
-            <ImagePreview src={item.variant_image} alt={item.fabric_name} />
-          ) : (
-            <div className="w-full h-full bg-gray-100" />
-          )}
-        </div>
-
-        <div className="flex-1 min-w-0">
-          <h6
-            className={`font-semibold text-sm truncate ${
-              isPacked
-                ? "text-green-700"
-                : isOutOfStock
-                  ? "text-red-700"
-                  : "text-gray-900"
-            }`}
-          >
-            {item.fabric_name}
-            {orderItemColorSuffix(item.variant_display_order)}
-          </h6>
-          <p
-            className={`text-xs font-medium mt-1 ${
-              isPacked
-                ? "text-green-600"
-                : isOutOfStock
-                  ? "text-red-600"
-                  : "text-gray-600"
-            }`}
-          >
-            {formatMeters(ordered)} m ordered
-            {outstanding > 0 ? (
-              <>
-                {" · "}
-                <span className="font-bold text-amber-600">
-                  {formatMeters(outstanding)} m awaiting packing
-                </span>
-              </>
-            ) : (
-              <span className="text-green-600"> · fully packed</span>
-            )}
-          </p>
-          <p className="text-[10px] text-gray-400 mt-0.5">
-            ₹{Number(item.rate_per_meter || 0).toLocaleString("en-IN")}/m
-          </p>
-        </div>
-
-        <div className="text-right flex-shrink-0">
-          <span
-            className={`text-base font-black ${isOutOfStock ? "text-red-700" : "text-gray-900"}`}
-          >
-            ₹{Number(item.line_total || 0).toLocaleString("en-IN")}
-          </span>
-        </div>
+        {footer}
       </div>
     </>
   );

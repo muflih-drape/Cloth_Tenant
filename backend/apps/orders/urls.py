@@ -30,6 +30,11 @@ urlpatterns = [
     path("packing-rounds/<int:pk>/confirm/", packing_views.confirm, name="packing-confirm"),
     path("packing-rounds/<int:pk>/cancel/", packing_views.cancel, name="packing-cancel"),
     path("packing-rounds/", packing_views.create_round, name="packing-create"),
+    path(
+        "<int:order_id>/items/<int:item_id>/pack/",
+        packing_views.pack_line,
+        name="packing-pack-line",
+    ),
 ] + router.urls + [
     path("<int:order_id>/place-order/", PlaceOrderView.as_view()),
     path("<int:order_id>/add-item/", AddOrderItemView.as_view()),
