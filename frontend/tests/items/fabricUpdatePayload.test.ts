@@ -28,12 +28,11 @@ const fresh = (over: Partial<EditableVariant> = {}): EditableVariant => ({
 const common = { name: "Cotton Lawn", description: "Light", price_per_meter: "180.00" };
 
 describe("buildFabricUpdatePayload", () => {
-  it("never sends stock_meters for an existing colour", () => {
-    // The edit screen loads the live warehouse count into stockMeters. Packing
-    // may have moved stock since the page loaded, so echoing it back would
-    // overwrite the real figure with a stale one.
+  it("sends stock for an existing colour", () => {
+    // The row shows the live warehouse count and edits it in place; it is
+    // echoed on every save so a correction is applied through the fabric.
     const payload = buildFabricUpdatePayload(common, [existing()]);
-    expect(payload.variants[0]).not.toHaveProperty("stock_meters");
+    expect(payload.variants[0].stock_meters).toBe("120.5");
   });
 
   it("sends opening stock for a colour that does not exist yet", () => {

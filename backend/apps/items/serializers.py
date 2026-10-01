@@ -72,6 +72,9 @@ class FabricSerializer(serializers.ModelSerializer):
         ]
 
     def get_total_stock_meters(self, obj):
+        total = getattr(obj, "_total_stock", None)
+        if total is not None:
+            return str(total or 0)
         total = obj.variants.aggregate(total=Sum("stock_meters"))["total"]
         return str(total or 0)
 
@@ -106,7 +109,7 @@ class FabricVariantRequestSerializer(serializers.Serializer):
         decimal_places=3,
         required=False,
         allow_null=True,
-        help_text="Opening stock in metres, for a new variant only.",
+        help_text="Stock in metres; applied on create and on edit.",
     )
 
 
@@ -206,6 +209,12 @@ class CreateFabricSerializer(serializers.Serializer):
 
                 if "display_order" in variant_data:
                     variant.display_order = variant_data.get("display_order") or None
+
+                if "stock_meters" in variant_data:
+                    new_stock = variant_data["stock_meters"] or 0
+                    if variant.stock_meters != new_stock:
+                        variant.stock_meters = new_stock
+                        variant.stock_updated_at = timezone.now()
 
                 if remove_image and variant.image:
                     variant.image.delete(save=False)

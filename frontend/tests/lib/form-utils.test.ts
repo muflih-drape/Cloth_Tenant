@@ -113,7 +113,7 @@ describe('fabricToFormData', () => {
     expect(result.get('variants[1]id')).toBeNull()
   })
 
-  it('omits stock_meters for existing colours so an edit cannot overwrite live stock', () => {
+  it('sends stock_meters for existing colours so a correction is saved', () => {
     const result = fabricToFormData({
       name: 'Linen',
       description: '',
@@ -121,7 +121,8 @@ describe('fabricToFormData', () => {
       variants: [{ id: 7, display_order: 'Natural', stock_meters: '9999' }]
     })
 
-    expect(result.get('variants[0]stock_meters')).toBeNull()
+    expect(result.get('variants[0]stock_meters')).toBe('9999')
+    expect(result.get('variants[0]id')).toBe('7')
   })
 
   it('handles a variant with an image file', () => {

@@ -2,21 +2,15 @@ import type { EditableVariant, FabricRequest } from "@/types/item";
 import { fabricApi } from "./api/item";
 import { fabricToFormData } from "./form-utils";
 
-/** Local-only marker for a colour the admin just added on the edit screen. */
-function isNewVariant(backendId: number): boolean {
-  return backendId < 0;
-}
-
 /**
  * Build the update payload for a fabric.
  *
  * Two rules the API relies on, both easy to get wrong:
  *  - Every colour has to be sent, because the API treats a colour missing from
  *    the payload as deleted.
- *  - `stock_meters` is only sent for colours that don't exist yet. The API
- *    ignores it for existing colours anyway, and sending the live warehouse
- *    count back would be a lie the moment packing has moved stock since the
- *    page was loaded.
+ *  - `stock_meters` rides on every colour, existing or new. The row shows the
+ *    live warehouse count and edits it in place; the API applies the edited
+ *    figure and records the change on the stock cursor.
  */
 export function buildFabricUpdatePayload(
   common: { name: string; description?: string; price_per_meter: string },
@@ -27,7 +21,6 @@ export function buildFabricUpdatePayload(
     description: common.description ?? "",
     price_per_meter: common.price_per_meter,
     variants: variants.map((variant) => {
-      const isNew = isNewVariant(variant.backendId);
       // Trim: a label of only spaces is an empty label, not the colour "  ".
       const label = variant.displayOrder.trim();
       return {
@@ -39,8 +32,8 @@ export function buildFabricUpdatePayload(
         ...(variant.backendId > 0 && !variant.imageUrl && !variant.newImage
           ? { remove_image: true }
           : {}),
-        // Opening stock only applies to new colours.
-        ...(isNew ? { stock_meters: variant.stockMeters || "0" } : {}),
+        // Stock is sent for every colour, including untouched existing ones.
+        stock_meters: variant.stockMeters || "0",
       };
     }),
   };

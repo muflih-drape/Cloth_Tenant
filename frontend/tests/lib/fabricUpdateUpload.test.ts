@@ -95,7 +95,7 @@ describe('fabric edit upload', () => {
     expect(sent.get('variants[1]remove_image')).toBe('true')
     expect(sent.get('variants[1]display_order')).toBe('White')
     expect(sent.get('variants[2]remove_image')).toBe('true')
-    // Existing colours never send stock back.
-    expect(sent.get('variants[0]stock_meters')).toBeNull()
+    // Existing colours send stock back too, so a correction in the row lands.
+    expect(sent.get('variants[0]stock_meters')).toBe('0')
   })
 })

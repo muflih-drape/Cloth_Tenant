@@ -54,6 +54,98 @@ class AgentTestBase(TestCase):
         )
 
 
+class AgentDeleteTests(AgentTestBase):
+    """Deleting an agent requires the calling admin's PIN for both paths.
+
+    The PIN check runs before either the transfer or the deactivate action. The
+    frontend sends it as a JSON body key ``pin`` on the DELETE request, which is
+    exactly what ``check_admin_pin`` reads.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.admin_user.set_pin("123456")
+        # set_pin writes only the in-memory attribute, so the hashed value has to
+        # be saved for check_pin in the view to see it.
+        self.admin_user.save(update_fields=["pin"])
+        self.target_user = User.objects.create_user(
+            username="agent2",
+            email="agent2@test.com",
+            password="pass1234",
+            role="AGENT",
+        )
+        self.target_agent = Agent.objects.create(
+            user=self.target_user, contact="3333333333"
+        )
+
+    def delete_agent(self, pin=None, action="deactivate", transfer_to_id=None):
+        self.client.credentials(**get_auth_header(self.admin_user))
+        payload = {}
+        if pin is not None:
+            payload["pin"] = pin
+        payload["action"] = action
+        if transfer_to_id is not None:
+            payload["transfer_to_id"] = transfer_to_id
+        return self.client.delete(
+            f"/api/agents/{self.agent.pk}/", payload, format="json"
+        )
+
+    def test_missing_pin_is_rejected(self):
+        resp = self.delete_agent(pin=None)
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(resp.data["error"], "PIN is required to delete.")
+        self.agent.refresh_from_db()
+        self.assertTrue(self.agent.is_active)
+
+    def test_wrong_pin_is_rejected(self):
+        resp = self.delete_agent(pin="000000")
+
+        self.assertEqual(resp.status_code, status.HTTP_403_FORBIDDEN)
+        self.assertEqual(resp.data["error"], "Incorrect PIN.")
+        self.agent.refresh_from_db()
+        self.assertTrue(self.agent.is_active)
+
+    def test_deactivate_with_correct_pin_keeps_references(self):
+        resp = self.delete_agent(pin="123456", action="deactivate")
+
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+
+        self.agent.refresh_from_db()
+        self.assertFalse(self.agent.is_active)
+        self.assertIsNotNone(self.agent.deactivated_at)
+        # The user account is deactivated, not removed, so history is intact.
+        self.agent.user.refresh_from_db()
+        self.assertFalse(self.agent.user.is_active)
+        self.assertTrue(User.objects.filter(pk=self.agent.user_id).exists())
+        self.assertTrue(
+            Customer.objects.filter(pk=self.customer.pk, agent=self.agent).exists()
+        )
+
+    def test_transfer_with_correct_pin_moves_customers_and_deletes_agent(self):
+        resp = self.delete_agent(
+            pin="123456", action="transfer", transfer_to_id=self.target_agent.pk
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT)
+
+        # Customers moved to the target agent, the source agent and its user
+        # account are gone.
+        self.customer.refresh_from_db()
+        self.assertEqual(self.customer.agent_id, self.target_agent.pk)
+        self.assertFalse(Agent.objects.filter(pk=self.agent.pk).exists())
+        self.assertFalse(
+            User.objects.filter(pk=self.agent.user_id).exists()
+        )
+
+    def test_transfer_requires_a_target(self):
+        resp = self.delete_agent(pin="123456", action="transfer")
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.agent.refresh_from_db()
+        self.assertTrue(self.agent.is_active)
+
+
 class AgentDeleteInfoTests(AgentTestBase):
     def test_delete_info_orders_count_excludes_drafts(self):
         Order.objects.create(

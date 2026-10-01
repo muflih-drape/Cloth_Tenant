@@ -3,14 +3,14 @@
 import { Trash2, ImagePlus, X } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import type { EditableVariant } from "@/types/item";
-import { formatMeters, toMeters } from "@/types/item";
+import { toMeters } from "@/types/item";
 import { ImagePreview } from "@/components/pages/ImagePreview";
 
 interface Props {
   variant: EditableVariant;
   index: number; // 0-based
   isOnly: boolean;
-  /** Existing colours keep their live warehouse count; it is read-only here. */
+  /** New colours start with opening stock; existing colours edit live stock. */
   isNew: boolean;
   onChange: (updated: EditableVariant) => void;
   onDelete: () => void;
@@ -18,10 +18,9 @@ interface Props {
 }
 
 /**
- * One colour row. The metre figure is the warehouse's live stock count for
- * existing colours, so it is shown but not editable here -- correcting stock is
- * a stock adjustment, not a catalogue edit, and overwriting it would clobber
- * whatever packing has already moved.
+ * One colour row. The metre figure is the warehouse's live stock count and is
+ * edited in place -- on save the API applies it and records the change on the
+ * stock cursor, so a correction here is authoritative.
  */
 export default function EditVariantRow({
   variant,
@@ -69,28 +68,23 @@ export default function EditVariantRow({
           className="h-8 text-sm"
         />
 
-        {isNew ? (
-          <div className="flex items-center gap-2">
-            <span className="text-[11px] text-gray-400 flex-shrink-0">Opening</span>
-            <Input
-              type="number"
-              min={0}
-              step="0.5"
-              inputMode="decimal"
-              value={variant.stockMeters}
-              placeholder="0"
-              onChange={(e) => set("stockMeters", e.target.value)}
-              onFocus={(e) => e.target.select()}
-              className="h-8 text-sm w-24"
-            />
-            <span className="text-[11px] text-gray-400">m</span>
-          </div>
-        ) : (
-          <p className="text-[11px] text-gray-400">
-            {formatMeters(variant.stockMeters)} m on hand · changed via stock
-            adjustment
-          </p>
-        )}
+        <div className="flex items-center gap-2">
+          <span className="text-[11px] text-gray-400 flex-shrink-0">
+            {isNew ? "Opening" : "Stock"}
+          </span>
+          <Input
+            type="number"
+            min={0}
+            step="0.5"
+            inputMode="decimal"
+            value={variant.stockMeters}
+            placeholder="0"
+            onChange={(e) => set("stockMeters", e.target.value)}
+            onFocus={(e) => e.target.select()}
+            className="h-8 text-sm w-24"
+          />
+          <span className="text-[11px] text-gray-400">m</span>
+        </div>
       </div>
 
       {imageSrc && (

@@ -80,8 +80,7 @@ export default function FabricEditPage() {
           data.variants.map((variant) => ({
             backendId: variant.id,
             localId: uid(),
-            // The live warehouse count, carried through read-only so the row can
-            // show it; never sent back on save.
+            // The live warehouse count, shown in the row and sent back on save.
             stockMeters: variant.stock_meters,
             displayOrder: variant.display_order ?? "",
             imageUrl: variant.image ?? null,
@@ -403,8 +402,8 @@ export default function FabricEditPage() {
 
           <p className="mt-3 text-[11px] text-gray-400 leading-relaxed">
             Colours are what orders are placed against, and a colour&apos;s metre
-            count is its warehouse stock. To correct existing stock, use the
-            stock adjustment on the fabric list so the change is recorded.
+            count is its warehouse stock. Edit it here and it is saved with the
+            fabric.
           </p>
 
           {variantCrop && (

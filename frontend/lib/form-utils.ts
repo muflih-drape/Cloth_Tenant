@@ -85,17 +85,12 @@ export function fabricToFormData(data: Record<string, any>): FormData {
         variant.display_order ?? "",
       );
     }
-    // Only meaningful on create: the API ignores stock for existing variants so
-    // an edit cannot quietly overwrite the warehouse's live count.
-    if (
-      variant.id === undefined ||
-      variant.id === null
-    ) {
-      formData.append(
-        `variants[${index}]stock_meters`,
-        String(variant.stock_meters ?? 0),
-      );
-    }
+    // Stock is sent for every colour, existing or new: the API applies it in
+    // both cases and records a change on the roll's stock cursor.
+    formData.append(
+      `variants[${index}]stock_meters`,
+      String(variant.stock_meters ?? 0),
+    );
   });
 
   return formData;

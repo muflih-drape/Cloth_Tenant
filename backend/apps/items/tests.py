@@ -535,6 +535,62 @@ class FabricWriteTests(FabricTestBase):
         self.fabric.refresh_from_db()
         self.assertEqual(self.fabric.price_per_meter, Decimal("11.25"))
 
+    def test_edit_can_set_stock_for_an_existing_colour(self):
+        self.auth()
+        resp = self.client.patch(
+            f"/api/items/{self.fabric.pk}/",
+            {
+                "variants": [
+                    {
+                        "id": self.variant1.pk,
+                        "display_order": "Natural",
+                        "stock_meters": "7777",
+                    }
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.variant1.refresh_from_db()
+        self.assertEqual(self.variant1.stock_meters, Decimal("7777.000"))
+
+    def test_edit_leaves_stock_untouched_when_the_key_is_absent(self):
+        # A payload that does not mention stock must not rewrite the live count.
+        self.auth()
+        resp = self.client.patch(
+            f"/api/items/{self.fabric.pk}/",
+            {"variants": [{"id": self.variant1.pk, "display_order": "Natural"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.variant1.refresh_from_db()
+        self.assertEqual(self.variant1.stock_meters, Decimal("3000.000"))
+
+    def test_edit_stock_bumps_the_stock_cursor(self):
+        # The sync feed only reports variants with a fresh stock_updated_at.
+        FabricVariant.objects.filter(pk=self.variant1.pk).update(
+            stock_updated_at=timezone.now() - timedelta(days=1)
+        )
+        self.auth()
+        resp = self.client.patch(
+            f"/api/items/{self.fabric.pk}/",
+            {
+                "variants": [
+                    {
+                        "id": self.variant1.pk,
+                        "display_order": "Natural",
+                        "stock_meters": "4000",
+                    }
+                ]
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.variant1.refresh_from_db()
+        self.assertGreater(
+            self.variant1.stock_updated_at, timezone.now() - timedelta(seconds=10)
+        )
+
     def test_agent_cannot_create(self):
         self.auth(self.agent_user)
         resp = self.client.post(

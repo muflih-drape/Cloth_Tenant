@@ -6,6 +6,7 @@ from rest_framework.views import APIView
 from rest_framework.viewsets import ModelViewSet
 from collections import defaultdict
 from django.db import transaction
+from django.db.models import Count, Prefetch
 
 from apps.accounts.permissions import (
     IsAdmin,
@@ -54,7 +55,22 @@ class AgentViewSet(ModelViewSet):
         user = self.request.user
 
         if user.role == "ADMIN":
-            return Agent.objects.filter(is_active=True).order_by('-id')
+            return (
+                Agent.objects.filter(is_active=True)
+                .select_related("user")
+                .prefetch_related(
+                    Prefetch(
+                        "assigned_items",
+                        queryset=AgentItem.objects.select_related(
+                            "variant__fabric"
+                        )
+                        .filter(variant__fabric__is_deleted=False)
+                        .order_by("-created_at"),
+                    )
+                )
+                .annotate(total_customers=Count("customers"))
+                .order_by("-id")
+            )
 
         return Agent.objects.filter(user=user, is_active=True).order_by('-id')
 

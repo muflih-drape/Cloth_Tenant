@@ -82,7 +82,6 @@ export default function DeleteWithTransferDialog({
     entityName,
     onFetchDeleteInfo,
     onDelete,
-    isSuperuser = false,
 }: DeleteWithTransferDialogProps) {
     const config = ENTITY_CONFIGS[entityType];
 
@@ -257,6 +256,7 @@ export default function DeleteWithTransferDialog({
                                         onChange={() => {
                                             setAction("transfer");
                                             setError("");
+                                            setPinError("");
                                         }}
                                         className="mt-0.5 accent-primary"
                                     />
@@ -288,6 +288,7 @@ export default function DeleteWithTransferDialog({
                                         onChange={() => {
                                             setAction("deactivate");
                                             setError("");
+                                            setPinError("");
                                         }}
                                         className="mt-0.5 accent-primary"
                                     />
@@ -306,11 +307,10 @@ export default function DeleteWithTransferDialog({
                         )}
 
                         <div className="h-px bg-gray-100" />
-                        {!isSuperuser && (
-                            <div className="flex flex-col gap-4">
-                                <p className="text-xs font-bold uppercase tracking-widest text-gray-400 text-center">
-                                    Enter your 6-digit PIN to confirm
-                                </p>
+                        <div className="flex flex-col gap-4">
+                            <p className="text-xs font-bold uppercase tracking-widest text-gray-400 text-center">
+                                Enter your 6-digit PIN to confirm
+                            </p>
 
                                 <div className="flex gap-2 justify-center">
                                     {pin.map((digit, i) => (
@@ -357,7 +357,6 @@ export default function DeleteWithTransferDialog({
                                     ))}
                                 </div>
                             </div>
-                        )}
 
                         {error && (
                             <p className="text-center text-xs font-semibold text-red-500 bg-red-50 py-2 px-3 rounded-xl">
@@ -383,7 +382,6 @@ export default function DeleteWithTransferDialog({
                                 onClick={handleConfirm}
                                 disabled={
                                     loading ||
-                                    (!isSuperuser && filledCount < 6) ||
                                     (action === "transfer" &&
                                         config.showTransfer &&
                                         !transferToId)

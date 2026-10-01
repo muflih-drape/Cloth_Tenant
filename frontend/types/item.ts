@@ -35,7 +35,7 @@ export interface FabricVariantRequest {
   remove_image?: boolean;
   /** Null clears an existing colour's label. */
   display_order?: string | null;
-  /** Opening stock in metres, for a new colour only. */
+  /** Warehouse stock in metres; sent for new and existing colours. */
   stock_meters?: string | number;
 }
 

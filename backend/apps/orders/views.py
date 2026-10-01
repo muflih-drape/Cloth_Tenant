@@ -480,7 +480,7 @@ class OrderViewSet(ModelViewSet):
             ):
                 _restore_snapshot(stale)
 
-        qs = Order.objects.prefetch_related(
+        qs = Order.objects.select_related("customer", "agent__user").prefetch_related(
             "items__variant", "items__fabric", "items__allocations"
         ).order_by("-created_at")
 

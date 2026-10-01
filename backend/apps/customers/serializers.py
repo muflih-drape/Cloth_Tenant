@@ -20,11 +20,16 @@ class CustomerSerializer(serializers.ModelSerializer):
         return obj.agent.user.username if obj.agent_id else None
 
     def get_total_orders(self, obj):
+        total = getattr(obj, "total_orders", None)
+        if total is not None:
+            return total
         return Order.objects.filter(customer=obj).exclude(status="DRAFT").count()
 
     def get_total_metres_bought(self, obj):
         """Lifetime dispatched metres -- the figure packing priority ranks on."""
-        total = Order.objects.filter(customer=obj, status="DISPATCHED").aggregate(
-            total=Sum("items__allocated_quantity")
-        )["total"]
+        total = getattr(obj, "total_metres_bought", None)
+        if total is None:
+            total = Order.objects.filter(
+                customer=obj, status="DISPATCHED"
+            ).aggregate(total=Sum("items__allocated_quantity"))["total"]
         return str(total or 0)

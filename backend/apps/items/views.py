@@ -123,7 +123,9 @@ class FabricViewSet(ModelViewSet):
     serializer_class = FabricSerializer
 
     def get_queryset(self):
-        return _active_fabrics().order_by("-id")
+        return _active_fabrics().annotate(
+            _total_stock=Sum("variants__stock_meters")
+        ).order_by("-id")
 
     def get_permissions(self):
         if self.action == "fabrics_sync":
@@ -353,13 +355,20 @@ class FabricViewSet(ModelViewSet):
         if variant_id:
             qs = qs.filter(pk=variant_id)
 
+        # One grouped aggregate for every variant instead of one SUM query per
+        # variant; the values are identical, only the round trips change.
+        demand = {
+            row["variant_id"]: row["outstanding"] or ZERO
+            for row in OrderItem.objects.filter(
+                order__status__in=OPEN_ORDER_STATUSES
+            )
+            .values("variant_id")
+            .annotate(outstanding=Sum("ordered_quantity") - Sum("allocated_quantity"))
+        }
+
         rows = []
         for variant in qs:
-            wanted = OrderItem.objects.filter(
-                variant=variant, order__status__in=OPEN_ORDER_STATUSES
-            ).aggregate(total=Sum("ordered_quantity") - Sum("allocated_quantity"))[
-                "total"
-            ] or ZERO
+            wanted = demand.get(variant.id, ZERO)
             rows.append(
                 {
                     "variant": variant.id,

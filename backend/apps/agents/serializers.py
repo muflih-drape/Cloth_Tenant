@@ -128,15 +128,21 @@ class AgentSerializer(serializers.ModelSerializer):
         return value
 
     def get_total_customers(self, obj):
+        total = getattr(obj, "total_customers", None)
+        if total is not None:
+            return total
         return obj.customers.count()
 
     def get_assigned_items(self, obj):
         request = self.context.get("request")
-        qs = (
-            obj.assigned_items.select_related("variant__fabric")
-            .filter(variant__fabric__is_deleted=False)
-            .order_by("-created_at")
-        )
+        if "assigned_items" in getattr(obj, "_prefetched_objects_cache", {}):
+            qs = obj.assigned_items.all()
+        else:
+            qs = (
+                obj.assigned_items.select_related("variant__fabric")
+                .filter(variant__fabric__is_deleted=False)
+                .order_by("-created_at")
+            )
         fabric_groups = defaultdict(list)
         for ai in qs:
             fabric_groups[ai.variant.fabric_id].append(ai)

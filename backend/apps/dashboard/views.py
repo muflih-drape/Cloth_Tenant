@@ -1,7 +1,7 @@
 from datetime import timedelta
 from decimal import Decimal
 
-from django.db.models import Count, Sum
+from django.db.models import Count, OuterRef, Subquery, Sum
 from django.db.models.functions import Coalesce, TruncDate
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiTypes, extend_schema
@@ -19,25 +19,39 @@ class AdminDashboardView(APIView):
     permission_classes = [IsAdmin]
 
     def get(self, request):
-        order_qs = Order.objects.all()
-        data = {
-            status.lower(): order_qs.filter(status=status).count()
-            for status, _ in Order.STATUS_CHOICES
+        # One grouped COUNT instead of a query per status.
+        counts = {
+            row["status"]: row["c"]
+            for row in Order.objects.values("status").annotate(c=Count("id"))
         }
+        data = {s.lower(): counts.get(s, 0) for s, _ in Order.STATUS_CHOICES}
         # An admin only sees/counts their own drafts.
-        data["draft"] = order_qs.filter(
+        data["draft"] = Order.objects.filter(
             status="DRAFT", created_by=request.user
         ).count()
 
+        pending_sub = Subquery(
+            Order.objects.filter(agent=OuterRef("pk"), status__in=("PENDING", "PACKED"))
+            .order_by()
+            .values("agent_id")
+            .annotate(c=Count("id"))
+            .values("c")
+        )
         agents = [
             {
                 "agent": agent.user.username,
-                "customers": agent.customers.count(),
-                "pending_orders": Order.objects.filter(
-                    agent=agent, status__in=("PENDING", "PACKED")
-                ).count(),
+                "customers": agent.customer_count,
+                "pending_orders": agent.pending_count or 0,
             }
-            for agent in Agent.objects.filter(is_active=True)
+            for agent in (
+                Agent.objects.filter(is_active=True)
+                .select_related("user")
+                .order_by("id")
+                .annotate(
+                    customer_count=Count("customers"),
+                    pending_count=pending_sub,
+                )
+            )
         ]
 
         return Response({"order_summary": data, "agents": agents})
@@ -147,14 +161,16 @@ class AdminAnalyticsView(APIView):
         )
 
         dispatch_times = []
-        for order in order_qs.filter(status="DISPATCHED"):
-            log = (
-                OrderLog.objects.filter(
-                    order_ref=order.id, action="DISPATCHED"
-                )
-                .order_by("-created_at")
-                .first()
-            )
+        dispatched_qs = order_qs.filter(status="DISPATCHED")
+        latest_logs = {}
+        for log in (
+            OrderLog.objects.filter(
+                order_ref__in=dispatched_qs, action="DISPATCHED"
+            ).order_by("-created_at")
+        ):
+            latest_logs.setdefault(log.order_ref, log)
+        for order in dispatched_qs:
+            log = latest_logs.get(order.id)
             if log:
                 delta = log.created_at - order.created_at
                 dispatch_times.append(delta.total_seconds() / 3600)

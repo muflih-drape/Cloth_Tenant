@@ -1,5 +1,7 @@
 import json
 
+from django.db.models import Count, DecimalField, IntegerField, OuterRef, Subquery, Sum
+from django.db.models.functions import Coalesce
 from django.http import JsonResponse
 from django.utils import timezone
 from django.views.decorators.csrf import csrf_exempt
@@ -37,9 +39,41 @@ class CustomerViewSet(ModelViewSet):
 
     def get_queryset(self):
         user = self.request.user
+        # Annotate the per-customer totals once for the whole page instead of
+        # letting the serializer run a COUNT/SUM per row.
+        qs = (
+            Customer.objects.filter(is_active=True)
+            .select_related("agent__user")
+            .annotate(
+                total_orders=Coalesce(
+                    Subquery(
+                        Order.objects.filter(customer=OuterRef("pk"))
+                        .exclude(status="DRAFT")
+                        .order_by()
+                        .values("customer_id")
+                        .annotate(cnt=Count("*"))
+                        .values("cnt")
+                    ),
+                    0,
+                    output_field=IntegerField(),
+                ),
+                total_metres_bought=Coalesce(
+                    Subquery(
+                        Order.objects.filter(customer=OuterRef("pk"), status="DISPATCHED")
+                        .order_by()
+                        .values("customer_id")
+                        .annotate(metres=Sum("items__allocated_quantity"))
+                        .values("metres")
+                    ),
+                    0,
+                    output_field=DecimalField(max_digits=14, decimal_places=3),
+                ),
+            )
+            .order_by("-id")
+        )
         if user.role == "ADMIN":
-            return Customer.objects.filter(is_active=True).order_by('-id')
-        return Customer.objects.filter(agent__user=user, is_active=True).order_by('-id')
+            return qs
+        return qs.filter(agent__user=user)
 
     def perform_create(self, serializer):
         if self.request.user.role == "AGENT":

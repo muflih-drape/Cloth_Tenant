@@ -1,7 +1,7 @@
 "use client";
 
 import { usePathname, useRouter } from "next/navigation";
-import { Truck, Users, Archive, BarChart3, Store, Loader2, Scissors } from "lucide-react";
+import { Truck, Users, Archive, BarChart3, Store, Loader2 } from "lucide-react";
 import { useAuth } from "@/context/AuthContext";
 import React, { useEffect, useState } from "react";
 import { PageLoading } from "./Loading";
@@ -44,11 +44,6 @@ const AdminNavBar: React.FC = () => {
             label: "Stats",
             icon: BarChart3,
             path: "/admin/analytics",
-        },
-        {
-            label: "Packing",
-            icon: Scissors,
-            path: "/admin/packing",
         },
         {
             label: "Stock",
