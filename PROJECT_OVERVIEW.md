@@ -705,7 +705,7 @@ Properties: `is_price_overridden` (`:95-100`), `effective_total` (`:102-107`).
 
 **`OrderLog`** — the audit trail. `order` is **nullable with `SET_NULL`** (`:137-139`) and `order_ref` (`PositiveIntegerField`, `db_index=True`) keeps the original id — *"which matters most for a deletion, since that is exactly the entry you need afterwards"* (`:114-120`).
 
-Actions: `ITEM_DELETED, ORDER_DELETED, ORDER_EDITED, DISPATCHED, EDIT_STARTED, EDIT_SAVED, EDIT_CANCELLED, PRICE_OVERRIDE, PRICE_OVERRIDE_CLEARED, ALLOCATION_MADE, ALLOCATION_REVERSED, ROUND_CANCELLED`.
+Actions: `ITEM_DELETED, ORDER_DELETED, ORDER_EDITED, DISPATCHED, EDIT_STARTED, EDIT_SAVED, EDIT_CANCELLED, PRICE_OVERRIDE, PRICE_OVERRIDE_CLEARED, ITEM_RATE_OVERRIDE, ITEM_RATE_OVERRIDE_CLEARED, ALLOCATION_MADE, ALLOCATION_REVERSED, ROUND_CANCELLED`.
 Classmethod `record(order, action, details, performed_by)` (`:153-165`) fills `order_ref` so no call site can forget.
 Index: `(order_ref, -created_at)`.
 
@@ -716,13 +716,17 @@ Index: `(order_ref, -created_at)`.
 | `order` | FK, CASCADE, `related_name="items"` | |
 | `fabric` / `variant` | FK, **SET_NULL**, null | |
 | `fabric_name` | CharField(100) | ★ snapshot |
-| `rate_per_meter` | Decimal(10,2) | ★ snapshot |
+| `rate_per_meter` | Decimal(10,2) | ★ snapshot; may be an **agreed rate** for this customer |
+| `original_rate_per_meter` | Decimal(10,2), null | ★ catalogue rate at add time; `!= rate_per_meter` ⇒ repriced |
+| `rate_overridden_by` / `rate_overridden_at` | FK **SET_NULL** null / DateTimeField null | who agreed it, and when |
 | `variant_image` | URLField | ★ snapshot (absolute URL) |
 | `variant_display_order` | CharField(100) | ★ snapshot |
 | `ordered_quantity` | Decimal(14,3) | demand |
 | `allocated_quantity` | Decimal(14,3) | cloth actually moved |
 
-Property `outstanding_quantity` (`:202-204`).
+Properties `outstanding_quantity` (`:202-204`) and `is_rate_overridden`.
+
+**Per-line rate override** — `rate_override` is an optional write-only field on both `AddOrderItemSerializer` and `OrderItemSerializer` (`rate_columns()` in `serializers.py`). It lands on the `OrderItem` only: `Fabric.price_per_meter` is never written, so a price agreed with one customer cannot leak into the catalogue. Omitted, or equal to the catalogue rate, means no override. An **agent may only discount** (capped at the live catalogue rate, mirroring `set-price`); an admin may bill any rate > 0. Every change is audited as `ITEM_RATE_OVERRIDE` / `ITEM_RATE_OVERRIDE_CLEARED`, is part of the edit snapshot, and survives `place-order`. `merge-items` refuses lines priced differently (the keeper's rate would otherwise be applied to the dropped lines' metres).
 
 **`PackingRound`** — `DRAFT | CONFIRMED | CANCELLED`
 
@@ -855,9 +859,9 @@ All apps squashed to a single `0001_initial.py` in commit `1b270f8` (50 migratio
 | GET/PATCH | `/{id}/` | IsAuthenticated | retrieve / patch. PATCH cannot set `status=DISPATCHED` (400) or leave DRAFT (400) |
 | DELETE | `/{id}/` | `_may_touch` | 204. **Returns allocated cloth to stock** unless DRAFT/DISPATCHED |
 | POST | `/{id}/place-order/` | IsAgentOrAdmin | DRAFT→PENDING; returns `shortfall_lines[]` + `notice` |
-| POST | `/{id}/add-item/` | IsAgentOrAdmin | `{qr_code, ordered_quantity}` |
+| POST | `/{id}/add-item/` | IsAgentOrAdmin | `{qr_code, ordered_quantity, rate_override?}` — `rate_override` prices **this line only** (agent ≤ catalogue) |
 | DELETE | `/{id}/delete-item/{item_id}/` | IsAuthenticated | 200 `{message}` (not 204) |
-| POST | `/{id}/merge-items/` | IsAgentOrAdmin | `{keep_item_id, drop_item_ids[]}` — must share one variant |
+| POST | `/{id}/merge-items/` | IsAgentOrAdmin | `{keep_item_id, drop_item_ids[]}` — must share one variant **and one rate** |
 | GET | `/{id}/invoice/` | `_may_touch` | invoice payload incl. `brand`, `totals`, `gst_rate` |
 | GET | `/{id}/logs/` | `_may_touch` | audit trail |
 | POST | `/{id}/start-edit/` | **IsAgent** | snapshot → EDITING |
@@ -869,7 +873,7 @@ All apps squashed to a single `0001_initial.py` in commit `1b270f8` (50 migratio
 | GET | `/my-viewed-ids/` | IsAuthenticated | `number[]` |
 | POST | `/{id}/mark-viewed/` | IsAuthenticated | get_or_create / delete by status |
 | GET | `/archived/` | IsAuthenticated | dispatched >30 d ago; **only honours `from_date`/`to_date`/`page`/`page_size`** |
-| GET/PATCH/DELETE | `/order-items/{id}/` | IsAuthenticated | `create()` always 405 |
+| GET/PATCH/DELETE | `/order-items/{id}/` | IsAuthenticated | `create()` always 405 · PATCH takes `ordered_quantity`, `variant`, `rate_override` |
 
 **`set-price` rules** (docstring `:384-395`): DRAFT only, for everyone · agent may only **discount**, capped at *live line arithmetic* (recomputed, not read from the stored column, `:432-435`) · admin may set any amount · reason optional · every change audited.
 

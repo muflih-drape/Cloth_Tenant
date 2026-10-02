@@ -16,8 +16,10 @@ import ProductImage from "./components/ProductImage";
 import ProductInfo from "./components/ProductInfo";
 import VariantSelector from "./components/VariantSelector";
 import MetresSelector from "./components/MetresSelector";
+import RateOverrideSelector from "./components/RateOverrideSelector";
 import SubmitButton from "./components/SubmitButton";
 import { useBackButton } from "@/util/useBackButton";
+import { useAuth } from "@/context/AuthContext";
 import { useOrderFlow } from "@/context/OrderFlowContext";
 import { Modal, ModalButton } from "@/components/ui/custom/Modals";
 
@@ -27,6 +29,7 @@ export default function ProductDetailPage() {
     const router = useRouter();
 
     const { basePath, agentId } = useOrderFlow();
+    const { role } = useAuth();
 
     const [data, setData] = useState<FabricQRResponse | null>(null);
     const [metres, setMetres] = useState("0");
@@ -48,6 +51,20 @@ export default function ProductDetailPage() {
         Record<number, number>
     >({});
     const [existingLineId, setExistingLineId] = useState<number | null>(null);
+
+    /**
+     * Rate this line will be billed at, per colour. Prefilled with the
+     * catalogue rate, or with the agreed rate when the colour is already on the
+     * order — sending it unchanged is a no-op, so only a real difference travels.
+     */
+    const [rateByVariant, setRateByVariant] = useState<
+        Record<number, string>
+    >({});
+    /** Whether the line for a colour is billed at an agreed rate. */
+    const [overriddenByVariant, setOverriddenByVariant] = useState<
+        Record<number, boolean>
+    >({});
+    const [rate, setRate] = useState("");
 
     const isEditMode = existingLineId !== null;
 
@@ -91,15 +108,25 @@ export default function ProductDetailPage() {
                     // second line for it, which is what the merge flow did.
                     const byVariant: Record<number, number> = {};
                     const lineIds: Record<number, number> = {};
+                    const rates: Record<number, string> = {};
+                    const overrides: Record<number, boolean> = {};
                     for (const line of orderResponse.items) {
                         if (!line.variant) continue;
                         byVariant[line.variant] =
                             (byVariant[line.variant] ?? 0) +
                             toMeters(line.ordered_quantity);
                         lineIds[line.variant] = line.id;
+                        rates[line.variant] = line.rate_per_meter;
+                        // The server's own answer to "was this line repriced?".
+                        // Comparing against the live catalogue price instead
+                        // would flag every legacy line added before a price
+                        // change, and those carry no agreement to preserve.
+                        overrides[line.variant] = !!line.is_rate_overridden;
                     }
                     setExistingMetres(byVariant);
                     setLineIdByVariant(lineIds);
+                    setRateByVariant(rates);
+                    setOverriddenByVariant(overrides);
                     // Follow the matched colour, not the first colour scanned.
                     setExistingLineId(lineIds[matched.id] ?? null);
                     setMetres(
@@ -107,6 +134,11 @@ export default function ProductDetailPage() {
                             ? String(byVariant[matched.id])
                             : "",
                     );
+                    setRate(
+                        rates[matched.id] ?? fabricResponse.price_per_meter,
+                    );
+                } else if (matched) {
+                    setRate(fabricResponse.price_per_meter);
                 }
             } catch (e: any) {
                 const errorMsg = e?.response?.data?.error || "";
@@ -135,11 +167,46 @@ export default function ProductDetailPage() {
                 ? String(existingMetres[variant.id])
                 : "",
         );
+        // Same for the rate: carry the agreed one over rather than resetting it
+        // to the catalogue, which would silently reprice the line on save.
+        setRate(
+            rateByVariant[variant.id] ?? data?.price_per_meter ?? "",
+        );
     };
 
     const onHandMetres = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
+    /** The agreed rate already on this colour's line, if the order has one. */
+    const existingRate = selectedVariant
+        ? rateByVariant[selectedVariant.id]
+        : undefined;
+    const isOverridden = selectedVariant
+        ? !!overriddenByVariant[selectedVariant.id]
+        : false;
 
     const requested = useMemo(() => toMeters(metres), [metres]);
+
+    const catalogRate = data?.price_per_meter ?? "";
+    /**
+     * The rate to send, or nothing when there is nothing to say.
+     *
+     * A line that already carries this exact rate and was never repriced needs
+     * no rate at all: its rate is a snapshot from when the order was written,
+     * and the catalogue may have moved since. Re-sending it would put a stale
+     * figure through the agent cap and could refuse an ordinary change of
+     * metres. Sending it *is* what clears an agreed rate, so an overridden line
+     * always speaks up.
+     */
+    const rateOverride = useMemo(() => {
+        const typed = Number(rate);
+        const catalog = Number(catalogRate);
+        if (!rate.trim() || !Number.isFinite(typed) || typed <= 0) return null;
+        const stored = existingRate !== undefined ? Number(existingRate) : NaN;
+        if (!isOverridden) {
+            if (Number.isFinite(stored) && typed === stored) return null;
+            if (typed === catalog) return null;
+        }
+        return rate.trim();
+    }, [rate, catalogRate, existingRate, isOverridden]);
 
     useEffect(() => {
         if (requested > 0) setValidationError(null);
@@ -158,6 +225,25 @@ export default function ProductDetailPage() {
             setValidationError("Enter how many metres are needed");
             return;
         }
+        const typedRate = Number(rate);
+        if (!rate.trim() || !Number.isFinite(typedRate) || typedRate <= 0) {
+            setValidationError("Enter the rate to charge per metre");
+            return;
+        }
+        // Pinned by the server too; catching it here keeps the agent from
+        // filling in a form that can only come back rejected. Keeping the rate
+        // a line already carries is not inflation, even once the catalogue has
+        // moved past it.
+        const keepingAgreedRate =
+            isOverridden &&
+            existingRate !== undefined &&
+            typedRate === Number(existingRate);
+        if (role !== "ADMIN" && !keepingAgreedRate && typedRate > Number(catalogRate)) {
+            setValidationError(
+                `Rate cannot be more than the catalogue price of ₹${catalogRate}/m`,
+            );
+            return;
+        }
 
         setValidationError(null);
 
@@ -174,12 +260,16 @@ export default function ProductDetailPage() {
             if (existingLineId !== null) {
                 await orderApi.updateItem(existingLineId, {
                     ordered_quantity: metres,
+                    ...(rateOverride
+                        ? { rate_override: rateOverride }
+                        : {}),
                 });
                 toastSuccess("Fabric line updated");
             } else {
                 await orderApi.addItem(orderId, {
                     qr_code: selectedVariant.qr_code,
                     ordered_quantity: metres,
+                    ...(rateOverride ? { rate_override: rateOverride } : {}),
                 });
             }
 
@@ -230,6 +320,14 @@ export default function ProductDetailPage() {
                     onChange={setMetres}
                     onHandMetres={onHandMetres}
                     isEditMode={isEditMode}
+                />
+
+                <RateOverrideSelector
+                    catalogRate={catalogRate}
+                    value={rate}
+                    onChange={setRate}
+                    canRaiseRate={role === "ADMIN"}
+isOverridden={isOverridden}
                 />
 
                 {validationError && (

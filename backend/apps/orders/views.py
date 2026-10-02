@@ -8,6 +8,7 @@ from django.db import transaction
 from django.db.models import F, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
+from django.utils.dateparse import parse_datetime
 from drf_spectacular.utils import extend_schema
 from rest_framework import serializers, status
 from rest_framework.decorators import action
@@ -63,6 +64,15 @@ def _build_snapshot(order):
             "variant_id": oi.variant_id,
             "fabric_name": oi.fabric_name,
             "rate_per_meter": str(oi.rate_per_meter),
+            "original_rate_per_meter": (
+                str(oi.original_rate_per_meter)
+                if oi.original_rate_per_meter is not None
+                else None
+            ),
+            "rate_overridden_by_id": oi.rate_overridden_by_id,
+            "rate_overridden_at": (
+                oi.rate_overridden_at.isoformat() if oi.rate_overridden_at else None
+            ),
             "variant_image": oi.variant_image,
             "variant_display_order": oi.variant_display_order,
             "ordered_quantity": str(oi.ordered_quantity),
@@ -91,12 +101,20 @@ def _restore_snapshot(order):
     with transaction.atomic():
         order.items.all().delete()
         for snap in order.edit_snapshot or []:
+            overridden_at = snap.get("rate_overridden_at")
             OrderItem.objects.create(
                 order=order,
                 fabric_id=snap["fabric_id"],
                 variant_id=snap["variant_id"],
                 fabric_name=snap["fabric_name"],
                 rate_per_meter=snap["rate_per_meter"],
+                # An abandoned edit must not leave a negotiated rate behind, or
+                # the rolled-back order would keep billing off-catalogue.
+                original_rate_per_meter=snap.get("original_rate_per_meter"),
+                rate_overridden_by_id=snap.get("rate_overridden_by_id"),
+                rate_overridden_at=(
+                    parse_datetime(overridden_at) if overridden_at else None
+                ),
                 variant_image=snap.get("variant_image"),
                 variant_display_order=snap.get("variant_display_order", ""),
                 ordered_quantity=snap["ordered_quantity"],
@@ -801,7 +819,9 @@ class AddOrderItemView(APIView):
         responses={201: None, 400: None, 403: None},
     )
     def post(self, request, order_id):
-        serializer = AddOrderItemSerializer(data=request.data)
+        serializer = AddOrderItemSerializer(
+            data=request.data, context={"request": request}
+        )
         serializer.is_valid(raise_exception=True)
 
         order = get_object_or_404(Order, id=order_id)
@@ -844,18 +864,39 @@ class AddOrderItemView(APIView):
             )
 
         with transaction.atomic():
-            OrderItem.objects.create(
+            line = OrderItem.objects.create(
                 order=order,
                 fabric=serializer.validated_data["fabric"],
                 variant=variant,
                 fabric_name=serializer.validated_data["fabric_name"],
                 rate_per_meter=serializer.validated_data["rate_per_meter"],
+                original_rate_per_meter=serializer.validated_data[
+                    "original_rate_per_meter"
+                ],
+                rate_overridden_by=serializer.validated_data["rate_overridden_by"],
+                rate_overridden_at=serializer.validated_data["rate_overridden_at"],
                 variant_image=serializer.validated_data.get("variant_image"),
                 variant_display_order=serializer.validated_data.get(
                     "variant_display_order", ""
                 ),
                 ordered_quantity=serializer.validated_data["ordered_quantity"],
             )
+            if line.is_rate_overridden:
+                # A rate agreed for one customer is worth a trace of its own:
+                # the catalogue is untouched, so this line is the only record
+                # that the order was billed off-rate.
+                OrderLog.record(
+                    order,
+                    "ITEM_RATE_OVERRIDE",
+                    details={
+                        "item_id": line.pk,
+                        "fabric_name": line.fabric_name,
+                        "catalog_rate": str(line.original_rate_per_meter),
+                        "rate_per_meter": str(line.rate_per_meter),
+                        "metres": str(line.ordered_quantity),
+                    },
+                    performed_by=request.user,
+                )
             recompute_order_total(order)
 
         return Response(
@@ -1021,6 +1062,20 @@ class MergeOrderItemsView(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
 
+            # The keeper's rate would be applied to the dropped lines' metres too,
+            # so merging lines that were priced differently would quietly reprice
+            # the order. Lines that agree carry no information, so only a genuine
+            # difference blocks the merge.
+            rates = {line.rate_per_meter for line in lines}
+            if len(rates) > 1:
+                return Response(
+                    {
+                        "error": "These lines are billed at different rates. Set "
+                        "the same rate on each of them before merging."
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
             # Decimals all the way: the metres are stored to three places, so
             # the sum must be too.
             merged = sum(
@@ -1176,6 +1231,7 @@ class OrderItemViewSet(ModelViewSet):
             )
 
         old_quantity = order_item.ordered_quantity
+        old_rate = order_item.rate_per_meter
         raw_quantity = request.data.get("ordered_quantity", old_quantity)
         try:
             new_quantity = Decimal(str(raw_quantity))
@@ -1223,6 +1279,31 @@ class OrderItemViewSet(ModelViewSet):
                         "fabric_name": order_item.fabric_name,
                         "old_quantity": str(old_quantity),
                         "new_quantity": str(new_quantity),
+                    },
+                    performed_by=request.user,
+                )
+            # ``super().update()`` fetches its own copy of the line, so this one
+            # is still the pre-edit row. Read the rate back off the database or
+            # a reprice looks like no change and never reaches the audit log.
+            order_item.refresh_from_db()
+            new_rate = order_item.rate_per_meter
+            if old_rate != new_rate:
+                OrderLog.record(
+                    order,
+                    "ITEM_RATE_OVERRIDE"
+                    if order_item.is_rate_overridden
+                    else "ITEM_RATE_OVERRIDE_CLEARED",
+                    details={
+                        "item_id": order_item.id,
+                        "fabric_name": order_item.fabric_name,
+                        "old_rate": str(old_rate),
+                        "new_rate": str(new_rate),
+                        "catalog_rate": (
+                            str(order_item.original_rate_per_meter)
+                            if order_item.original_rate_per_meter is not None
+                            else None
+                        ),
+                        "metres": str(order_item.ordered_quantity),
                     },
                     performed_by=request.user,
                 )

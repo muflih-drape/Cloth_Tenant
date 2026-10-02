@@ -268,6 +268,20 @@ export default function OrderItemRow({
             </p>
             <p className="text-[10px] text-gray-400 mt-0.5">
               ₹{Number(item.rate_per_meter || 0).toLocaleString("en-IN")}/m
+              {/* An agreed rate is kept on this line only, so the catalogue
+                  price it replaced is the only clue to where it came from. */}
+              {item.is_rate_overridden && item.original_rate_per_meter && (
+                <>
+                  {" · "}
+                  <span className="line-through">
+                    ₹
+                    {Number(item.original_rate_per_meter).toLocaleString("en-IN")}
+                  </span>
+                  <span className="ml-1 font-bold text-amber-600">
+                    agreed
+                  </span>
+                </>
+              )}
             </p>
           </div>
 

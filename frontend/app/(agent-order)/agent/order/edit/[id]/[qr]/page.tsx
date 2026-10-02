@@ -10,12 +10,14 @@ import { toastSuccess, toastError } from "@/lib/toast";
 import type { FabricQRResponse, FabricVariant } from "@/types/item";
 import { toMeters } from "@/types/item";
 import { useEditGuard } from "@/lib/useEditGuard";
+import { useAuth } from "@/context/AuthContext";
 
 import ProductHeader from "../../../new/[id]/[qr]/components/ProductHeader";
 import ProductImage from "../../../new/[id]/[qr]/components/ProductImage";
 import ProductInfo from "../../../new/[id]/[qr]/components/ProductInfo";
 import VariantSelector from "../../../new/[id]/[qr]/components/VariantSelector";
 import MetresSelector from "../../../new/[id]/[qr]/components/MetresSelector";
+import RateOverrideSelector from "../../../new/[id]/[qr]/components/RateOverrideSelector";
 import SubmitButton from "../../../new/[id]/[qr]/components/SubmitButton";
 
 export default function EditProductDetailPage() {
@@ -23,6 +25,7 @@ export default function EditProductDetailPage() {
   const id = params.id as string;
   const router = useRouter();
   const { handleBack } = useEditGuard(id);
+  const { role } = useAuth();
 
   const [data, setData] = useState<FabricQRResponse | null>(null);
   const [metres, setMetres] = useState("0");
@@ -38,6 +41,13 @@ export default function EditProductDetailPage() {
   const [lineIdByVariant, setLineIdByVariant] = useState<Record<number, number>>(
     {},
   );
+const [rateByVariant, setRateByVariant] = useState<Record<number, string>>(
+    {},
+);
+const [overriddenByVariant, setOverriddenByVariant] = useState<
+    Record<number, boolean>
+>({});
+  const [rate, setRate] = useState("");
   const [existingLineId, setExistingLineId] = useState<number | null>(null);
 
   const isEditMode = existingLineId !== null;
@@ -62,20 +72,32 @@ export default function EditProductDetailPage() {
         if (orderResponse && matched) {
           const byVariant: Record<number, number> = {};
           const lineIds: Record<number, number> = {};
+          const rates: Record<number, string> = {};
+          const overrides: Record<number, boolean> = {};
           for (const line of orderResponse.items) {
             if (!line.variant) continue;
             byVariant[line.variant] =
               (byVariant[line.variant] ?? 0) + toMeters(line.ordered_quantity);
             lineIds[line.variant] = line.id;
+            rates[line.variant] = line.rate_per_meter;
+            // The server's own answer to "was this line repriced?" — comparing
+            // against the live catalogue price instead would flag every line
+            // added before a price change.
+            overrides[line.variant] = !!line.is_rate_overridden;
           }
           setExistingMetres(byVariant);
           setLineIdByVariant(lineIds);
+          setRateByVariant(rates);
+          setOverriddenByVariant(overrides);
 
           // Reuse this colour's line if the order already has one, so scanning
           // the same roll twice adjusts it rather than duplicating it. The line
           // follows the selected colour, not the colour first scanned.
           setExistingLineId(lineIds[matched.id] ?? null);
           setMetres(byVariant[matched.id] ? String(byVariant[matched.id]) : "");
+          setRate(rates[matched.id] ?? fabricResponse.price_per_meter);
+        } else if (matched) {
+          setRate(fabricResponse.price_per_meter);
         }
       } catch (e) {
         console.error("Error fetching fabric details:", e);
@@ -95,10 +117,39 @@ export default function EditProductDetailPage() {
     setMetres(
       existingMetres[variant.id] ? String(existingMetres[variant.id]) : "",
     );
+    // So does the rate: keep the agreed one rather than silently falling back
+    // to the catalogue price, which would reprice the line on save.
+    setRate(rateByVariant[variant.id] ?? data?.price_per_meter ?? "");
   };
 
   const onHandMetres = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
   const requested = useMemo(() => toMeters(metres), [metres]);
+
+  const catalogRate = data?.price_per_meter ?? "";
+  const existingRate = selectedVariant
+    ? rateByVariant[selectedVariant.id]
+    : undefined;
+  const isOverridden = selectedVariant
+    ? !!overriddenByVariant[selectedVariant.id]
+    : false;
+  /**
+   * The rate to send, or nothing when there is nothing to say. A line that
+   * already carries this rate and was never repriced is left alone: its rate is
+   * a snapshot, and re-sending it could put a stale figure through the agent
+   * cap. An overridden line always sends, since that is how the agreement is
+   * changed or cleared.
+   */
+  const rateOverride = useMemo(() => {
+    const typed = Number(rate);
+    const catalog = Number(catalogRate);
+    if (!rate.trim() || !Number.isFinite(typed) || typed <= 0) return null;
+    const stored = existingRate !== undefined ? Number(existingRate) : NaN;
+    if (!isOverridden) {
+      if (Number.isFinite(stored) && typed === stored) return null;
+      if (typed === catalog) return null;
+    }
+    return rate.trim();
+  }, [rate, catalogRate, existingRate, isOverridden]);
 
   const handleSubmit = async () => {
     if (!selectedVariant) {
@@ -113,6 +164,29 @@ export default function EditProductDetailPage() {
       setValidationError("Enter how many metres are needed");
       return;
     }
+    const typedRate = Number(rate);
+    if (!rate.trim() || !Number.isFinite(typedRate) || typedRate <= 0) {
+      setValidationError("Enter the rate to charge per metre");
+      return;
+    }
+    // Pinned by the server too; catching it here keeps the agent from filling
+    // in a form that can only come back rejected. Keeping the rate a line
+    // already carries is not inflation, even once the catalogue has moved past
+    // it.
+    const keepingAgreedRate =
+      isOverridden &&
+      existingRate !== undefined &&
+      typedRate === Number(existingRate);
+    if (
+      role !== "ADMIN" &&
+      !keepingAgreedRate &&
+      typedRate > Number(catalogRate)
+    ) {
+      setValidationError(
+        `Rate cannot be more than the catalogue price of ₹${catalogRate}/m`,
+      );
+      return;
+    }
 
     setValidationError(null);
 
@@ -125,12 +199,14 @@ export default function EditProductDetailPage() {
       if (existingLineId !== null) {
         await orderApi.updateItem(existingLineId, {
           ordered_quantity: metres,
+          ...(rateOverride ? { rate_override: rateOverride } : {}),
         });
         toastSuccess("Fabric line updated");
       } else {
         await orderApi.addItem(orderId, {
           qr_code: selectedVariant.qr_code,
           ordered_quantity: metres,
+          ...(rateOverride ? { rate_override: rateOverride } : {}),
         });
         toastSuccess("Fabric added");
       }
@@ -168,6 +244,14 @@ export default function EditProductDetailPage() {
           onChange={setMetres}
           onHandMetres={onHandMetres}
           isEditMode={isEditMode}
+        />
+
+        <RateOverrideSelector
+          catalogRate={catalogRate}
+          value={rate}
+          onChange={setRate}
+          canRaiseRate={role === "ADMIN"}
+          isOverridden={isOverridden}
         />
 
         {validationError && (

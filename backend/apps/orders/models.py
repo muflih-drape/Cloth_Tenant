@@ -129,6 +129,8 @@ class OrderLog(models.Model):
         ("EDIT_CANCELLED", "Edit Cancelled"),
         ("PRICE_OVERRIDE", "Price Overridden"),
         ("PRICE_OVERRIDE_CLEARED", "Price Override Cleared"),
+        ("ITEM_RATE_OVERRIDE", "Item Rate Overridden"),
+        ("ITEM_RATE_OVERRIDE_CLEARED", "Item Rate Override Cleared"),
         ("ALLOCATION_MADE", "Stock Allocated"),
         ("ALLOCATION_REVERSED", "Allocation Reversed"),
         ("ROUND_CANCELLED", "Packing Round Cancelled"),
@@ -176,6 +178,12 @@ class OrderItem(models.Model):
     The gap between the two is the outstanding demand that the packing queue
     works through. Packing may overshoot ``ordered_quantity`` -- a roll is cut
     whole -- so the gap is clamped at zero rather than allowed to go negative.
+
+    Money is snapshotted onto the line too, so an order keeps billing the rate
+    that was agreed even after the catalogue changes. ``rate_per_meter`` may be
+    set to a rate negotiated for one customer; the fabric's own
+    ``price_per_meter`` is never written, so that rate stays on this order and
+    this order alone.
     """
 
     order = models.ForeignKey(Order, related_name="items", on_delete=models.CASCADE)
@@ -192,6 +200,23 @@ class OrderItem(models.Model):
     rate_per_meter = models.DecimalField(
         max_digits=10, decimal_places=2, default=0
     )
+    #: The catalogue rate this line was added at. Kept beside the billed rate so
+    #: an agreed price stays auditable: the fabric's own ``price_per_meter`` may
+    #: move afterwards, and a line created before that must still show what it
+    #: would have cost. Equal to ``rate_per_meter`` unless the line was repriced.
+    original_rate_per_meter = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True
+    )
+    #: Who agreed the per-customer rate, and when. Null while the line is billed
+    #: at the catalogue rate.
+    rate_overridden_by = models.ForeignKey(
+        User,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="repriced_order_items",
+    )
+    rate_overridden_at = models.DateTimeField(null=True, blank=True)
     variant_image = models.URLField(null=True, blank=True)
     variant_display_order = models.CharField(max_length=100, blank=True, default="")
 
@@ -199,6 +224,14 @@ class OrderItem(models.Model):
     allocated_quantity = models.DecimalField(
         max_digits=14, decimal_places=3, default=0
     )
+
+    @property
+    def is_rate_overridden(self):
+        """Whether this line is billed at something other than the catalogue."""
+        return (
+            self.original_rate_per_meter is not None
+            and self.rate_per_meter != self.original_rate_per_meter
+        )
 
     @property
     def outstanding_quantity(self):

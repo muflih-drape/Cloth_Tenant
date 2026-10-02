@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.conf import settings
+from django.utils import timezone
 from rest_framework import serializers
 
 from apps.agents.models import Agent
@@ -16,6 +17,46 @@ CENT = Decimal("0.01")
 #: Smallest orderable quantity: one gram, i.e. 0.001 m at 3 decimal places.
 #: Anything below this is a rounding artefact, not a real order line.
 MIN_ORDER_METERS = Decimal("0.001")
+
+#: A negotiated rate has to be money: one paisa per metre is the floor.
+MIN_RATE = CENT
+
+
+def rate_columns(request, catalog_rate, override):
+    """Decide what one order line will be billed at.
+
+    ``override`` is the rate typed on the item preview page, and is optional --
+    leave it out and the line is billed at the catalogue rate as before. The
+    returned columns are written to the ``OrderItem`` only; ``Fabric``'s
+    ``price_per_meter`` is never touched, so a price agreed with one customer
+    cannot leak into the price every other customer pays.
+
+    An agent is held to the catalogue rate, mirroring ``SetOrderPriceView``'s cap
+    on the order total: they can discount a line, but only an admin can bill
+    above catalogue.
+    """
+    if override is None or override == catalog_rate:
+        return {
+            "rate_per_meter": catalog_rate,
+            "original_rate_per_meter": catalog_rate,
+            "rate_overridden_by": None,
+            "rate_overridden_at": None,
+        }
+
+    if request.user.role == "AGENT" and override > catalog_rate:
+        raise serializers.ValidationError(
+            {
+                "rate_override": "An agent rate cannot be higher than the "
+                f"catalogue rate of {catalog_rate:,.2f}"
+            }
+        )
+
+    return {
+        "rate_per_meter": override,
+        "original_rate_per_meter": catalog_rate,
+        "rate_overridden_by": request.user,
+        "rate_overridden_at": timezone.now(),
+    }
 
 
 class SimpleCustomerSerializer(serializers.ModelSerializer):
@@ -65,6 +106,18 @@ class OrderItemSerializer(serializers.ModelSerializer):
     )
     line_total = serializers.SerializerMethodField()
     allocation_count = serializers.SerializerMethodField()
+    is_rate_overridden = serializers.BooleanField(read_only=True)
+    rate_overridden_by = serializers.CharField(
+        source="rate_overridden_by.username", read_only=True
+    )
+    #: Write-only: the rate to bill this line at instead of the catalogue one.
+    rate_override = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=MIN_RATE,
+        required=False,
+        write_only=True,
+    )
 
     class Meta:
         model = OrderItem
@@ -76,6 +129,11 @@ class OrderItemSerializer(serializers.ModelSerializer):
             "fabric_name",
             "fabric_name_display",
             "rate_per_meter",
+            "original_rate_per_meter",
+            "is_rate_overridden",
+            "rate_overridden_by",
+            "rate_overridden_at",
+            "rate_override",
             "variant_image",
             "ordered_quantity",
             "allocated_quantity",
@@ -87,6 +145,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
             "order",
             "fabric_name",
             "rate_per_meter",
+            "original_rate_per_meter",
+            "rate_overridden_by",
+            "rate_overridden_at",
             "variant_image",
             "allocated_quantity",
         )
@@ -108,11 +169,15 @@ class OrderItemSerializer(serializers.ModelSerializer):
         variant that had never been paid for.
         """
         variant = attrs.get("variant")
+        override = attrs.pop("rate_override", None)
+
         if variant is None:
             if "fabric" in attrs and self.instance is not None:
                 raise serializers.ValidationError(
                     {"variant": "A colour is required to change the fabric."}
                 )
+            if override is not None:
+                attrs.update(self._rate_attrs(override))
             return attrs
 
         if variant.fabric.is_deleted:
@@ -135,10 +200,36 @@ class OrderItemSerializer(serializers.ModelSerializer):
         # The variant is the source of truth for the fabric and the rate.
         attrs["fabric"] = variant.fabric
         attrs["fabric_name"] = variant.fabric.name
-        attrs["rate_per_meter"] = variant.fabric.price_per_meter
         attrs["variant_display_order"] = variant.display_order or ""
 
+        if override is not None:
+            attrs.update(self._rate_attrs(override, variant.fabric.price_per_meter))
+        else:
+            attrs["rate_per_meter"] = variant.fabric.price_per_meter
+
         return attrs
+
+    def _rate_attrs(self, override, catalog_rate=None):
+        """Validate a client-supplied rate for this line.
+
+        The catalogue rate comes from the colour being moved to when there is
+        one, and otherwise from the fabric the line already points at -- so a
+        quantity edit that also carries ``rate_override`` is capped against the
+        right price.
+        """
+        if catalog_rate is None:
+            fabric = self.instance.fabric if self.instance else None
+            catalog_rate = fabric.price_per_meter if fabric else None
+
+        if catalog_rate is None:
+            raise serializers.ValidationError(
+                {
+                    "rate_override": "This line's fabric is no longer in the "
+                    "catalogue, so its rate cannot be changed."
+                }
+            )
+
+        return rate_columns(self.context["request"], catalog_rate, override)
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -219,11 +310,22 @@ class OrderSerializer(serializers.ModelSerializer):
 
 
 class AddOrderItemSerializer(serializers.Serializer):
-    """Add a fabric line to a draft by scanning its QR label."""
+    """Add a fabric line to a draft by scanning its QR label.
+
+    ``rate_override`` is optional. Send it to bill this one line at a rate
+    negotiated for this customer; omit it and the catalogue rate applies.
+    """
 
     qr_code = serializers.UUIDField()
     ordered_quantity = serializers.DecimalField(
         max_digits=14, decimal_places=3, min_value=MIN_ORDER_METERS
+    )
+    rate_override = serializers.DecimalField(
+        max_digits=10,
+        decimal_places=2,
+        min_value=MIN_RATE,
+        required=False,
+        write_only=True,
     )
 
     def validate(self, attrs):
@@ -247,8 +349,12 @@ class AddOrderItemSerializer(serializers.Serializer):
         )
 
         attrs["fabric_name"] = variant.fabric.name
-        attrs["rate_per_meter"] = variant.fabric.price_per_meter
         attrs["variant_display_order"] = variant.display_order or ""
+
+        catalog_rate = variant.fabric.price_per_meter
+        attrs.update(
+            rate_columns(request, catalog_rate, attrs.pop("rate_override", None))
+        )
 
         return attrs
 

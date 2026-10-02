@@ -30,7 +30,17 @@ export interface OrderItem {
   variant_display_order: string;
   fabric_name: string;
   fabric_name_display: string;
+  /** What this line is billed at — the catalogue rate unless it was repriced. */
   rate_per_meter: string;
+  /**
+   * The catalogue rate the line was added at. `is_rate_overridden` is true when
+   * `rate_per_meter` differs from it, i.e. a rate was agreed for this one
+   * customer. The fabric's own price is never changed by that.
+   */
+  original_rate_per_meter: string | null;
+  is_rate_overridden: boolean;
+  rate_overridden_by: string | null;
+  rate_overridden_at: string | null;
   variant_image: string | null;
   ordered_quantity: string;
   allocated_quantity: string;
@@ -133,6 +143,11 @@ export type OrderRegisterResponse = Order;
 export interface AddOrderItemRequest {
   qr_code: string;
   ordered_quantity: string;
+  /**
+   * Bill this line at an agreed rate instead of the catalogue one. Only this
+   * order is affected — the fabric keeps its own price for everyone else.
+   */
+  rate_override?: string;
 }
 
 export interface UpdateOrderRequest {
@@ -147,6 +162,8 @@ export interface UpdateOrderRequest {
 export interface UpdateOrderItemRequest {
   ordered_quantity?: string;
   variant?: number | null;
+  /** Reprice this line only; see `AddOrderItemRequest.rate_override`. */
+  rate_override?: string;
 }
 
 /** Collapse duplicate lines of the same colour into the one kept. */

@@ -1896,3 +1896,367 @@ class LineIntegrityTests(OrderTestBase):
         )
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
         self.assertEqual(self.order.items.count(), 0)
+
+
+class LineRateOverrideTests(OrderTestBase):
+    """A line may be billed at a rate agreed for one customer.
+
+    The whole feature rests on one rule: the negotiated rate lands on the
+    ``OrderItem`` and nowhere else. ``Fabric.price_per_meter`` -- the price every
+    other customer pays -- must come out of every one of these tests unchanged,
+    or the "for a dedicated customer" part is meaningless.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.order = self.make_draft()
+
+    def add_line(self, order, metres, rate=None, user=None, variant=None):
+        payload = {
+            "qr_code": str((variant or self.variant).qr_code),
+            "ordered_quantity": str(metres),
+        }
+        if rate is not None:
+            payload["rate_override"] = rate
+        self.auth(user)
+        resp = self.client.post(
+            f"/api/orders/{order.pk}/add-item/", payload, format="json"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return order.items.order_by("id").last()
+
+    def reprice(self, line, rate, user=None):
+        self.auth(user)
+        return self.client.patch(
+            f"/api/orders/order-items/{line.pk}/",
+            {"rate_override": rate},
+            format="json",
+        )
+
+    # ── default behaviour is unchanged ─────────────────────────────────────
+
+    def test_line_added_without_a_rate_is_billed_at_the_catalogue(self):
+        line = self.add_line(self.order, 100)
+
+        self.assertEqual(line.rate_per_meter, Decimal("9.00"))
+        self.assertEqual(line.original_rate_per_meter, Decimal("9.00"))
+        self.assertFalse(line.is_rate_overridden)
+        self.assertIsNone(line.rate_overridden_by)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.computed_total, Decimal("900.00"))
+
+    def test_a_rate_matching_the_catalogue_is_not_an_override(self):
+        # Typing the catalogue price back in is a reset, not an override.
+        line = self.add_line(self.order, 100, rate="9.00")
+
+        self.assertFalse(line.is_rate_overridden)
+        self.assertIsNone(line.rate_overridden_by)
+        self.assertFalse(
+            OrderLog.objects.filter(action="ITEM_RATE_OVERRIDE").exists()
+        )
+
+    # ── the negotiated rate stays on this order and nowhere else ───────────
+
+    def test_agent_can_add_a_line_at_a_negotiated_rate(self):
+        line = self.add_line(self.order, 100, rate="8.25")
+
+        self.assertEqual(line.rate_per_meter, Decimal("8.25"))
+        self.assertEqual(line.original_rate_per_meter, Decimal("9.00"))
+        self.assertTrue(line.is_rate_overridden)
+        self.assertEqual(line.rate_overridden_by, self.agent_user)
+        self.assertIsNotNone(line.rate_overridden_at)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.computed_total, Decimal("825.00"))
+
+    def test_the_catalogue_price_is_never_written(self):
+        self.add_line(self.order, 100, rate="8.25")
+
+        self.fabric.refresh_from_db()
+        self.assertEqual(self.fabric.price_per_meter, Decimal("9.00"))
+
+    def test_the_rate_does_not_leak_into_the_next_order(self):
+        other_customer = Customer.objects.create(
+            name="DEF Textiles", contact="3333333333", agent=self.agent
+        )
+        other_order = self.make_draft(customer=other_customer)
+
+        self.add_line(self.order, 100, rate="8.25")
+        line = self.add_line(other_order, 100)
+
+        self.assertEqual(line.rate_per_meter, Decimal("9.00"))
+        self.assertFalse(line.is_rate_overridden)
+
+    def test_a_later_catalogue_change_does_not_reprice_the_line(self):
+        line = self.add_line(self.order, 100, rate="8.25")
+
+        self.fabric.price_per_meter = Decimal("11.00")
+        self.fabric.save(update_fields=["price_per_meter"])
+
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("8.25"))
+        self.assertEqual(line.original_rate_per_meter, Decimal("9.00"))
+        self.assertTrue(line.is_rate_overridden)
+
+    def test_the_agreed_rate_survives_being_placed(self):
+        self.add_line(self.order, 100, rate="8.25")
+
+        self.place(self.order)
+
+        self.order.refresh_from_db()
+        line = self.order.items.get()
+        self.assertEqual(line.rate_per_meter, Decimal("8.25"))
+        self.assertEqual(self.order.computed_total, Decimal("825.00"))
+
+    def test_admin_may_price_above_the_catalogue(self):
+        line = self.add_line(self.order, 100, rate="9.75", user=self.admin)
+
+        self.assertEqual(line.rate_per_meter, Decimal("9.75"))
+        self.assertTrue(line.is_rate_overridden)
+        self.assertEqual(line.rate_overridden_by, self.admin)
+        self.fabric.refresh_from_db()
+        self.assertEqual(self.fabric.price_per_meter, Decimal("9.00"))
+
+    # ── an agent may discount, never inflate ──────────────────────────────
+
+    def test_agent_cannot_price_a_line_above_the_catalogue(self):
+        self.auth()
+        resp = self.client.post(
+            f"/api/orders/{self.order.pk}/add-item/",
+            {
+                "qr_code": str(self.variant.qr_code),
+                "ordered_quantity": "100",
+                "rate_override": "9.50",
+            },
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("cannot be higher", str(resp.data))
+        self.assertEqual(self.order.items.count(), 0)
+
+    def test_agent_cannot_reprice_a_line_above_the_catalogue(self):
+        line = self.add_line(self.order, 100)
+
+        resp = self.reprice(line, "9.50")
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("9.00"))
+
+    def test_a_rate_of_zero_is_rejected(self):
+        self.auth()
+        resp = self.client.post(
+            f"/api/orders/{self.order.pk}/add-item/",
+            {
+                "qr_code": str(self.variant.qr_code),
+                "ordered_quantity": "100",
+                "rate_override": "0",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("rate_override", resp.data)
+
+    # ── repricing an existing line from the same page ──────────────────────
+
+    def test_a_line_on_the_order_can_be_repriced(self):
+        line = self.add_line(self.order, 100)
+
+        resp = self.reprice(line, "8.00")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("8.00"))
+        self.assertTrue(line.is_rate_overridden)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.computed_total, Decimal("800.00"))
+
+    def test_restoring_the_catalogue_rate_clears_the_override(self):
+        line = self.add_line(self.order, 100, rate="8.00")
+        self.assertTrue(line.is_rate_overridden)
+
+        resp = self.reprice(line, "9.00")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        line.refresh_from_db()
+        self.assertFalse(line.is_rate_overridden)
+        self.assertIsNone(line.rate_overridden_by)
+        self.assertIsNone(line.rate_overridden_at)
+        self.assertTrue(
+            OrderLog.objects.filter(
+                order=self.order, action="ITEM_RATE_OVERRIDE_CLEARED"
+            ).exists()
+        )
+
+    def test_a_reprice_alongside_a_quantity_change_takes_both(self):
+        line = self.add_line(self.order, 100)
+        self.auth()
+
+        resp = self.client.patch(
+            f"/api/orders/order-items/{line.pk}/",
+            {"ordered_quantity": "200", "rate_override": "8.00"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        line.refresh_from_db()
+        self.assertEqual(line.ordered_quantity, Decimal("200.000"))
+        self.assertEqual(line.rate_per_meter, Decimal("8.00"))
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.computed_total, Decimal("1600.00"))
+
+    def test_another_agent_cannot_reprice_the_line(self):
+        line = self.add_line(self.order, 100)
+
+        resp = self.reprice(line, "1.00", user=self.other_agent_user)
+
+        # Their queryset filters to their own orders, so the line is invisible.
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("9.00"))
+
+    def test_the_audit_columns_are_not_reachable_through_a_plain_patch(self):
+        line = self.add_line(self.order, 100, rate="8.00")
+        self.auth()
+
+        resp = self.client.patch(
+            f"/api/orders/order-items/{line.pk}/",
+            {
+                "rate_per_meter": "1.00",
+                "original_rate_per_meter": "1.00",
+                "rate_overridden_by": self.other_agent_user.pk,
+            },
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("8.00"))
+        self.assertEqual(line.original_rate_per_meter, Decimal("9.00"))
+
+    def test_a_line_whose_fabric_is_gone_cannot_be_repriced(self):
+        # Fabric is SET_NULL on the line, so a hard delete leaves a rate with
+        # nothing to cap it against. That has to read as a refusal, not a 500.
+        line = self.add_line(self.order, 100)
+        self.fabric.delete()
+        self.auth()
+
+        resp = self.reprice(line, "8.00")
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.data)
+        self.assertIn("no longer in the catalogue", str(resp.data))
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("9.00"))
+
+    def test_a_reprice_is_audited(self):
+        self.add_line(self.order, 100, rate="8.00")
+
+        log = OrderLog.objects.filter(
+            order=self.order, action="ITEM_RATE_OVERRIDE"
+        ).first()
+        self.assertIsNotNone(log)
+        self.assertEqual(log.details["catalog_rate"], "9.00")
+        self.assertEqual(log.details["rate_per_meter"], "8.00")
+        self.assertEqual(log.performed_by, self.agent_user)
+
+    def test_adding_a_line_at_a_negotiated_rate_is_audited(self):
+        self.add_line(self.order, 100, rate="8.00")
+
+        self.assertEqual(
+            OrderLog.objects.filter(
+                order=self.order, action="ITEM_RATE_OVERRIDE"
+            ).count(),
+            1,
+        )
+
+    # ── the other edit paths must not lose the rate ───────────────────────
+
+    def test_a_cancelled_edit_restores_the_original_rate(self):
+        self.add_line(self.order, 100, rate="8.00")
+        line = self.order.items.get()
+        self.place(self.order)
+        self.order.refresh_from_db()
+        self.auth()
+        self.client.post(f"/api/orders/{self.order.pk}/start-edit/", {}, format="json")
+        self.order.refresh_from_db()
+        self.reprice(line, "5.00")
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("5.00"))
+
+        self.client.post(f"/api/orders/{self.order.pk}/cancel-edit/", {}, format="json")
+
+        self.order.refresh_from_db()
+        restored = self.order.items.get()
+        self.assertEqual(restored.rate_per_meter, Decimal("8.00"))
+        self.assertEqual(restored.original_rate_per_meter, Decimal("9.00"))
+        self.assertEqual(restored.rate_overridden_by, self.agent_user)
+        self.assertTrue(restored.is_rate_overridden)
+
+    def test_saving_an_edit_keeps_the_agreed_rate(self):
+        self.add_line(self.order, 100, rate="8.00")
+        line = self.order.items.get()
+        self.place(self.order)
+        self.order.refresh_from_db()
+        self.auth()
+        self.client.post(f"/api/orders/{self.order.pk}/start-edit/", {}, format="json")
+        self.reprice(line, "5.00")
+
+        resp = self.client.post(
+            f"/api/orders/{self.order.pk}/save-edit/", {}, format="json"
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("5.00"))
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.computed_total, Decimal("500.00"))
+
+    def test_lines_priced_differently_cannot_be_merged(self):
+        # Merging keeps the keeper's rate, so folding an off-rate line into a
+        # catalogue one would silently reprice its metres.
+        keeper = self.add_line(self.order, 100)
+        drop = self.add_line(self.order, 100, rate="8.00")
+        self.auth()
+
+        resp = self.client.post(
+            f"/api/orders/{self.order.pk}/merge-items/",
+            {"keep_item_id": keeper.pk, "drop_item_ids": [drop.pk]},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("different rates", str(resp.data))
+        self.assertEqual(self.order.items.count(), 2)
+
+    def test_lines_at_the_same_rate_still_merge(self):
+        keeper = self.add_line(self.order, 100)
+        drop = self.add_line(self.order, 100)
+        self.auth()
+
+        resp = self.client.post(
+            f"/api/orders/{self.order.pk}/merge-items/",
+            {"keep_item_id": keeper.pk, "drop_item_ids": [drop.pk]},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.items.get().ordered_quantity, Decimal("200.000"))
+
+    # ── the line reports what it was repriced from ─────────────────────────
+
+    def test_the_line_serialises_the_override(self):
+        line = self.add_line(self.order, 100, rate="8.00")
+
+        self.auth()
+        resp = self.client.get(f"/api/orders/{self.order.pk}/")
+
+        payload = resp.data["items"][0]
+        self.assertEqual(payload["rate_per_meter"], "8.00")
+        self.assertEqual(payload["original_rate_per_meter"], "9.00")
+        self.assertTrue(payload["is_rate_overridden"])
+        self.assertEqual(payload["rate_overridden_by"], "agent1")
+        self.assertIsNotNone(payload["rate_overridden_at"])
+        self.assertEqual(payload["line_total"], "800.00")
+        self.assertNotIn("rate_override", payload)
+
