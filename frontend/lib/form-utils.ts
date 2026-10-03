@@ -50,6 +50,9 @@ export function objectToFormData(
  *    rewrites a label when the key is present. Omitting it keeps the old label.
  *  - `remove_image` is the only way to clear a photo; an absent `image` simply
  *    means "leave the existing one alone".
+ *
+ * A colour flagged `is_roll_tracked` is the third case: its metres belong to
+ * physical rolls, so no `stock_meters` is sent for it at all.
  */
 export function fabricToFormData(data: Record<string, any>): FormData {
   const formData = new FormData();
@@ -65,6 +68,7 @@ export function fabricToFormData(data: Record<string, any>): FormData {
       display_order?: string | null;
       stock_meters?: string | number | null;
       remove_image?: boolean;
+      is_roll_tracked?: boolean;
     }>
   ).forEach((variant, index: number) => {
     if (variant.id !== undefined && variant.id !== null) {
@@ -85,8 +89,13 @@ export function fabricToFormData(data: Record<string, any>): FormData {
         variant.display_order ?? "",
       );
     }
-    // Stock is sent for every colour, existing or new: the API applies it in
-    // both cases and records a change on the roll's stock cursor.
+    // A colour tracked by physical rolls owns its own total: that figure is the
+    // roll sum, and only receiving, cutting or adjusting a roll may move it.
+    // Sending it here would either be refused or, worse, silently contradict the
+    // rolls, so it is left out.
+    if (variant.is_roll_tracked) return;
+    // Stock is sent for every other colour, existing or new: the API applies it
+    // and records a change on the colour's stock cursor.
     formData.append(
       `variants[${index}]stock_meters`,
       String(variant.stock_meters ?? 0),

@@ -199,7 +199,7 @@ class AgentItemsView(APIView):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 class AgentItemDetailView(APIView):
-    permission_classes = [IsAdmin()]
+    permission_classes = [IsAdmin]
 
     def delete(self, request, agent_id, variant_id):
         agent = get_object_or_404(Agent, id=agent_id)
@@ -211,7 +211,7 @@ class AgentItemDetailView(APIView):
 
 
 class AgentItemTransferView(APIView):
-    permission_classes = [IsAdmin()]
+    permission_classes = [IsAdmin]
 
     def post(self, request, agent_id):
         source_agent = get_object_or_404(Agent, id=agent_id)
@@ -267,7 +267,7 @@ class AgentItemTransferView(APIView):
 
 
 class AgentItemCopyView(APIView):
-    permission_classes = [IsAdmin()]
+    permission_classes = [IsAdmin]
 
     def post(self, request, agent_id):
         source_agent = get_object_or_404(Agent, id=agent_id)

@@ -1,13 +1,20 @@
 import type {
+    BulkReceiveRollsResponse,
     CustomerRequirementResponse,
     FabricAllResponse,
     FabricQRResponse,
     FabricRequest,
     FabricResponse,
+    FabricRoll,
     FabricStockEntry,
     FabricVariant,
     OutstandingDemandRow,
+    ReceiveRollResponse,
+    RollCutPlan,
+    RollHistoryResponse,
+    RollSummary,
     VariantAllResponse,
+    VariantRollsResponse,
 } from "@/types/item";
 import { api } from "./axios";
 
@@ -82,6 +89,89 @@ export const fabricApi = {
     setVariantStock(variantId: number, stockMeters: string): Promise<FabricVariant> {
         return api
             .patch<FabricVariant>(`/api/items/variants/${variantId}/`, { stock_meters: stockMeters })
+            .then((r) => r.data);
+    },
+};
+
+/**
+ * Physical rolls.
+ *
+ * A colour tracked by rolls has its stock figure owned by these calls: receiving
+ * a roll, correcting one, or packing against it is the only way the warehouse
+ * total moves. The backend refuses a plain stock edit for such a colour, so the
+ * UI never has to guess whether typing a number is safe.
+ */
+export const rollApi = {
+    /** Every roll, optionally narrowed to one colour or to active rolls. */
+    getAll(variantId?: number, activeOnly = false): Promise<FabricRoll[]> {
+        const params: Record<string, string> = {};
+        if (variantId) params.variant = String(variantId);
+        if (activeOnly) params.active = "1";
+        return api.get<FabricRoll[]>("/api/items/rolls/", { params }).then((r) => r.data);
+    },
+
+    /** One colour's rolls plus its roll totals, for the inventory panel. */
+    getForVariant(variantId: number): Promise<VariantRollsResponse> {
+        return api
+            .get<VariantRollsResponse>(`/api/items/variants/${variantId}/rolls/`)
+            .then((r) => r.data);
+    },
+
+    /** Receive one roll onto a colour. */
+    receive(
+        variantId: number,
+        data: { meters: string; roll_number?: string; note?: string }
+    ): Promise<ReceiveRollResponse> {
+        return api
+            .post<ReceiveRollResponse>(`/api/items/variants/${variantId}/rolls/`, data)
+            .then((r) => r.data);
+    },
+
+    /** Receive a factory delivery as several rolls, all or nothing. */
+    bulkReceive(
+        variantId: number,
+        rolls: { meters: string; note?: string }[]
+    ): Promise<BulkReceiveRollsResponse> {
+        return api
+            .post<BulkReceiveRollsResponse>(`/api/items/variants/${variantId}/rolls/bulk-add/`, {
+                rolls,
+            })
+            .then((r) => r.data);
+    },
+
+    /** Correct a roll's metres. Negative takes cloth off, positive adds it. */
+    adjust(rollId: number, meters: string, reason?: string): Promise<FabricRoll> {
+        return api
+            .post<FabricRoll>(`/api/items/rolls/${rollId}/adjust/`, {
+                meters,
+                reason,
+            })
+            .then((r) => r.data);
+    },
+
+    /** What was cut from a roll, and what was handed back. */
+    history(rollId: number): Promise<RollHistoryResponse> {
+        return api.get<RollHistoryResponse>(`/api/items/rolls/${rollId}/history/`).then((r) => r.data);
+    },
+
+    /** Which rolls packing this many metres would come off, by best fit. */
+    preview(variantId: number, meters: string): Promise<RollCutPlan> {
+        return api
+            .post<RollCutPlan>(`/api/items/variants/${variantId}/rolls/preview/`, { meters })
+            .then((r) => r.data);
+    },
+
+    /** Delete a roll that holds nothing and has never been cut from. */
+    remove(rollId: number): Promise<void> {
+        return api.delete(`/api/items/rolls/${rollId}/`).then((r) => r.data);
+    },
+
+    /** Put a colour's total back in step with its rolls after a manual edit. */
+    syncStock(variantId: number): Promise<{ stock_meters: string } & RollSummary> {
+        return api
+            .post<{ stock_meters: string } & RollSummary>(
+                `/api/items/variants/${variantId}/rolls/sync-stock/`
+            )
             .then((r) => r.data);
     },
 };

@@ -1,5 +1,6 @@
 import uuid
 from datetime import timedelta
+from decimal import Decimal
 from io import BytesIO
 
 from django.conf import settings
@@ -9,12 +10,35 @@ from django.utils import timezone
 from PIL import Image
 from rest_framework import serializers
 
-from .models import Fabric, FabricVariant
+from .models import Fabric, FabricRoll, FabricVariant
+from .rolls import (
+    MAX_METERS,
+    MIN_ROLL_METERS,
+    RollError,
+    clean_meters,
+    is_roll_tracked,
+    variant_roll_info,
+)
 from .services import sync_out_of_stock, touch_catalog
+
+ZERO = Decimal("0")
+
+#: Said wherever a colour's metres are owned by its rolls, so the admin is sent
+#: to the rolls screen instead of guessing why the field will not save.
+ROLL_TRACKED_MESSAGE = (
+    "This colour's stock is tracked as physical rolls. Add or adjust rolls "
+    "instead of setting the metre total directly."
+)
 
 
 class FabricVariantSerializer(serializers.ModelSerializer):
     """One colour/finish of a fabric: its own QR label, image and metre stock."""
+
+    #: True once the colour has rolls, so clients know the metre total is their
+    #: sum rather than a figure somebody typed.
+    is_roll_tracked = serializers.SerializerMethodField()
+    roll_count = serializers.SerializerMethodField()
+    roll_stock_meters = serializers.SerializerMethodField()
 
     class Meta:
         model = FabricVariant
@@ -25,8 +49,20 @@ class FabricVariantSerializer(serializers.ModelSerializer):
             "display_order",
             "stock_meters",
             "stock_updated_at",
+            "is_roll_tracked",
+            "roll_count",
+            "roll_stock_meters",
         ]
         read_only_fields = ["qr_code", "stock_updated_at"]
+
+    def get_is_roll_tracked(self, obj):
+        return variant_roll_info(obj)[0]
+
+    def get_roll_count(self, obj):
+        return variant_roll_info(obj)[1]
+
+    def get_roll_stock_meters(self, obj):
+        return str(variant_roll_info(obj)[2])
 
     def to_representation(self, instance):
         data = super().to_representation(instance)
@@ -34,6 +70,14 @@ class FabricVariantSerializer(serializers.ModelSerializer):
         if data.get("image") and request:
             data["image"] = request.build_absolute_uri(data["image"])
         return data
+
+    def validate_stock_meters(self, value):
+        # The one figure that must never be written directly: on a roll-tracked
+        # colour it *is* the sum of the rolls, so editing it here would leave the
+        # two disagreeing with nothing to say which is right.
+        if self.instance is not None and is_roll_tracked(self.instance):
+            raise serializers.ValidationError(ROLL_TRACKED_MESSAGE)
+        return value
 
     def create(self, validated_data):
         variant = FabricVariant.objects.create(**validated_data)
@@ -212,7 +256,12 @@ class CreateFabricSerializer(serializers.Serializer):
 
                 if "stock_meters" in variant_data:
                     new_stock = variant_data["stock_meters"] or 0
-                    if variant.stock_meters != new_stock:
+                    if is_roll_tracked(variant):
+                        # The metre total is the sum of this colour's rolls now,
+                        # so the catalogue form must not overwrite it. The row
+                        # is saved unchanged instead of failing the whole save.
+                        pass
+                    elif variant.stock_meters != new_stock:
                         variant.stock_meters = new_stock
                         variant.stock_updated_at = timezone.now()
 
@@ -235,6 +284,145 @@ class CreateFabricSerializer(serializers.Serializer):
 
 
 UpdateFabricSerializer = CreateFabricSerializer
+
+
+# --------------------------------------------------------------------------- #
+# Physical rolls
+# --------------------------------------------------------------------------- #
+
+
+class FabricRollSerializer(serializers.ModelSerializer):
+    """One physical roll, as the warehouse sees it."""
+
+    consumed_meters = serializers.SerializerMethodField()
+    is_exhausted = serializers.BooleanField(read_only=True)
+    fabric_name = serializers.CharField(source="variant.fabric.name", read_only=True)
+    display_order = serializers.CharField(
+        source="variant.display_order", read_only=True
+    )
+
+    class Meta:
+        model = FabricRoll
+        fields = [
+            "id",
+            "variant",
+            "roll_number",
+            "note",
+            "original_meters",
+            "remaining_meters",
+            "consumed_meters",
+            "is_active",
+            "is_exhausted",
+            "fabric_name",
+            "display_order",
+            "created_at",
+            "updated_at",
+        ]
+        read_only_fields = [
+            "variant",
+            "original_meters",
+            "remaining_meters",
+            "consumed_meters",
+            "is_active",
+            "is_exhausted",
+            "created_at",
+            "updated_at",
+        ]
+
+    def get_consumed_meters(self, obj):
+        return str(obj.consumed_meters)
+
+
+class FabricRollCreateSerializer(serializers.Serializer):
+    """Receive one roll onto a colour, adding its metres to the warehouse."""
+
+    meters = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        help_text="Roll length in metres, e.g. 250.000",
+    )
+    roll_number = serializers.CharField(
+        max_length=32,
+        required=False,
+        allow_blank=True,
+        help_text="Optional label. Generated as R-000001 when left blank.",
+    )
+    note = serializers.CharField(max_length=100, required=False, allow_blank=True)
+
+    def validate_meters(self, value):
+        if value < MIN_ROLL_METERS:
+            raise serializers.ValidationError(
+                f"A roll must hold at least {MIN_ROLL_METERS.normalize()} m."
+            )
+        if value > MAX_METERS:
+            raise serializers.ValidationError(
+                f"A roll cannot hold more than {MAX_METERS:,} m."
+            )
+        return value
+
+
+class BulkRollCreateSerializer(serializers.Serializer):
+    """Receive a factory delivery as several rolls in one go."""
+
+    rolls = serializers.ListField(
+        child=serializers.DictField(), allow_empty=False, min_length=1
+    )
+
+    def validate_rolls(self, rolls):
+        cleaned = []
+        for index, entry in enumerate(rolls, start=1):
+            raw = entry.get("meters", entry.get("original_meters"))
+            try:
+                metres = clean_meters(raw, field=f"rolls[{index - 1}].meters")
+            except RollError as exc:
+                raise serializers.ValidationError({"rolls": f"Roll {index}: {exc}"})
+            note = str(entry.get("note") or "").strip()[:100]
+            cleaned.append({"meters": metres, "note": note})
+        return cleaned
+
+
+class RollAdjustSerializer(serializers.Serializer):
+    """Correct a roll's metres after the fact, in either direction."""
+
+    meters = serializers.DecimalField(
+        max_digits=14,
+        decimal_places=3,
+        help_text="Metres to add (positive) or remove (negative).",
+    )
+    reason = serializers.CharField(required=False, allow_blank=True, max_length=200)
+
+    def validate_meters(self, value):
+        if value == ZERO:
+            raise serializers.ValidationError("Enter a non-zero figure to adjust by.")
+        if abs(value) > MAX_METERS:
+            raise serializers.ValidationError(
+                f"A roll cannot hold more than {MAX_METERS:,} m."
+            )
+        return value
+
+
+class RollHistoryEntrySerializer(serializers.Serializer):
+    """One line of a roll's consumption history, for the warehouse."""
+
+    id = serializers.IntegerField()
+    roll_number = serializers.CharField(source="roll.roll_number", read_only=True)
+    metres = serializers.DecimalField(max_digits=14, decimal_places=3)
+    is_reversed = serializers.BooleanField()
+    created_at = serializers.DateTimeField()
+    round = serializers.IntegerField(source="allocation.round_id", allow_null=True)
+    round_status = serializers.CharField(
+        source="allocation.round.status", allow_null=True
+    )
+    order = serializers.IntegerField(
+        source="allocation.order_item.order_id", allow_null=True
+    )
+    order_status = serializers.CharField(
+        source="allocation.order_item.order.status", allow_null=True
+    )
+    customer = serializers.CharField(
+        source="allocation.order_item.order.customer.name", allow_null=True
+    )
+    order_item = serializers.IntegerField(source="allocation.order_item_id")
 
 
 class CustomerRequirementSerializer(serializers.Serializer):

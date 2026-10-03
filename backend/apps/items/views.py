@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db.models import F, Sum
+from django.db.models import F, Sum, ProtectedError
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiTypes, extend_schema
 from rest_framework import status
@@ -14,14 +14,32 @@ from rest_framework.viewsets import ModelViewSet
 
 from apps.accounts.permissions import IsAdmin, check_admin_pin
 from apps.agents.models import Agent, AgentItem
-from apps.orders.models import OrderItem
+from apps.orders.models import OrderItem, RollAllocation
 
-from .models import Fabric, FabricVariant
+from .models import Fabric, FabricRoll, FabricVariant
+from .rolls import (
+    RollError,
+    adjust_roll,
+    clean_meters,
+    is_roll_tracked,
+    preview_consumption,
+    receive_roll,
+    receive_rolls,
+    roll_payload,
+    sync_variant_stock,
+    variant_roll_info,
+)
 from .serializers import (
+    ROLL_TRACKED_MESSAGE,
+    BulkRollCreateSerializer,
     CreateFabricSerializer,
     CustomerRequirementSerializer,
+    FabricRollCreateSerializer,
+    FabricRollSerializer,
     FabricSerializer,
     FabricVariantSerializer,
+    RollAdjustSerializer,
+    RollHistoryEntrySerializer,
     UpdateFabricSerializer,
 )
 from .services import delete_fabric_keep_history
@@ -62,6 +80,16 @@ def _total_stock(qs):
     return FabricVariant.objects.filter(fabric__in=qs).aggregate(
         total=Sum("stock_meters")
     )["total"] or ZERO
+
+
+def _roll_fields(variant):
+    """``(is_roll_tracked, roll_count, roll_stock_meters)`` for a variant row."""
+    tracked, count, stock = variant_roll_info(variant)
+    return (
+        tracked,
+        count,
+        str(stock),
+    )
 
 
 def _sync_fabrics_payload(request, qs, page, page_size):
@@ -426,23 +454,259 @@ class FabricViewSet(ModelViewSet):
         )
 
 
-class FabricVariantViewSet(ModelViewSet):
-    serializer_class = FabricVariantSerializer
+class FabricRollViewSet(ModelViewSet):
+    """The physical rolls of a colour, and their warehouse history.
+
+    Reading is open to any signed-in user; receiving, adjusting and removing
+    cloth is admin-only, like every other stock movement in this project.
+    """
+
+    serializer_class = FabricRollSerializer
+    lookup_value_regex = "[0-9]+"
 
     def get_queryset(self):
-        return FabricVariant.objects.select_related("fabric").filter(
-            fabric__is_deleted=False
-        )
+        qs = FabricRoll.objects.select_related("variant__fabric").all()
+        variant_id = self.request.query_params.get("variant")
+        if variant_id:
+            qs = qs.filter(variant_id=variant_id)
+        if self.request.query_params.get("active") in ("1", "true", "True"):
+            qs = qs.filter(is_active=True)
+        return qs
 
     def get_permissions(self):
         if self.request.method in ["POST", "PUT", "PATCH", "DELETE"]:
             return [IsAdmin()]
         return [IsAuthenticated()]
 
+    def destroy(self, request, *args, **kwargs):
+        """Only a roll nobody has cut from, and that holds nothing, may go.
+
+        Cloth that has been packed is part of the warehouse's record
+        (``RollAllocation`` protects it), and cloth still on the shelf belongs to
+        the colour's stock, so it has to be handed back first.
+        """
+        roll = self.get_object()
+        if roll.remaining_meters > ZERO:
+            return Response(
+                {
+                    "error": f"{roll.roll_number} still holds "
+                    f"{roll.remaining_meters.normalize()} m. Take that cloth off "
+                    f"the roll before deleting it."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            roll.delete()
+        except ProtectedError:
+            return Response(
+                {
+                    "error": f"{roll.roll_number} has been packed. A roll keeps "
+                    f"its record once cloth has been cut from it, so cancel the "
+                    f"packing round instead of deleting the roll."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @action(detail=True, methods=["get"], url_path="history")
+    def history(self, request, pk=None):
+        """Everything that has been cut from this roll, and what was given back."""
+        roll = self.get_object()
+        entries = roll.roll_allocations.select_related(
+            "allocation__order_item__order__customer", "allocation__round"
+        ).order_by("id")
+        return Response(
+            {
+                "roll": FabricRollSerializer(roll).data,
+                "entries": RollHistoryEntrySerializer(entries, many=True).data,
+            }
+        )
+
+    @action(detail=True, methods=["post"], url_path="adjust")
+    def adjust(self, request, pk=None):
+        """Correct a roll's metres, moving the colour's stock with it."""
+        roll = self.get_object()
+        serializer = RollAdjustSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            adjust_roll(roll, serializer.validated_data["meters"])
+        except RollError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(FabricRollSerializer(roll).data)
+
+
+class FabricVariantViewSet(ModelViewSet):
+    serializer_class = FabricVariantSerializer
+
+    def get_queryset(self):
+        return FabricVariant.objects.select_related("fabric").prefetch_related(
+            "rolls"
+        ).filter(fabric__is_deleted=False)
+
+    def get_permissions(self):
+        if self.request.method in ["POST", "PUT", "PATCH", "DELETE"]:
+            return [IsAdmin()]
+        return [IsAuthenticated()]
+
+    def destroy(self, request, *args, **kwargs):
+        """Refuse to drop a colour that still has cloth on its rolls.
+
+        Deleting the colour would take the rolls with it and the metres with
+        those, so the stock would quietly disappear. A colour whose rolls are all
+        used up but whose cloth has been packed is refused too: those rolls are
+        the warehouse's record of what it sent out, and ``RollAllocation``
+        protects them.
+        """
+        variant = self.get_object()
+        if variant.rolls.filter(is_active=True, remaining_meters__gt=0).exists():
+            return Response(
+                {"error": ROLL_TRACKED_MESSAGE},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if RollAllocation.objects.filter(roll__variant=variant).exists():
+            return Response(
+                {
+                    "error": f"{variant.fabric.name} ({variant.display_order or 'unlabelled'}) "
+                    f"has packed cloth recorded against its rolls. Keep the colour so "
+                    f"the warehouse history stays intact."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        try:
+            variant.delete()
+        except ProtectedError:
+            return Response(
+                {
+                    "error": f"{variant.fabric.name} has packed cloth recorded "
+                    f"against its rolls, so it cannot be deleted."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+    @extend_schema(
+        methods=["GET", "POST"],
+        summary="Physical rolls of one colour, and receive a new one",
+        request=FabricRollCreateSerializer,
+        responses={201: FabricRollSerializer},
+    )
+    @action(detail=True, methods=["get", "post"], url_path="rolls")
+    def rolls(self, request, pk=None):
+        variant = self.get_object()
+
+        if request.method == "GET":
+            rows = list(variant.rolls.all())
+            return Response(
+                {
+                    "variant": variant.pk,
+                    "fabric": variant.fabric.name,
+                    "display_order": variant.display_order,
+                    # The roll's label prints a value, and the fabric's price is
+                    # where that value comes from -- the roll stores metres only.
+                    "price_per_meter": str(variant.fabric.price_per_meter),
+                    "stock_meters": str(variant.stock_meters),
+                    **roll_payload(variant),
+                    "rolls": FabricRollSerializer(rows, many=True).data,
+                }
+            )
+
+        serializer = FabricRollCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            roll = receive_roll(
+                variant,
+                serializer.validated_data["meters"],
+                roll_number=serializer.validated_data.get("roll_number"),
+                note=serializer.validated_data.get("note", ""),
+                created_by=request.user,
+            )
+        except RollError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        variant.refresh_from_db()
+        return Response(
+            {
+                "roll": FabricRollSerializer(roll).data,
+                "stock_meters": str(variant.stock_meters),
+                **roll_payload(variant),
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @extend_schema(
+        methods=["POST"],
+        summary="Receive a factory delivery as several rolls at once",
+        request=BulkRollCreateSerializer,
+    )
+    @action(detail=True, methods=["post"], url_path="rolls/bulk-add")
+    def rolls_bulk_add(self, request, pk=None):
+        variant = self.get_object()
+        serializer = BulkRollCreateSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        try:
+            created, total, variant = receive_rolls(
+                variant,
+                serializer.validated_data["rolls"],
+                created_by=request.user,
+            )
+        except RollError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response(
+            {
+                "created": len(created),
+                "total_meters": str(total),
+                "stock_meters": str(variant.stock_meters),
+                **roll_payload(variant),
+                "rolls": FabricRollSerializer(created, many=True).data,
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @extend_schema(
+        methods=["GET", "POST"],
+        summary="Which rolls a packing of this many metres would come off (best fit)",
+    )
+    @action(detail=True, methods=["get", "post"], url_path="rolls/preview")
+    def rolls_preview(self, request, pk=None):
+        variant = self.get_object()
+        raw = (
+            request.data.get("meters")
+            if request.method == "POST"
+            else request.query_params.get("meters")
+        )
+        try:
+            metres = clean_meters(raw, field="meters")
+        except RollError as exc:
+            return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+        return Response(preview_consumption(variant, metres))
+
+    @extend_schema(
+        methods=["POST"],
+        summary="Put the colour's metre total back in step with its rolls",
+    )
+    @action(detail=True, methods=["post"], url_path="rolls/sync-stock")
+    def rolls_sync_stock(self, request, pk=None):
+        """Repair the invariant after somebody edited metres outside the rolls."""
+        variant = self.get_object()
+        if not is_roll_tracked(variant):
+            return Response(
+                {"error": "This colour has no physical rolls."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        sync_variant_stock(variant, force=True)
+        return Response(
+            {
+                "stock_meters": str(variant.stock_meters),
+                **roll_payload(variant),
+            }
+        )
+
     @action(detail=False, methods=["get"], url_path="all")
     def get_all_variants(self, request):
         variants = (
             FabricVariant.objects.select_related("fabric")
+            .prefetch_related("rolls")
             .filter(fabric__is_deleted=False)
             .order_by("fabric__name", "display_order")
         )
@@ -463,6 +727,12 @@ class FabricVariantViewSet(ModelViewSet):
                     ),
                     "stock_meters": str(variant.stock_meters),
                     "stock_updated_at": variant.stock_updated_at.isoformat(),
+                    **dict(
+                        zip(
+                            ("is_roll_tracked", "roll_count", "roll_stock_meters"),
+                            _roll_fields(variant),
+                        )
+                    ),
                 }
                 for variant in variants
             ]

@@ -5,7 +5,7 @@ from django.db import models
 
 from apps.agents.models import Agent
 from apps.customers.models import Customer
-from apps.items.models import Fabric, FabricVariant
+from apps.items.models import Fabric, FabricRoll, FabricVariant
 from transports.models import Transport
 
 User = get_user_model()
@@ -322,6 +322,47 @@ class Allocation(models.Model):
 
     def __str__(self):
         return f"{self.metres}m -> {self.order_item_id}"
+
+
+class RollAllocation(models.Model):
+    """Which physical roll a packing allocation's metres were cut from.
+
+    :class:`Allocation` records *that* cloth moved; this records *which roll* it
+    came off, one row per roll the metres spanned. Without it, cancelling a round
+    could only give the metres back as a total, and putting them on an arbitrary
+    roll would falsify the warehouse's book-keeping -- the roll the cloth left
+    would stay short forever while a roll nobody touched grew.
+
+    Rows are kept after a round is cancelled and marked ``is_reversed``, so the
+    history of what was cut and given back survives while the metres cannot be
+    returned twice.
+    """
+
+    allocation = models.ForeignKey(
+        Allocation, related_name="roll_allocations", on_delete=models.CASCADE
+    )
+    #: PROTECT: a roll that has been cut from is part of the warehouse's record
+    #: and cannot be deleted out from under that record.
+    roll = models.ForeignKey(
+        FabricRoll, related_name="roll_allocations", on_delete=models.PROTECT
+    )
+    metres = models.DecimalField(max_digits=14, decimal_places=3)
+    #: Which roll of the allocation this was, i.e. the order they were cut.
+    sequence = models.PositiveSmallIntegerField(default=1)
+    is_reversed = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["allocation_id", "sequence", "id"]
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(metres__gt=Decimal("0")),
+                name="rollallocation_metres_positive",
+            )
+        ]
+
+    def __str__(self):
+        return f"{self.metres}m off {self.roll_id} (allocation {self.allocation_id})"
 
 
 class UserViewedOrder(models.Model):

@@ -22,6 +22,7 @@ from django.db.models import F, Sum
 from django.utils import timezone
 
 from apps.items.models import Fabric, FabricVariant
+from apps.items.rolls import return_metres_for_lines as return_metres_to_rolls
 from apps.items.services import sync_out_of_stock
 
 ZERO = Decimal("0")
@@ -106,7 +107,13 @@ def stock_movement_for_lines(lines, direction="consume"):
     (cloth comes back, e.g. deleting an order that was never dispatched).
     Performs the update and returns the ``{variant_id: metres}`` map it applied,
     which is empty when none of the lines had been allocated.
+
+    On the way back, cloth from a colour with physical rolls is credited to the
+    exact rolls it was cut from, found through each line's allocation records.
+    Cloth packed before rolls existed has no records and simply goes back on the
+    warehouse total.
     """
+    lines = list(lines)
     totals = allocated_totals_by_variant(lines)
     if not totals:
         return {}
@@ -115,6 +122,7 @@ def stock_movement_for_lines(lines, direction="consume"):
         consume_for_allocation(totals)
     elif direction == "return":
         return_to_stock(totals)
+        return_metres_to_rolls(lines)
     else:
         raise ValueError(f"Unknown stock direction: {direction!r}")
 

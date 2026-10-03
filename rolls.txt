@@ -1,0 +1,2 @@
+Found 45 test(s).
+Type 'yes' if you would like to try deleting the test database 'test_postgres', or 'no' to cancel: 

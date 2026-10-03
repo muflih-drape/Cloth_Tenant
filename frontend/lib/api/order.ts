@@ -11,6 +11,7 @@ import type {
   PackingQueue,
   PackingRoundSummary,
   PackLineResponse,
+  PackLineRollOverride,
   PlaceOrderResponse,
   PlanOverrideEntry,
   UpdateOrderItemRequest,
@@ -345,16 +346,59 @@ export const packingApi = {
    * and confirms it through the same engine the board uses: same stock rules,
    * same Allocation row, same ALLOCATION_MADE log entry, and a round that can
    * still be cancelled if the admin changes their mind.
+   *
+   * For a colour tracked by physical rolls the server refuses this without a
+   * `rolls` breakdown rather than guessing which cloth to cut -- `scanRoll` is the
+   * path there, since the roll's label already says which roll it is.
    */
   packLine(
     orderId: number,
     itemId: number,
     metres: string,
+    rolls?: PackLineRollOverride[],
   ): Promise<PackLineResponse> {
     return api
       .post<PackLineResponse>(`/api/orders/${orderId}/items/${itemId}/pack/`, {
         metres,
+        // Omitted entirely for a colour with no rolls, whose stock is one figure.
+        ...(rolls && rolls.length > 0 ? { rolls } : {}),
       })
+      .then((r) => r.data);
+  },
+
+  /**
+   * Pack one order line by scanning a roll's label, for a colour whose metres
+   * live on physical rolls.
+   *
+   * `roll` is the primary key encoded in that label, so the admin never picks a
+   * roll from a list: they pick up the roll and scan it. The whole roll is cut for
+   * the line, because rolls are not split at the warehouse, and the server
+   * refuses a roll belonging to another colour or one that is already used up.
+   */
+  scanRoll(
+    orderId: number,
+    itemId: number,
+    roll: number,
+  ): Promise<PackLineResponse> {
+    return api
+      .post<PackLineResponse>(
+        `/api/orders/${orderId}/items/${itemId}/pack/scan-roll/`,
+        { roll },
+      )
+      .then((r) => r.data);
+  },
+
+  /**
+   * Reverse the most recent scan on one line, putting the metres back on the very
+   * roll they came off. Only scans are undone, so a line packed by hand keeps its
+   * pack. Each scan is its own round, so this reverses exactly one of them.
+   */
+  undoScan(orderId: number, itemId: number): Promise<PackLineResponse> {
+    return api
+      .post<PackLineResponse>(
+        `/api/orders/${orderId}/items/${itemId}/pack/undo-scan/`,
+        {},
+      )
       .then((r) => r.data);
   },
 };

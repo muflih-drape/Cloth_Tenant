@@ -276,7 +276,9 @@ frontend/
 │   │   │   ├── new/page.tsx (154)           /admin/items/new — 2-step wizard
 │   │   │   │   + addColor/colorCard/colorList/commonDetails(+Badge)/cropModal
 │   │   │   ├── edit/[id]/page.tsx (433)     /admin/items/edit/:id
-│   │   │   │   + editVariantRow.tsx
+│   │   │   │   + editVariantRow.tsx        (read-only stock + roll badge when roll-tracked)
+│   │   │   │   + components/items/physicalRollsPanel.tsx  ★ rolls, adjust, history per colour
+│   │   │   │   + components/items/receiveRollsDialog.tsx ★ one-roll or atomic bulk receive
 │   │   │   └── ordered/[id]/page.tsx (207)  /admin/items/ordered/:id — demand by customer
 │   │   ├── packing/
 │   │   │   ├── page.tsx (157)               /admin/packing — variant picker
@@ -578,6 +580,25 @@ unpinned → (1, 0,               -sold[cid],  first_order, cid)  # biggest buye
 
 `OPEN_ORDER_STATUSES` here is `("DRAFT","PENDING","EDITED","PACKED")` — deliberately **wider** than the packing constant, because these orders still hold cloth references, so the fabric must never be purged (`:21-23`).
 
+#### `apps/items/rolls.py` ★ the physical-roll service
+
+The one place that may change a tracked colour's metre total. Every public function
+validates decimals, takes `select_for_update` on the variant (and the rolls it will
+touch), and moves `FabricVariant.stock_meters` in the same transaction.
+
+| Function | Purpose |
+|---|---|
+| `roll_summary(variant)` / `variant_roll_info(variant)` | Counts and totals for the roll UI; a variant with no rolls reports `is_roll_tracked=False` and its plain stock |
+| `receive_roll(variant, meters, note, roll_number)` / `receive_rolls(...)` | One roll or an **atomic** bulk delivery — a bad figure halfway down leaves stock untouched |
+| `adjust_roll(roll, delta, note)` | Signed correction to one roll (negative allowed, down to zero remaining) |
+| `preview_consumption(variant, metres)` | Which rolls a cut would come off, oldest first, without changing anything |
+| `consume_for_allocation(allocation)` | The packing write path: take metres off rolls FIFO, recording one `RollAllocation` per roll touched |
+| `return_metres_for_allocations(...)` / `return_metres_for_lines(...)` | **Exact** reversal — each allocation credits the same roll it debited; reversed rows stay for history |
+| `check_variant_invariant(variant)` / `sync_variant_stock(variant)` | Assert / repair `stock_meters == SUM(active rolls)` |
+
+FIFO order is `(created_at, id)`. `move_variant_stock()` is the single choke point for
+stock changes, so an adjustment, a pack and a delete all move it identically.
+
 #### `apps/notification/utils.py` (53 lines)
 
 `notify_user_safely()` (`:27-41`) queues web push + FCM with `retry=False` so an unreachable broker fails fast instead of holding the request open. `admin_user_ids()` (`:44-53`) returns active `role="ADMIN"` ∪ superusers.
@@ -612,6 +633,9 @@ Notably `transports/views.py:11-13` defines a **separate, local** `IsAdminUser` 
 | `lib/form-utils.ts` | 3502 B | ★ Multipart encoding protocol |
 | `lib/updateItem.ts` | 2461 B | ★ Fabric update payload rules |
 | `lib/toast.ts` | 3759 B | ★ Error extraction across axios/DRF/proxy/HTML |
+| `lib/api/item.ts` | | `itemApi` + `rollApi` (receive, bulk-receive, adjust, history, preview, sync) |
+| `components/items/physicalRollsPanel.tsx` | | ★ Rolls of one colour: summary, per-roll adjust, history dialog |
+| `components/items/receiveRollsDialog.tsx` | | ★ Receive a delivery as one roll or several, in one request |
 | `components/pages/admin/packing/PackingBoard.tsx` | 27722 B | ★ The three-step roll-splitting UI |
 
 **`PackingBoard.tsx` flow** (rewritten in `efa6644`): `"select"` → `"review"` → commit. Holds `selected` (ticked order-item ids) and `metres` (typed per line) state; prefill via `splitEqually()`; validation via `splitProblems()`; a *"read the split back"* confirmation gate before any cloth moves; the backend re-checks stock and demand regardless.
@@ -619,6 +643,13 @@ Notably `transports/views.py:11-13` defines a **separate, local** `IsAdminUser` 
 **`lib/updateItem.ts` two load-bearing rules:**
 1. **Every colour is always sent** — an absent colour is treated as deleted by the API.
 2. **`stock_meters` is only sent for new variants.** Sending the loaded warehouse count back would overwrite live stock changed by concurrent packing.
+
+**Roll-tracked colours** add a third rule: a colour that already has rolls never sends
+`stock_meters` at all (the backend rejects it), and its `is_roll_tracked` flag is sent so
+the stock figure survives a save. Its metre total changes only through
+`PhysicalRollsPanel`, which reloads after every receive/adjust and pushes the fresh
+`stock_meters` back into the colour row so the read-only figure beside the colour name
+stays truthful without a page reload.
 
 ---
 
@@ -675,10 +706,32 @@ Notably `transports/views.py:11-13` defines a **separate, local** `IsAdminUser` 
 | `display_order` | CharField(100) | null/blank — the colour label |
 | `qr_code` | **UUIDField, unique, `editable=False`, `default=uuid4`** | The QR agents scan |
 | `image` | ImageField | null/blank |
-| `stock_meters` | **Decimal(14,3)**, default 0, `MinValueValidator(0)` | Fractional metres |
+| `stock_meters` | **Decimal(14,3)**, default 0, `MinValueValidator(0)` | Fractional metres. For a roll-tracked colour this is the **aggregate**, not an editable figure |
 | `stock_updated_at` | DateTime | `db_index=True` — stock delta-sync cursor |
 
-#### `apps.orders` — 6 models
+**`FabricRoll`** — a physical roll on the shelf (migration `items/0003_fabricroll`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `variant` | FK → FabricVariant, **CASCADE**, `related_name="rolls"` | |
+| `roll_number` | CharField(32) **unique** | `R-000001` generated, or an importer's `LOT-7` |
+| `note` | CharField(100) | blank |
+| `original_meters` | **Decimal(14,3)** | `> 0` (DB check) |
+| `remaining_meters` | **Decimal(14,3)** | `>= 0` and `<= original_meters` (DB checks) |
+| `is_active` | Boolean | false once exhausted; the row is **kept** |
+| `created_at` / `updated_at` | DateTime | `created_at` is the FIFO key |
+
+**The roll invariant.** For a colour with any rolls,
+`variant.stock_meters == SUM(roll.remaining_meters for roll in variant.rolls if roll.is_active)`.
+It is enforced in `rolls.py`, checked by `check_variant_invariant`, and repairable with
+`sync_stock`. A colour with **no** rolls is a legacy colour and keeps its old behaviour
+entirely — `stock_meters` stays hand-editable, and nothing about orders or packing changes.
+Consequences enforced everywhere: a non-empty or previously-used roll cannot be deleted
+(exhausted rolls are archived, not removed), a variant with stock or roll history cannot
+be deleted, and `stock_meters` may not be written directly for a tracked colour (the
+variant serializers reject it).
+
+#### `apps.orders` — 8 models
 
 **`Order`** — `ordering: ["-created_at"]`. Status: `DRAFT → PENDING → EDITING → PENDING → PACKED → DISPATCHED`
 
@@ -726,7 +779,7 @@ Index: `(order_ref, -created_at)`.
 
 Properties `outstanding_quantity` (`:202-204`) and `is_rate_overridden`.
 
-**Per-line rate override** — `rate_override` is an optional write-only field on both `AddOrderItemSerializer` and `OrderItemSerializer` (`rate_columns()` in `serializers.py`). It lands on the `OrderItem` only: `Fabric.price_per_meter` is never written, so a price agreed with one customer cannot leak into the catalogue. Omitted, or equal to the catalogue rate, means no override. An **agent may only discount** (capped at the live catalogue rate, mirroring `set-price`); an admin may bill any rate > 0. Every change is audited as `ITEM_RATE_OVERRIDE` / `ITEM_RATE_OVERRIDE_CLEARED`, is part of the edit snapshot, and survives `place-order`. `merge-items` refuses lines priced differently (the keeper's rate would otherwise be applied to the dropped lines' metres).
+**Per-line rate override** — `rate_override` is an optional write-only field on both `AddOrderItemSerializer` and `OrderItemSerializer` (`rate_columns()` in `serializers.py`). It lands on the `OrderItem` only: `Fabric.price_per_meter` is never written, so a price agreed with one customer cannot leak into the catalogue. Omitted, or equal to the catalogue rate, means no override. An **agent may only discount** (capped at the live catalogue rate, mirroring `set-price`); an admin may bill any rate > 0. Every change is audited as `ITEM_RATE_OVERRIDE` / `ITEM_RATE_OVERRIDE_CLEARED`, is part of the edit snapshot, and survives `place-order`. `merge-items` refuses lines priced differently (the keeper's rate would otherwise be applied to the dropped lines' metres). Editing a line does not disturb an agreed rate: the order page sends the colour with every edit, so "no `rate_override` in the payload" means *change nothing* — `rate_per_meter`, `original_rate_per_meter` and the attribution all stand. Only an actual **colour change** reprices the line: it takes the new colour's catalogue rate, rebases the snapshot onto it and clears `rate_overridden_by`/`_at`, because there is no longer a difference to report and nobody to credit with it. Supplying a `rate_override` with the new colour takes the normal path instead.
 
 **`PackingRound`** — `DRAFT | CONFIRMED | CANCELLED`
 
@@ -751,6 +804,21 @@ Properties `outstanding_quantity` (`:202-204`) and `is_rate_overridden`.
 
 **`UserViewedOrder`** — `unique_together ("user","order")`; unread-badge tracking.
 
+**`RollAllocation`** — which roll each metre actually came off (migration `orders/0003_rollallocation`)
+
+| Field | Type | Notes |
+|---|---|---|
+| `allocation` | FK → Allocation, **CASCADE**, `related_name="roll_allocations"` | |
+| `roll` | FK → FabricRoll, **PROTECT** | a roll with history is never erased |
+| `metres` | Decimal(14,3) | `> 0` (DB check) |
+| `sequence` | PositiveSmallInteger | same order the metres were cut in, FIFO |
+| `is_reversed` | Boolean | set when the packing round is cancelled |
+
+One row per roll touched by a packing round, so a cut spanning two rolls is recorded as
+two rows. This is what makes cancellation exact: the reversal credits **the same rolls**
+rather than guessing from a total, and the rows stay for the audit trail. Packing
+responses carry these rows (`rolls`) so the order page can say which roll was cut.
+
 #### `apps.agents`, `apps.customers`, `apps.business`, `apps.notification`, `transports`
 
 | Model | Key fields |
@@ -765,7 +833,17 @@ Properties `outstanding_quantity` (`:202-204`) and `is_rate_overridden`.
 
 ### 5.3 Migration State
 
-All apps squashed to a single `0001_initial.py` in commit `1b270f8` (50 migrations deleted). Only one second migration exists: `items/0002_alter_fabricvariant_stock_meters.py`.
+All apps squashed to a single `0001_initial.py` in commit `1b270f8` (50 migrations deleted). The second migration is `items/0002_alter_fabricvariant_stock_meters.py`; two more were added for physical rolls:
+
+| Migration | Adds |
+|---|---|
+| `items/0003_fabricroll` | the `FabricRoll` table |
+| `orders/0003_rollallocation` | the `RollAllocation` table |
+
+Both are **purely additive** — two new tables, no data migration and no change to any
+existing column, so existing colours and the 79 existing order lines are untouched. A
+colour only becomes roll-tracked once a roll is actually received against it.
+`makemigrations --check --dry-run` reports no further changes.
 
 `apps/dashboard/migrations/` and `apps/transports/migrations/` contain **only `__init__.py`** — the dashboard has no models, and the `transports` migration lives at `backend/transports/migrations/` (not `apps/transports/`), which is *not* in `INSTALLED_APPS` as written — it resolves via the `transports` top-level package.
 
@@ -846,8 +924,27 @@ All apps squashed to a single `0001_initial.py` in commit `1b270f8` (50 migratio
 | GET | `/by-qr/?qr_code=&agent_id=` | IsAuthenticated | ★ QR lookup; rejects `len>255` or containing `/` (path-traversal guard); optional agent-assignment scoping |
 | GET | `/outstanding-demand/?variant=` | IsAuthenticated | `Σordered − Σallocated` per variant + `is_backordered` |
 | GET | `/customer-requirements/?fabric_id=` | IsAuthenticated | per-customer open demand for a fabric |
-| GET/POST/PUT/PATCH/DELETE | `/variants/` and `/variants/{id}/` | IsAuthenticated / **IsAdmin** | variant CRUD; writes call `touch_catalog` + `sync_out_of_stock` |
+| GET/POST/PUT/PATCH/DELETE | `/variants/` and `/variants/{id}/` | IsAuthenticated / **IsAdmin** | variant CRUD; writes call `touch_catalog` + `sync_out_of_stock`. `stock_meters` is rejected for a roll-tracked colour |
 | GET | `/variants/all/` | IsAuthenticated | flat variant list across fabrics |
+
+**Physical rolls** (`items/rolls.py`). Reads are authenticated; every mutation is
+**IsAdmin**. All figures are decimal **strings**.
+
+| Method | Path | Purpose |
+|---|---|---|
+| GET | `/rolls/` | every roll, filterable by `variant`, `is_active`, `is_exhausted`, `search`, paginated |
+| GET/PATCH/DELETE | `/rolls/{id}/` | one roll. DELETE 409s once it is non-empty or has history |
+| POST | `/rolls/{id}/adjust/` | `{delta, note?}` — signed correction |
+| GET | `/rolls/{id}/history/` | `{roll, entries[]}` — every cut, with order/customer/round, and `is_reversed` |
+| GET | `/variants/{id}/rolls/` | `{variant, fabric, display_order, stock_meters, is_roll_tracked, roll_count, active_roll_count, exhausted_roll_count, total_received_meters, roll_stock_meters, consumed_meters, rolls[]}` |
+| POST | `/variants/{id}/rolls/` | receive one roll: `{meters, note?, roll_number?}` |
+| POST | `/variants/{id}/rolls/bulk-add/` | `{rolls: [{meters, note?, roll_number?}]}` — **one transaction** |
+| POST | `/variants/{id}/rolls/preview/` | `{meters}` → which rolls a cut would come off, oldest first; changes nothing |
+| POST | `/variants/{id}/rolls/sync-stock/` | repair `stock_meters` to the roll total |
+
+Routing note: the roll router is a `SimpleRouter` registered **before** the fabric router.
+`DefaultRouter`'s API root at `api-items/` would otherwise capture `POST /api/items/` and
+return 405, and the roll root would shadow the fabric list.
 
 ### 6.6 Orders — `/api/orders/`
 
@@ -891,6 +988,16 @@ All apps squashed to a single `0001_initial.py` in commit `1b270f8` (50 migratio
 | POST | `/{pk}/cancel/` | `{}` | Return the metres; demotes orders that are no longer full |
 
 **Two-layer status check on confirm:** the second `select_for_update` read is what prevents two admins clicking simultaneously from both seeing `DRAFT` and applying the plan twice.
+
+**Where the metres come off.** For a roll-tracked colour, confirming a round (or
+packing one line from the order page) calls `consume_for_allocation()` inside the same
+transaction: metres are taken **FIFO**, oldest roll first, a roll is skipped once empty,
+and one `RollAllocation` is written per roll touched. Cancelling calls
+`return_metres_for_allocations()`, which credits back **the exact rolls** those rows name
+and marks them `is_reversed` — the rows stay as history. A colour with no rolls behaves
+exactly as before. The responses gained `rolls[]` (which rolls were cut, with metres) and
+preview gained `roll_cut` (which rolls *would* be cut), so the order page can name the
+roll instead of only quoting a total.
 
 ### 6.8 Dashboard — `/api/dashboard/`
 

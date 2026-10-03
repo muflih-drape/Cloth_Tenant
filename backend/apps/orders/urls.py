@@ -35,6 +35,16 @@ urlpatterns = [
         packing_views.pack_line,
         name="packing-pack-line",
     ),
+    path(
+        "<int:order_id>/items/<int:item_id>/pack/scan-roll/",
+        packing_views.scan_roll,
+        name="packing-scan-roll",
+    ),
+    path(
+        "<int:order_id>/items/<int:item_id>/pack/undo-scan/",
+        packing_views.undo_scan,
+        name="packing-undo-scan",
+    ),
 ] + router.urls + [
     path("<int:order_id>/place-order/", PlaceOrderView.as_view()),
     path("<int:order_id>/add-item/", AddOrderItemView.as_view()),

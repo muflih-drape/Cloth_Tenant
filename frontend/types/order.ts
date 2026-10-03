@@ -1,6 +1,6 @@
-import type { OrderStatus } from "./item";
+import type { OrderStatus, RollCutPlan, RollHistoryEntry } from "./item";
 
-export type { OrderStatus };
+export type { OrderStatus, RollCutPlan, RollHistoryEntry };
 
 export interface SimpleAgent {
   id: number;
@@ -47,6 +47,12 @@ export interface OrderItem {
   outstanding_quantity: string;
   line_total: string;
   allocation_count: number;
+  /**
+   * Whether this colour's metres live on physical rolls. When true the line is
+   * packed by scanning a roll's label rather than by typing a figure, and the
+   * server will not cut cloth off a roll nobody named.
+   */
+  is_roll_tracked: boolean;
 }
 
 export interface OrderTotals {
@@ -206,6 +212,12 @@ export interface PackingPlan {
   shortfall_meters: string;
   allocations: AllocationEntry[];
   priority: Record<string, unknown>;
+  /**
+   * Which physical rolls this plan would be cut from, by best fit. Present only
+   * for a colour tracked by rolls; a colour without them behaves exactly as it
+   * did before.
+   */
+  roll_cut?: RollCutPlan;
 }
 
 export interface PackingQueueLine {
@@ -270,7 +282,22 @@ export interface PlanOverrideEntry {
  * is left on the roll, so the page can update both in place instead of
  * refetching the order. `round` is the packing round the backend built to do it,
  * which is what makes the shortcut auditable rather than a private shortcut.
+ *
+ * `rolls` names the physical rolls the metres were cut from, for a colour tracked
+ * by rolls: empty otherwise, which is every colour that predates roll tracking.
  */
+/**
+ * One roll of an admin's own breakdown for a single-line pack: which roll, and how
+ * much to take off it. Only needed for a colour with physical rolls, where the
+ * server refuses to guess which roll to cut; a scan sends the roll's primary key
+ * instead. The server re-validates every figure here against the rolls as they are
+ * now.
+ */
+export interface PackLineRollOverride {
+  roll: number;
+  metres: string;
+}
+
 export interface PackLineResponse {
   message: string;
   round: number;
@@ -278,4 +305,5 @@ export interface PackLineResponse {
   order_status: OrderStatus;
   item: OrderItem;
   stock_meters: string;
+  rolls?: RollHistoryEntry[];
 }

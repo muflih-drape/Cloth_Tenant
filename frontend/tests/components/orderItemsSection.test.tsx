@@ -17,18 +17,24 @@ vi.mock("@/context/AuthContext", () => ({
 
 vi.mock("@/lib/api/item", () => ({
   fabricApi: { getOutstandingDemand: vi.fn() },
+  // A colour tracked by physical rolls is packed by scanning its label; these
+  // lines have none, so the scanner is stood in for rather than opened.
+  rollApi: { preview: vi.fn(), getForVariant: vi.fn() },
 }));
 
+vi.mock("@/components/items/QRScanModal", () => ({ default: () => null }));
+
 vi.mock("@/lib/api/order", () => ({
-  packingApi: { packLine: vi.fn() },
+  packingApi: { packLine: vi.fn(), scanRoll: vi.fn(), undoScan: vi.fn() },
   orderApi: { deleteItem: vi.fn(), updateItem: vi.fn() },
 }));
 
 // Imported after the mocks above so the component picks them up.
-import { fabricApi } from "@/lib/api/item";
+import { fabricApi, rollApi } from "@/lib/api/item";
 
 const packLine = vi.mocked(packingApi.packLine);
 const getOutstandingDemand = vi.mocked(fabricApi.getOutstandingDemand);
+const preview = vi.mocked(rollApi.preview);
 
 const lineA: OrderItem = {
   id: 7,
@@ -48,6 +54,7 @@ const lineA: OrderItem = {
   outstanding_quantity: "600.000",
   line_total: "5400.00",
   allocation_count: 0,
+  is_roll_tracked: false,
 };
 
 const lineB: OrderItem = {
@@ -68,6 +75,7 @@ const lineB: OrderItem = {
   outstanding_quantity: "400.000",
   line_total: "4800.00",
   allocation_count: 0,
+  is_roll_tracked: false,
 };
 
 const aResult: PackLineResponse = {
@@ -104,6 +112,14 @@ beforeEach(() => {
     { variant: 3, stock_meters: "2400.000" },
     { variant: 4, stock_meters: "500.000" },
   ] as never);
+  // No breakdown to offer, so the packing rows stay as they were.
+  preview.mockResolvedValue({
+    rolls: [],
+    requested_meters: "0.000",
+    covered_meters: "0.000",
+    shortfall_meters: "0.000",
+    available_meters: "0.000",
+  });
 });
 
 function section() {

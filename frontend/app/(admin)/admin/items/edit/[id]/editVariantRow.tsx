@@ -21,6 +21,11 @@ interface Props {
  * One colour row. The metre figure is the warehouse's live stock count and is
  * edited in place -- on save the API applies it and records the change on the
  * stock cursor, so a correction here is authoritative.
+ *
+ * A colour whose metres live on physical rolls is the exception: its total is
+ * the sum of those rolls, so the figure is shown read-only and the roll panel
+ * below is the only place it can change. A newly added colour has no rolls yet,
+ * so its opening figure is editable as usual.
  */
 export default function EditVariantRow({
   variant,
@@ -38,6 +43,7 @@ export default function EditVariantRow({
 
   const imageSrc = variant.imagePreview ?? variant.imageUrl;
   const label = variant.displayOrder.trim();
+  const rollTracked = !isNew && variant.isRollTracked === true;
 
   return (
     <div className="flex items-center gap-3 bg-gray-50 border border-gray-100 rounded-xl px-3 py-2.5">
@@ -70,7 +76,7 @@ export default function EditVariantRow({
 
         <div className="flex items-center gap-2">
           <span className="text-[11px] text-gray-400 flex-shrink-0">
-            {isNew ? "Opening" : "Stock"}
+            {rollTracked ? "Stock (derived from physical rolls)" : isNew ? "Opening" : "Stock"}
           </span>
           <Input
             type="number"
@@ -81,9 +87,21 @@ export default function EditVariantRow({
             placeholder="0"
             onChange={(e) => set("stockMeters", e.target.value)}
             onFocus={(e) => e.target.select()}
-            className="h-8 text-sm w-24"
+            readOnly={rollTracked}
+            aria-readonly={rollTracked}
+            title={
+              rollTracked
+                ? "Stock is derived from physical rolls for this colour. Add or adjust rolls to change the total."
+                : undefined
+            }
+            className={`h-8 text-sm w-24 ${rollTracked ? "bg-gray-100 text-gray-500 cursor-not-allowed" : ""}`}
           />
           <span className="text-[11px] text-gray-400">m</span>
+          {rollTracked && (
+            <span className="text-[10px] uppercase tracking-wide text-primary bg-primary/10 rounded-full px-2 py-0.5">
+              derived from physical rolls · {variant.rollCount ?? 0} roll{variant.rollCount === 1 ? "" : "s"}
+            </span>
+          )}
         </div>
       </div>
 

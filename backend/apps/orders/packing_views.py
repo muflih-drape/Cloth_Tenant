@@ -10,6 +10,11 @@ writes the audit trail; ``cancel`` reverses it.
 ``pack_line`` is the shortcut for filling one order line from the order page
 without opening the board. It is not a second way of moving stock: it builds the
 same one-entry round and hands it to the same applier, so the trail is identical.
+
+``scan_roll`` and ``undo_scan`` are the same shortcut for a colour tracked by
+physical rolls, where the roll itself is the unit: the admin scans the roll's
+label instead of typing a figure, and each scan is its own one-entry round so it
+can be reversed on its own.
 """
 
 from decimal import Decimal, InvalidOperation
@@ -24,7 +29,13 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.response import Response
 
 from apps.accounts.permissions import IsAdmin
-from apps.items.models import FabricVariant
+from apps.items.models import FabricRoll, FabricVariant
+from apps.items.rolls import (
+    consume_for_allocation,
+    is_roll_tracked,
+    preview_consumption,
+)
+from apps.items.serializers import RollHistoryEntrySerializer
 from apps.orders.allocation import (
     OPEN_STATUSES,
     build_plan,
@@ -43,6 +54,10 @@ from apps.orders.serializers import (
 
 ZERO = Decimal("0")
 
+#: Marks a round as having come from a label scan rather than a typed figure, so
+#: ``undo_scan`` reverses one of its own and leaves a hand-packed line alone.
+_SCAN_NOTE = "Roll scan"
+
 
 def _parse_metres(raw, field):
     if raw in (None, ""):
@@ -56,9 +71,9 @@ def _parse_metres(raw, field):
     return value
 
 
-def _serialise_plan(plan):
+def _serialise_plan(plan, variant=None):
     """JSON-safe version of :func:`build_plan`'s output."""
-    return {
+    payload = {
         "variant": plan["variant"],
         "round_size": str(plan["round_size"]),
         "available_meters": str(plan["available_meters"]),
@@ -86,6 +101,30 @@ def _serialise_plan(plan):
         ],
         "priority": plan.get("priority", {}),
     }
+
+    if variant is not None and is_roll_tracked(variant):
+        # Which physical rolls this plan would be cut from, so the admin sees the
+        # cloth leaving a numbered roll rather than an anonymous total.
+        cutting = sum(
+            (Decimal(str(entry["metres"])) for entry in plan["allocations"]), ZERO
+        )
+        payload["roll_cut"] = preview_consumption(variant, cutting)
+
+    return payload
+
+
+def _roll_usage(packing_round):
+    """The roll-level records behind a confirmed round, for the response body."""
+    from apps.orders.models import RollAllocation
+
+    entries = RollAllocation.objects.filter(
+        allocation__round=packing_round
+    ).select_related(
+        "roll",
+        "allocation__round",
+        "allocation__order_item__order__customer",
+    )
+    return RollHistoryEntrySerializer(entries, many=True).data
 
 
 class _PreviewRequestSerializer(serializers.Serializer):
@@ -170,10 +209,22 @@ class _CreateRoundSerializer(serializers.Serializer):
         return attrs
 
 
+class _PackLineRollSerializer(serializers.Serializer):
+    """One roll of the admin's own breakdown for a single-line pack."""
+
+    roll = serializers.IntegerField()
+    metres = serializers.DecimalField(max_digits=14, decimal_places=3)
+
+
 class _PackLineSerializer(serializers.Serializer):
     """Metres to hand one order line, typed in from the order page."""
 
     metres = serializers.DecimalField(max_digits=14, decimal_places=3)
+    #: Optional: the roll breakdown to cut these metres from. Required in practice
+    #: for a colour tracked by physical rolls, which is refused rather than guessed
+    #: at when it is absent -- use ``scan_roll`` there. Re-validated against the
+    #: rolls under lock before anything is cut.
+    rolls = _PackLineRollSerializer(many=True, required=False)
 
     def validate_metres(self, value):
         if value < MIN_ORDER_METERS:
@@ -285,7 +336,7 @@ def preview(request):
     except ValueError as exc:
         return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
-    return Response(_serialise_plan(plan))
+    return Response(_serialise_plan(plan, variant))
 
 
 @extend_schema(
@@ -375,6 +426,7 @@ def confirm(request, pk):
             "allocations": AllocationSerializer(
                 packing_round.allocations.all(), many=True
             ).data,
+            "rolls": _roll_usage(packing_round),
         }
     )
 
@@ -418,6 +470,7 @@ def _apply_plan(packing_round, stored, user, note=""):
     }
 
     touched = {}
+    roll_entries = []
     for sequence, entry in enumerate(stored, start=1):
         line = lines.get(entry["order_item"])
         if line is None:
@@ -427,12 +480,20 @@ def _apply_plan(packing_round, stored, user, note=""):
         # handing over more than was ordered is allowed and `allocated_quantity`
         # may legitimately pass `ordered_quantity`. The only hard limit is the
         # metres physically on the roll, which is enforced above.
-        Allocation.objects.create(
+        allocation = Allocation.objects.create(
             round=packing_round,
             order_item=line,
             metres=metres,
             sequence=sequence,
             is_priority_award=False,
+        )
+        # For a colour tracked by physical rolls, cut the metres off them here
+        # and record which roll each metre came off, so a cancelled round can
+        # put the cloth back where it was cut from. `rolls` is the roll the admin
+        # named -- a scanned label, or an explicit breakdown -- and a roll-tracked
+        # colour is refused without one rather than falling back to a guess.
+        roll_entries.extend(
+            consume_for_allocation(variant, allocation, metres, entry.get("rolls"))
         )
         line.allocated_quantity += metres
         line.save(update_fields=["allocated_quantity"])
@@ -450,6 +511,7 @@ def _apply_plan(packing_round, stored, user, note=""):
     for order in touched.values():
         sync_order_after_allocation(order, user, packing_round)
 
+    packing_round.roll_entries = roll_entries
     return packing_round
 
 
@@ -501,6 +563,14 @@ def pack_line(request, order_id, item_id):
     metres = serializer.validated_data["metres"]
 
     plan = [{"order_item": line.pk, "metres": str(metres)}]
+    # Only present when the caller named the rolls to cut from. A roll-tracked
+    # colour with no breakdown is refused downstream, so an untouched line cannot
+    # quietly take cloth off whichever roll the server likes.
+    chosen_rolls = serializer.validated_data.get("rolls")
+    if chosen_rolls:
+        plan[0]["rolls"] = [
+            {"roll": row["roll"], "metres": str(row["metres"])} for row in chosen_rolls
+        ]
     note = f"Packed directly from order #{order.pk}"
 
     try:
@@ -555,6 +625,196 @@ def pack_line(request, order_id, item_id):
             "order_status": order.status,
             "item": OrderItemSerializer(line).data,
             "stock_meters": str(locked_variant.stock_meters),
+            "rolls": _roll_usage(packing_round),
+        }
+    )
+
+
+class _ScanRollSerializer(serializers.Serializer):
+    """The roll a warehouse scan resolved to, named by its own identifier.
+
+    A roll's label carries its primary key, which is what makes a scan resolve to
+    exactly one roll row rather than to a colour with several lengths on it.
+    """
+
+    roll = serializers.IntegerField(min_value=1)
+
+
+@extend_schema(
+    methods=["POST"],
+    summary="Pack a single order line by scanning a roll's label",
+    request=_ScanRollSerializer,
+)
+@api_view(["POST"])
+@permission_classes([IsAdmin])
+def scan_roll(request, order_id, item_id):
+    """Fill one order line with a whole scanned roll.
+
+    The counterpart to :func:`pack_line` for a colour tracked by physical rolls:
+    there is no figure to type, because the roll itself is the unit. A scan names
+    one roll, and the whole of that roll is cut for the line -- rolls are not
+    split at the warehouse, so the roll's full remaining length is what moves.
+
+    Each scan is its own one-entry round applied by :func:`_apply_plan`, the very
+    function a hand-approved round uses, so the ``Allocation``, the
+    ``RollAllocation``, the stock deduction, the ``ALLOCATION_MADE`` log and the
+    order's ``PACKED`` promotion all land exactly as they do anywhere else, and
+    the round stays visible and cancellable in the same history. The note marks
+    the round as a scan so :func:`undo_scan` can find the right one to reverse.
+    """
+    order = get_object_or_404(Order, pk=order_id)
+    line = get_object_or_404(
+        OrderItem.objects.select_related("variant__fabric"),
+        pk=item_id,
+        order=order,
+    )
+
+    if line.variant_id is None:
+        return Response(
+            {"error": f"Order #{order.pk} line #{line.pk} has no fabric variant."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+    if order.status not in OPEN_STATUSES:
+        return Response(
+            {"error": f"Order #{order.pk} is {order.status.lower()}, not open for packing."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    serializer = _ScanRollSerializer(data=request.data)
+    serializer.is_valid(raise_exception=True)
+    roll_id = serializer.validated_data["roll"]
+
+    try:
+        with transaction.atomic():
+            # The variant lock serialises every roll write for this colour, and the
+            # roll itself is re-read under its own lock so two scans of the same
+            # label cannot both see it as available.
+            locked_variant = FabricVariant.objects.select_for_update().get(
+                pk=line.variant_id
+            )
+            roll = FabricRoll.objects.select_for_update().filter(pk=roll_id).first()
+            if roll is None:
+                raise ValueError(
+                    "That label does not belong to any roll in this warehouse."
+                )
+
+            if roll.variant_id != locked_variant.pk:
+                scanned = roll.variant
+                wanted = locked_variant
+                raise ValueError(
+                    f"This roll is {scanned.fabric.name} "
+                    f"({scanned.display_order or 'unlabelled'}), this line needs "
+                    f"{wanted.fabric.name} ({wanted.display_order or 'unlabelled'})."
+                )
+
+            if not roll.is_active or Decimal(str(roll.remaining_meters)) <= ZERO:
+                raise ValueError(
+                    f"Roll {roll.roll_number} has already been used up."
+                )
+
+            metres = Decimal(str(roll.remaining_meters))
+            plan = [
+                {
+                    "order_item": line.pk,
+                    "metres": str(metres),
+                    "rolls": [{"roll": roll.pk, "metres": str(metres)}],
+                }
+            ]
+
+            packing_round = PackingRound.objects.create(
+                variant=locked_variant,
+                round_size=metres,
+                status="DRAFT",
+                note=_SCAN_NOTE,
+                plan_override=plan,
+                created_by=request.user,
+            )
+            # Moves the stock, writes the allocation, promotes the order and logs
+            # it. Deliberately the only writer of stock_meters on this path.
+            packing_round = _apply_plan(packing_round, plan, request.user, _SCAN_NOTE)
+    except ValueError as exc:
+        return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    # _apply_plan works on its own instances of these rows, and may have promoted
+    # the order to PACKED, so re-read before answering.
+    line.refresh_from_db()
+    order.refresh_from_db()
+    locked_variant.refresh_from_db()
+
+    return Response(
+        {
+            "message": (
+                f"Packed roll {roll.roll_number} "
+                f"({metres.normalize()} m) for order #{order.pk}"
+            ),
+            "round": packing_round.pk,
+            "order": order.pk,
+            "order_status": order.status,
+            "item": OrderItemSerializer(line).data,
+            "stock_meters": str(locked_variant.stock_meters),
+            "rolls": _roll_usage(packing_round),
+        }
+    )
+
+
+@extend_schema(
+    methods=["POST"],
+    summary="Reverse the most recent roll scan on one order line",
+)
+@api_view(["POST"])
+@permission_classes([IsAdmin])
+def undo_scan(request, order_id, item_id):
+    """Give back the roll the last scan on this line took.
+
+    Every scan is its own one-entry round, so reversing one is exactly cancelling
+    that round: :func:`cancel_round` puts the metres back on the very roll they
+    came off, marks the ``RollAllocation`` reversed so the same round cannot be
+    credited twice, takes the line's packed total back down, and re-runs the
+    order's status sync. Only rounds this endpoint created are considered, so a
+    line packed by hand keeps that pack when the admin undoes a scan.
+    """
+    order = get_object_or_404(Order, pk=order_id)
+    line = get_object_or_404(OrderItem, pk=item_id, order=order)
+
+    if order.status not in OPEN_STATUSES:
+        return Response(
+            {"error": f"Order #{order.pk} is {order.status.lower()}, not open for packing."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    packing_round = (
+        PackingRound.objects.filter(
+            status="CONFIRMED",
+            note__startswith=_SCAN_NOTE,
+            allocations__order_item=line,
+        )
+        .order_by("-confirmed_at", "-id")
+        .first()
+    )
+    if packing_round is None:
+        return Response(
+            {"error": f"Order #{order.pk} line #{line.pk} has no scan to undo."},
+            status=status.HTTP_400_BAD_REQUEST,
+        )
+
+    try:
+        cancel_round(packing_round, user=request.user)
+    except ValueError as exc:
+        return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
+
+    line.refresh_from_db()
+    order.refresh_from_db()
+    variant = FabricVariant.objects.get(pk=line.variant_id)
+
+    return Response(
+        {
+            "message": f"Undid the last scan on order #{order.pk}",
+            "round": packing_round.pk,
+            "order": order.pk,
+            "order_status": order.status,
+            "item": OrderItemSerializer(line).data,
+            "stock_meters": str(variant.stock_meters),
+            "rolls": _roll_usage(packing_round),
         }
     )
 
@@ -576,6 +836,7 @@ def cancel(request, pk):
             "message": "Packing round cancelled",
             "id": packing_round.pk,
             "status": packing_round.status,
+            "rolls": _roll_usage(packing_round),
         }
     )
 

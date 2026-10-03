@@ -36,6 +36,7 @@ from django.utils import timezone
 
 from apps.customers.models import Customer
 from apps.items.models import FabricVariant
+from apps.items.rolls import consume_for_allocation, return_metres_for_allocations
 from apps.items.services import sync_out_of_stock
 from apps.orders.models import Allocation, Order, OrderItem, OrderLog, PackingRound
 
@@ -340,20 +341,24 @@ def confirm_round(packing_round, user=None, note=""):
                     f"{entry['metres']} m of {line.fabric_name}"
                 )
 
-            Allocation.objects.create(
+            allocation = Allocation.objects.create(
                 round=packing_round,
                 order_item=line,
                 metres=entry["metres"],
                 sequence=entry["sequence"],
                 is_priority_award=entry["is_priority_award"],
             )
+            # If this colour is tracked by physical rolls, take the metres off
+            # them here and record which roll each metre came off, so cancelling
+            # can put the cloth back where it was cut from.
+            consume_for_allocation(variant, allocation, entry["metres"])
             line.allocated_quantity = line.allocated_quantity + entry["metres"]
             line.save(update_fields=["allocated_quantity"])
             total_granted += entry["metres"]
             touched_orders[line.order_id] = line.order
 
         # Leftover stock (``plan["unallocated_meters"]``) simply stays on the
-        # roll; only what was actually granted comes off it.
+        # rolls; only what was actually granted comes off them.
         _adjust_stock(variant, -total_granted)
 
         packing_round.status = "CONFIRMED"
@@ -399,6 +404,11 @@ def cancel_round(packing_round, user=None):
 
         if returned > ZERO:
             _adjust_stock(variant, returned)
+
+        # Put the cloth back on the very rolls it was cut from, for colours that
+        # are tracked by physical rolls. Cloth packed before rolls existed has no
+        # records, so the flat credit above is all it gets.
+        return_metres_for_allocations(allocations)
 
         packing_round.status = "CANCELLED"
         packing_round.save()

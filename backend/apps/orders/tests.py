@@ -1356,6 +1356,453 @@ class PackSingleLineConcurrencyTests(TransactionTestCase):
         self.assertEqual(self.line.outstanding_quantity, Decimal("200.000"))
 
 
+class PackSingleLineRollConcurrencyTests(TransactionTestCase):
+    """Two packs naming the same rolls must not overdraw them.
+
+    Same shape as :class:`PackSingleLineConcurrencyTests`, but on a colour tracked
+    by physical rolls, where the metres are cut off named ``FabricRoll`` rows. Both
+    requests therefore name the *same* rolls, which is exactly the case where an
+    unlocked read would let both believe the cloth was still there.
+    """
+
+    reset_sequences = True
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            username="admin1", email="admin1@test.com",
+            password="pass1234", role="ADMIN",
+        )
+        self.agent_user = User.objects.create_user(
+            username="agent1", email="agent1@test.com",
+            password="pass1234", role="AGENT",
+        )
+        agent = Agent.objects.create(user=self.agent_user, contact="111")
+        customer = Customer.objects.create(
+            name="ABC Fashions", contact="2222222222", agent=agent
+        )
+        self.fabric = Fabric.objects.create(
+            name="Cotton Cambric 140 GSM", price_per_meter=Decimal("9.00")
+        )
+        self.variant = FabricVariant.objects.create(
+            fabric=self.fabric,
+            display_order="Natural",
+            stock_meters=Decimal("0.000"),
+        )
+        AgentItem.objects.create(agent=agent, variant=self.variant)
+
+        # 600 + 400 + 100 = 1100 m on hand, so 700 + 700 cannot both be granted:
+        # the second request has to be refused rather than left to overdraw
+        # whichever rolls the first one already took from.
+        from apps.items.rolls import receive_roll
+
+        self.rolls = [
+            receive_roll(self.variant, Decimal("600")),
+            receive_roll(self.variant, Decimal("400")),
+            receive_roll(self.variant, Decimal("100")),
+        ]
+
+        self.order = Order.objects.create(
+            customer=customer, agent=agent, created_by=self.agent_user, status="PENDING"
+        )
+        self.line = OrderItem.objects.create(
+            order=self.order,
+            fabric=self.fabric,
+            variant=self.variant,
+            fabric_name=self.fabric.name,
+            rate_per_meter=self.fabric.price_per_meter,
+            variant_display_order=self.variant.display_order,
+            ordered_quantity=Decimal("1000.000"),
+        )
+        recompute_order_total(self.order)
+
+    def test_racing_packs_over_shared_candidate_rolls_stay_safe(self):
+        # 700 + 700 against 1100 m, both naming the same two rolls. Both requests
+        # read those rolls' remaining_meters at the same moment, and the loser must
+        # be refused rather than left to overdraw what the winner already took.
+        url = f"/api/orders/{self.order.pk}/items/{self.line.pk}/pack/"
+        payload = {
+            "metres": "700",
+            "rolls": [
+                {"roll": self.rolls[0].pk, "metres": "600"},
+                {"roll": self.rolls[2].pk, "metres": "100"},
+            ],
+        }
+        header_a = get_auth_header(self.admin)
+        header_b = get_auth_header(self.admin)
+        barrier = threading.Barrier(2)
+        statuses = []
+        guard = threading.Lock()
+
+        def pack(header):
+            client = APIClient()
+            client.credentials(**header)
+            try:
+                barrier.wait(timeout=20)
+                resp = client.post(url, payload, format="json")
+                code = resp.status_code
+            except Exception as exc:  # pragma: no cover - surfaced in the assert
+                code = repr(exc)
+            finally:
+                connections.close_all()
+            with guard:
+                statuses.append(code)
+
+        threads = [
+            threading.Thread(target=pack, args=(header,))
+            for header in (header_a, header_b)
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        # The line only owes 1000 m, so it can be filled once: one request wins and
+        # the other is refused.
+        self.assertEqual(len(statuses), 2, statuses)
+        self.assertEqual(statuses.count(status.HTTP_200_OK), 1, statuses)
+        self.assertEqual(statuses.count(status.HTTP_400_BAD_REQUEST), 1, statuses)
+
+        self.variant.refresh_from_db()
+        self.line.refresh_from_db()
+
+        # No roll was left negative, the recorded cuts equal the metres actually
+        # granted, and the warehouse total still agrees with the rolls.
+        from apps.items.models import FabricRoll
+        from apps.items.rolls import roll_invariant_holds
+        from apps.orders.models import RollAllocation
+
+        remaining = list(
+            FabricRoll.objects.filter(variant=self.variant).values_list(
+                "remaining_meters", flat=True
+            )
+        )
+        self.assertTrue(all(value >= Decimal("0.000") for value in remaining), remaining)
+        # 1100 received less the single granted pack.
+        self.assertEqual(
+            sum(remaining), Decimal("400.000")
+        )
+        self.assertEqual(self.variant.stock_meters, Decimal("400.000"))
+        self.assertTrue(roll_invariant_holds(self.variant))
+        self.assertEqual(self.line.allocated_quantity, Decimal("700.000"))
+        self.assertEqual(
+            sum(
+                RollAllocation.objects.filter(
+                    allocation__order_item=self.line
+                ).values_list("metres", flat=True),
+                Decimal("0.000"),
+            ),
+            Decimal("700.000"),
+        )
+
+
+class ScanRollPackingTests(OrderTestBase):
+    """A scanned roll label fills the line it was scanned against, and only it.
+
+    The label carries a ``FabricRoll`` primary key, so a scan is specific: it names
+    one physical roll of one colour. These tests pin what the admin sees when the
+    label is right, and that a wrong, spent or foreign label is refused with
+    something worth reading rather than quietly packing the wrong cloth.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from apps.items.rolls import receive_roll
+
+        # The colour under test is tracked by rolls, so its warehouse total is the
+        # sum of the rolls rather than a figure typed in by hand.
+        FabricVariant.objects.filter(pk=self.variant.pk).update(stock_meters=ZERO)
+        self.rolls = [
+            receive_roll(self.variant, Decimal("600")),
+            receive_roll(self.variant, Decimal("400")),
+        ]
+        self.variant.refresh_from_db()
+
+        # A second colour, so a label from the wrong fabric has somewhere to be
+        # scanned from.
+        self.other_fabric = Fabric.objects.create(
+            name="Linen 200 GSM", price_per_meter=Decimal("14.00")
+        )
+        self.other_variant = FabricVariant.objects.create(
+            fabric=self.other_fabric,
+            display_order="Ivory",
+            stock_meters=Decimal("0.000"),
+        )
+        AgentItem.objects.create(agent=self.agent, variant=self.other_variant)
+        self.other_roll = receive_roll(self.other_variant, Decimal("250"))
+
+        self.order = self.make_draft()
+        self.line = self.add_line(self.order, 1000)
+        self.place(self.order)
+        self.order.refresh_from_db()
+
+    def scan_url(self, line=None):
+        line = line or self.line
+        return f"/api/orders/{self.order.pk}/items/{line.pk}/pack/scan-roll/"
+
+    def undo_url(self, line=None):
+        line = line or self.line
+        return f"/api/orders/{self.order.pk}/items/{line.pk}/pack/undo-scan/"
+
+    def scan(self, roll, line=None):
+        self.auth(self.admin)
+        return self.client.post(
+            self.scan_url(line), {"roll": roll.pk}, format="json"
+        )
+
+    def test_a_scanned_roll_fills_the_line_with_that_roll_s_own_metres(self):
+        roll = self.rolls[0]
+
+        resp = self.scan(roll)
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line.refresh_from_db()
+        self.order.refresh_from_db()
+        roll.refresh_from_db()
+        self.variant.refresh_from_db()
+        # The roll is the unit: all 600 m of it went to this line, no more.
+        self.assertEqual(self.line.allocated_quantity, Decimal("600.000"))
+        self.assertEqual(self.line.outstanding_quantity, Decimal("400.000"))
+        self.assertEqual(roll.remaining_meters, ZERO)
+        self.assertFalse(roll.is_active)
+        # 1000 received, 600 cut, and the warehouse total agrees with the rolls.
+        self.assertEqual(self.variant.stock_meters, Decimal("400.000"))
+        self.assertEqual(resp.data["stock_meters"], "400.000")
+        self.assertEqual(resp.data["rolls"][0]["roll_number"], roll.roll_number)
+        self.assertEqual(resp.data["rolls"][0]["metres"], "600.000")
+
+    def test_a_scan_is_recorded_as_a_confirmed_round_naming_the_roll(self):
+        roll = self.rolls[0]
+
+        resp = self.scan(roll)
+
+        packing_round = PackingRound.objects.get(pk=resp.data["round"])
+        self.assertEqual(packing_round.status, "CONFIRMED")
+        self.assertEqual(packing_round.variant, self.variant)
+        self.assertEqual(packing_round.round_size, Decimal("600.000"))
+        allocation = Allocation.objects.get()
+        self.assertEqual(allocation.order_item, self.line)
+        self.assertEqual(allocation.metres, Decimal("600.000"))
+        # The round is the same audit trail a hand-approved round leaves.
+        self.assertTrue(
+            OrderLog.objects.filter(
+                order=self.order, action="ALLOCATION_MADE"
+            ).exists()
+        )
+
+    def test_two_scans_of_different_rolls_accumulate_on_the_line(self):
+        self.scan(self.rolls[1])
+        resp = self.scan(self.rolls[0])
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line.refresh_from_db()
+        self.variant.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("1000.000"))
+        self.assertEqual(self.line.outstanding_quantity, ZERO)
+        self.assertEqual(self.variant.stock_meters, Decimal("0.000"))
+        self.assertEqual(Allocation.objects.count(), 2)
+
+    def test_undoing_the_last_scan_gives_only_that_roll_back(self):
+        self.scan(self.rolls[0])
+        self.scan(self.rolls[1])
+        self.auth(self.admin)
+
+        resp = self.client.post(self.undo_url(), {}, format="json")
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.line.refresh_from_db()
+        self.order.refresh_from_db()
+        self.rolls[0].refresh_from_db()
+        self.rolls[1].refresh_from_db()
+        self.variant.refresh_from_db()
+        self.assertEqual(self.rolls[1].remaining_meters, Decimal("400.000"))
+        self.assertTrue(self.rolls[1].is_active)
+        # The earlier scan is untouched.
+        self.assertEqual(self.rolls[0].remaining_meters, ZERO)
+        self.assertFalse(self.rolls[0].is_active)
+        self.assertEqual(self.line.allocated_quantity, Decimal("600.000"))
+        self.assertEqual(self.variant.stock_meters, Decimal("400.000"))
+
+    def test_undo_leaves_a_hand_packed_line_alone(self):
+        # Packed by hand with an explicit breakdown, then asked to undo: there is
+        # no scan on this line, so there is nothing for undo to reverse.
+        self.auth(self.admin)
+        packed = self.client.post(
+            f"/api/orders/{self.order.pk}/items/{self.line.pk}/pack/",
+            {
+                "metres": "500",
+                "rolls": [{"roll": self.rolls[0].pk, "metres": "500"}],
+            },
+            format="json",
+        )
+        self.assertEqual(packed.status_code, status.HTTP_200_OK, packed.data)
+
+        resp = self.client.post(self.undo_url(), {}, format="json")
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("no scan to undo", resp.data["error"])
+        self.line.refresh_from_db()
+        self.rolls[0].refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("500.000"))
+        self.assertEqual(self.rolls[0].remaining_meters, Decimal("100.000"))
+
+    def test_a_label_from_another_colour_is_refused_naming_both_fabrics(self):
+        resp = self.scan(self.other_roll)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("Linen 200 GSM", resp.data["error"])
+        self.assertIn("Cotton Cambric 140 GSM", resp.data["error"])
+        self.line.refresh_from_db()
+        self.other_roll.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, ZERO)
+        self.assertEqual(self.other_roll.remaining_meters, Decimal("250.000"))
+
+    def test_a_label_for_no_roll_at_all_is_refused(self):
+        self.auth(self.admin)
+        resp = self.client.post(self.scan_url(), {"roll": 999999}, format="json")
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("does not belong to any roll", resp.data["error"])
+
+    def test_a_spent_rolls_label_is_refused(self):
+        spent = self.rolls[0]
+        self.scan(spent)
+        # Put the line back in debt so the refusal can only be about the roll.
+        self.line.allocated_quantity = ZERO
+        self.line.save(update_fields=["allocated_quantity"])
+
+        resp = self.scan(spent)
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been used up", resp.data["error"])
+        self.assertEqual(Allocation.objects.count(), 1)
+
+    def test_a_scan_is_refused_once_the_order_is_out_of_reach(self):
+        self.order.status = "DISPATCHED"
+        self.order.save(update_fields=["status"])
+
+        resp = self.scan(self.rolls[0])
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not open for packing", resp.data["error"])
+        self.rolls[0].refresh_from_db()
+        self.assertEqual(self.rolls[0].remaining_meters, Decimal("600.000"))
+
+    def test_a_line_with_no_variant_has_no_roll_to_scan(self):
+        # A custom fabric line: no colour, so no roll of it exists to scan.
+        custom = self.make_draft()
+        custom_line = OrderItem.objects.create(
+            order=custom,
+            fabric=self.fabric,
+            variant=None,
+            fabric_name=self.fabric.name,
+            rate_per_meter=self.fabric.price_per_meter,
+            ordered_quantity=Decimal("100.000"),
+        )
+        recompute_order_total(custom)
+        self.place(custom)
+        self.auth(self.admin)
+
+        resp = self.client.post(
+            f"/api/orders/{custom.pk}/items/{custom_line.pk}/pack/scan-roll/",
+            {"roll": self.rolls[0].pk},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("no fabric variant", resp.data["error"])
+
+
+class ScanRollConcurrencyTests(TransactionTestCase):
+    """Two scans of one label must not both cut that roll.
+
+    A roll is scanned by picking it up, so the same label can be scanned twice at
+    once -- two scanners, or a retry after a dropped connection. The roll row is
+    locked before its remaining length is read, so exactly one request wins and the
+    other is told the roll is gone rather than overdrawing it.
+    """
+
+    reset_sequences = True
+
+    def setUp(self):
+        self.admin = User.objects.create_user(
+            username="admin1", email="admin1@test.com",
+            password="pass1234", role="ADMIN",
+        )
+        agent_user = User.objects.create_user(
+            username="agent1", email="agent1@test.com",
+            password="pass1234", role="AGENT",
+        )
+        agent = Agent.objects.create(user=agent_user, contact="111")
+        customer = Customer.objects.create(
+            name="ABC Fashions", contact="2222222222", agent=agent
+        )
+        self.fabric = Fabric.objects.create(
+            name="Cotton Cambric 140 GSM", price_per_meter=Decimal("9.00")
+        )
+        self.variant = FabricVariant.objects.create(
+            fabric=self.fabric, display_order="Natural", stock_meters=Decimal("0.000")
+        )
+        AgentItem.objects.create(agent=agent, variant=self.variant)
+
+        from apps.items.rolls import receive_roll
+
+        self.roll = receive_roll(self.variant, Decimal("600"))
+
+        self.order = Order.objects.create(
+            customer=customer, agent=agent, created_by=agent_user, status="PENDING"
+        )
+        self.line = OrderItem.objects.create(
+            order=self.order,
+            fabric=self.fabric,
+            variant=self.variant,
+            fabric_name=self.fabric.name,
+            rate_per_meter=self.fabric.price_per_meter,
+            variant_display_order=self.variant.display_order,
+            ordered_quantity=Decimal("600.000"),
+        )
+        recompute_order_total(self.order)
+
+    def test_two_scans_of_the_same_roll_leave_one_winner(self):
+        url = f"/api/orders/{self.order.pk}/items/{self.line.pk}/pack/scan-roll/"
+        barrier = threading.Barrier(2)
+        statuses = []
+        guard = threading.Lock()
+
+        def scan():
+            client = APIClient()
+            client.credentials(**get_auth_header(self.admin))
+            try:
+                barrier.wait(timeout=20)
+                code = client.post(
+                    url, {"roll": self.roll.pk}, format="json"
+                ).status_code
+            except Exception as exc:  # pragma: no cover - surfaced in the assert
+                code = repr(exc)
+            finally:
+                connections.close_all()
+            with guard:
+                statuses.append(code)
+
+        threads = [threading.Thread(target=scan) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=60)
+
+        self.assertEqual(len(statuses), 2, statuses)
+        self.assertEqual(statuses.count(status.HTTP_200_OK), 1, statuses)
+        self.assertEqual(statuses.count(status.HTTP_400_BAD_REQUEST), 1, statuses)
+
+        self.roll.refresh_from_db()
+        self.variant.refresh_from_db()
+        self.line.refresh_from_db()
+        # The cloth moved once and only once.
+        self.assertEqual(self.roll.remaining_meters, ZERO)
+        self.assertEqual(self.variant.stock_meters, ZERO)
+        self.assertEqual(self.line.allocated_quantity, Decimal("600.000"))
+        self.assertEqual(Allocation.objects.count(), 1)
+
+
 class EditFlowTests(OrderTestBase):
     def setUp(self):
         super().setUp()
@@ -2242,6 +2689,89 @@ class LineRateOverrideTests(OrderTestBase):
         self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
         self.order.refresh_from_db()
         self.assertEqual(self.order.items.get().ordered_quantity, Decimal("200.000"))
+
+    # ── editing a line keeps the rate it was given ─────────────────────────
+
+    def test_editing_the_quantity_keeps_an_agreed_rate(self):
+        # The order page sends the colour again with every edit, so "no rate in
+        # the payload" has to mean "change nothing", not "go back to catalogue".
+        line = self.add_line(self.order, 100, rate="8.00")
+        self.auth()
+
+        resp = self.client.patch(
+            f"/api/orders/order-items/{line.pk}/",
+            {"ordered_quantity": "200", "variant": self.variant.pk},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        line.refresh_from_db()
+        self.assertEqual(line.ordered_quantity, Decimal("200.000"))
+        self.assertEqual(line.rate_per_meter, Decimal("8.00"))
+        self.assertEqual(line.original_rate_per_meter, Decimal("9.00"))
+        self.assertEqual(line.rate_overridden_by, self.agent_user)
+        self.assertTrue(line.is_rate_overridden)
+        self.order.refresh_from_db()
+        self.assertEqual(self.order.computed_total, Decimal("1600.00"))
+
+    def test_a_catalogue_line_stays_at_the_catalogue_after_an_edit(self):
+        line = self.add_line(self.order, 100)
+        self.auth()
+
+        self.client.patch(
+            f"/api/orders/order-items/{line.pk}/",
+            {"ordered_quantity": "200", "variant": self.variant.pk},
+            format="json",
+        )
+
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("9.00"))
+        self.assertEqual(line.original_rate_per_meter, Decimal("9.00"))
+        self.assertFalse(line.is_rate_overridden)
+
+    def test_changing_the_colour_rebases_the_rate_snapshot(self):
+        other = FabricVariant.objects.create(
+            fabric=self.fabric, display_order="Black", stock_meters=Decimal("500")
+        )
+        line = self.add_line(self.order, 100, rate="8.00")
+        self.auth()
+
+        resp = self.client.patch(
+            f"/api/orders/order-items/{line.pk}/",
+            {"ordered_quantity": "100", "variant": other.pk},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        line.refresh_from_db()
+        # Different cloth with no agreed rate: the line is at catalogue, so there
+        # is no difference left to report and nobody left to credit with it.
+        self.assertEqual(line.variant_id, other.pk)
+        self.assertEqual(line.rate_per_meter, Decimal("9.00"))
+        self.assertEqual(line.original_rate_per_meter, Decimal("9.00"))
+        self.assertIsNone(line.rate_overridden_by)
+        self.assertIsNone(line.rate_overridden_at)
+        self.assertFalse(line.is_rate_overridden)
+
+    def test_changing_the_colour_with_a_rate_takes_the_new_rate(self):
+        other = FabricVariant.objects.create(
+            fabric=self.fabric, display_order="Black", stock_meters=Decimal("500")
+        )
+        line = self.add_line(self.order, 100, rate="8.00")
+        self.auth()
+
+        resp = self.client.patch(
+            f"/api/orders/order-items/{line.pk}/",
+            {"ordered_quantity": "100", "variant": other.pk, "rate_override": "7.50"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        line.refresh_from_db()
+        self.assertEqual(line.rate_per_meter, Decimal("7.50"))
+        self.assertEqual(line.original_rate_per_meter, Decimal("9.00"))
+        self.assertEqual(line.rate_overridden_by, self.agent_user)
+        self.assertTrue(line.is_rate_overridden)
 
     # ── the line reports what it was repriced from ─────────────────────────
 

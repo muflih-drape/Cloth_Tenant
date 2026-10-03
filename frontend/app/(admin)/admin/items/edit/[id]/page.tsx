@@ -13,6 +13,7 @@ import { updateFabric } from "@/lib/updateItem";
 import { toastError, toastSuccess } from "@/lib/toast";
 import EditVariantRow from "./editVariantRow";
 import CropModal from "../../new/cropModal";
+import PhysicalRollsPanel from "@/components/items/physicalRollsPanel";
 import type { EditableVariant, FabricDetails } from "@/types/item";
 import { formatMeters, toMeters } from "@/types/item";
 import { useAuth } from "@/context/AuthContext";
@@ -86,6 +87,10 @@ export default function FabricEditPage() {
             imageUrl: variant.image ?? null,
             newImage: null,
             imagePreview: null,
+            // A colour whose metres live on physical rolls: the figure above is
+            // read-only and its only way to change is through the roll panel.
+            isRollTracked: variant.is_roll_tracked ?? false,
+            rollCount: variant.roll_count ?? 0,
           })),
         );
       })
@@ -114,9 +119,26 @@ export default function FabricEditPage() {
         imageUrl: null,
         newImage: null,
         imagePreview: null,
+        // A colour being created has no rolls yet, so its opening figure is set
+        // here in the ordinary way.
+        isRollTracked: false,
+        rollCount: 0,
       },
     ]);
   };
+
+  /**
+   * A roll received, cut or adjusted moves the colour's warehouse total, so the
+   * read-only figure beside the colour has to follow it without a page reload.
+   */
+  const handleRollStockChanged = (localId: string, stockMeters: string) =>
+    setVariants((prev) =>
+      prev.map((v) =>
+        v.localId === localId
+          ? { ...v, stockMeters, isRollTracked: true }
+          : v,
+      ),
+    );
 
   const handleVariantImageUpload = async (
     localId: string,
@@ -387,6 +409,20 @@ export default function FabricEditPage() {
                     fileRefs.current[variant.localId]?.click()
                   }
                 />
+
+                {/* Physical rolls: the only place a roll-tracked colour's
+                    metre total can change, once it has rolls. */}
+                {variant.backendId > 0 && (
+                  <div className="mt-2">
+                    <PhysicalRollsPanel
+                      variantId={variant.backendId}
+                      label={common.name || "Fabric"}
+                      onStockChanged={(stock) =>
+                        handleRollStockChanged(variant.localId, stock)
+                      }
+                    />
+                  </div>
+                )}
               </div>
             ))}
           </div>
@@ -403,7 +439,9 @@ export default function FabricEditPage() {
           <p className="mt-3 text-[11px] text-gray-400 leading-relaxed">
             Colours are what orders are placed against, and a colour&apos;s metre
             count is its warehouse stock. Edit it here and it is saved with the
-            fabric.
+            fabric. A colour tracked by physical rolls shows its total read-only
+            instead: that figure is the sum of its rolls, so it changes by
+            receiving, packing or adjusting a roll.
           </p>
 
           {variantCrop && (

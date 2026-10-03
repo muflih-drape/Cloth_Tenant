@@ -5,6 +5,10 @@ export type OrderStatus = "DRAFT" | "PENDING" | "EDITING" | "PACKED" | "DISPATCH
  * cloth: `stockMeters` is physical on-hand stock in the warehouse. Metres are
  * sent as strings by the API (Django decimals) and parsed where numbers are
  * needed, so nothing here silently rounds a 0.5 m cut.
+ *
+ * `is_roll_tracked` says whether the colour's metres are broken down into
+ * physical rolls. When it is true the stock figure is the roll total and must be
+ * changed by receiving, cutting or adjusting a roll -- never by typing it in.
  */
 export interface FabricVariant {
   id: number;
@@ -13,6 +17,96 @@ export interface FabricVariant {
   display_order?: string;
   stock_meters: string;
   stock_updated_at?: string;
+  is_roll_tracked?: boolean;
+  roll_count?: number;
+  roll_stock_meters?: string;
+}
+
+/** One physical roll of cloth on the shelf (or in a customer's hands). */
+export interface FabricRoll {
+  id: number;
+  variant: number;
+  roll_number: string;
+  note: string;
+  original_meters: string;
+  remaining_meters: string;
+  consumed_meters: string;
+  is_active: boolean;
+  is_exhausted: boolean;
+  fabric_name?: string;
+  display_order?: string;
+  created_at: string;
+  updated_at: string;
+}
+
+/** Roll counts and totals for one colour, from the roll endpoints. */
+export interface RollSummary {
+  is_roll_tracked: boolean;
+  roll_count: number;
+  active_roll_count: number;
+  exhausted_roll_count: number;
+  total_received_meters: string;
+  roll_stock_meters: string;
+  consumed_meters: string;
+  largest_roll_meters: string;
+  smallest_roll_meters: string;
+}
+
+export interface VariantRollsResponse extends RollSummary {
+  variant: number;
+  fabric: string;
+  display_order: string;
+  /** The fabric's price, so a roll's label can be valued without another read. */
+  price_per_meter: string;
+  stock_meters: string;
+  rolls: FabricRoll[];
+}
+
+export interface ReceiveRollResponse extends RollSummary {
+  roll: FabricRoll;
+  stock_meters: string;
+}
+
+export interface BulkReceiveRollsResponse extends RollSummary {
+  created: number;
+  total_meters: string;
+  stock_meters: string;
+  rolls: FabricRoll[];
+}
+
+/** One line of a roll's history: metres cut off it, and where they went. */
+export interface RollHistoryEntry {
+  id: number;
+  roll_number: string;
+  metres: string;
+  is_reversed: boolean;
+  created_at: string;
+  round: number | null;
+  round_status: string | null;
+  order: number | null;
+  order_status: string | null;
+  customer: string | null;
+  order_item: number;
+}
+
+export interface RollHistoryResponse {
+  roll: FabricRoll;
+  entries: RollHistoryEntry[];
+}
+
+/** Which rolls a packing of N metres would be cut from, oldest first. */
+export interface RollCutPlan {
+  rolls: {
+    roll: number;
+    roll_number: string;
+    metres: string;
+    remaining_before: string;
+    remaining_after: string;
+  }[];
+  requested_meters: string;
+  covered_meters: string;
+  shortfall_meters: string;
+  available_meters: string;
 }
 
 export interface Fabric {
@@ -37,6 +131,12 @@ export interface FabricVariantRequest {
   display_order?: string | null;
   /** Warehouse stock in metres; sent for new and existing colours. */
   stock_meters?: string | number;
+  /**
+   * Set for a colour whose metres live on physical rolls. `stock_meters` is then
+   * left out of the payload entirely: that colour's total is the roll total, and
+   * only receiving, cutting or adjusting a roll may move it.
+   */
+  is_roll_tracked?: boolean;
 }
 
 export interface FabricRequest {
@@ -66,6 +166,9 @@ export interface VariantAllItem {
   display_order?: string;
   stock_meters: string;
   stock_updated_at: string;
+  is_roll_tracked?: boolean;
+  roll_count?: number;
+  roll_stock_meters?: string;
 }
 
 export type VariantAllResponse = VariantAllItem[];
@@ -135,6 +238,12 @@ export interface EditableVariant {
   imageUrl: string | null;
   newImage: File | null;
   imagePreview: string | null;
+  /**
+   * True once the colour has physical rolls. Its metre count is then owned by
+   * those rolls: shown read-only here, and left out of the save payload.
+   */
+  isRollTracked?: boolean;
+  rollCount?: number;
 }
 
 export type WizardStep =

@@ -107,6 +107,9 @@ class OrderItemSerializer(serializers.ModelSerializer):
     line_total = serializers.SerializerMethodField()
     allocation_count = serializers.SerializerMethodField()
     is_rate_overridden = serializers.BooleanField(read_only=True)
+    #: Whether this colour's metres live on physical rolls, so the order page can
+    #: offer the scan-a-roll control instead of a typed figure.
+    is_roll_tracked = serializers.SerializerMethodField()
     rate_overridden_by = serializers.CharField(
         source="rate_overridden_by.username", read_only=True
     )
@@ -140,6 +143,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
             "outstanding_quantity",
             "line_total",
             "allocation_count",
+            "is_roll_tracked",
         ]
         read_only_fields = (
             "order",
@@ -157,6 +161,11 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
     def get_allocation_count(self, obj):
         return obj.allocations.count()
+
+    def get_is_roll_tracked(self, obj):
+        from apps.items.rolls import is_roll_tracked
+
+        return obj.variant_id is not None and is_roll_tracked(obj.variant)
 
     def validate(self, attrs):
         """Keep the line internally consistent and its snapshots honest.
@@ -185,11 +194,14 @@ class OrderItemSerializer(serializers.ModelSerializer):
                 {"variant": "This fabric has been deleted."}
             )
 
-        if (
-            self.instance is not None
-            and self.instance.variant_id != variant.id
-            and self.instance.allocations.exists()
-        ):
+        # Whether this edit moves the line onto different cloth. A line that stays
+        # on its colour must keep whatever rate was agreed for it, even though the
+        # client sends the colour again with every edit.
+        changing_variant = (
+            self.instance is not None and self.instance.variant_id != variant.id
+        )
+
+        if changing_variant and self.instance.allocations.exists():
             raise serializers.ValidationError(
                 {
                     "variant": "This line has already been packed, so the colour "
@@ -204,8 +216,19 @@ class OrderItemSerializer(serializers.ModelSerializer):
 
         if override is not None:
             attrs.update(self._rate_attrs(override, variant.fabric.price_per_meter))
-        else:
-            attrs["rate_per_meter"] = variant.fabric.price_per_meter
+        elif changing_variant:
+            # Different cloth, no agreed rate: bill the new colour's catalogue
+            # rate and rebase the snapshot onto it. Leaving the old snapshot and
+            # the old "repriced by" behind would report a difference that no
+            # longer exists and credit the wrong person with it.
+            attrs.update(
+                {
+                    "rate_per_meter": variant.fabric.price_per_meter,
+                    "original_rate_per_meter": variant.fabric.price_per_meter,
+                    "rate_overridden_by": None,
+                    "rate_overridden_at": None,
+                }
+            )
 
         return attrs
 
