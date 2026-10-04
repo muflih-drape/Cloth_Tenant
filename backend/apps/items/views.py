@@ -592,9 +592,12 @@ class FabricVariantViewSet(ModelViewSet):
     )
     @action(detail=True, methods=["get", "post"], url_path="rolls")
     def rolls(self, request, pk=None):
+        # Already carries select_related("fabric") and prefetch_related("rolls"),
+        # so the fabric's name and rate and this colour's rolls are both in hand.
         variant = self.get_object()
 
         if request.method == "GET":
+            # Free: these are the prefetched rows.
             rows = list(variant.rolls.all())
             return Response(
                 {
@@ -605,7 +608,9 @@ class FabricVariantViewSet(ModelViewSet):
                     # where that value comes from -- the roll stores metres only.
                     "price_per_meter": str(variant.fabric.price_per_meter),
                     "stock_meters": str(variant.stock_meters),
-                    **roll_payload(variant),
+                    # Counted from the rows already read, not fetched again to be
+                    # counted: this used to be a second identical query.
+                    **roll_payload(variant, rows=rows),
                     "rolls": FabricRollSerializer(rows, many=True).data,
                 }
             )

@@ -33,7 +33,13 @@ from apps.orders.stock import (
     return_to_stock,
     stock_movement_for_lines,
 )
-from apps.orders.models import Order, OrderItem, OrderLog, UserViewedOrder
+from apps.orders.models import (
+    Order,
+    OrderItem,
+    OrderLog,
+    PackingBundle,
+    UserViewedOrder,
+)
 from apps.orders.serializers import (
     AddOrderItemSerializer,
     InvoiceSerializer,
@@ -605,10 +611,36 @@ class OrderViewSet(ModelViewSet):
         if not _may_touch(request.user, order):
             return Response({"error": "Unauthorized"}, status=403)
 
+        # Cloth that has left the warehouse cannot be put back on its roll by
+        # deleting the paperwork, so a dispatched order is not deletable at all.
+        # Checked before the transaction because there is nothing to undo: no roll
+        # is credited and no record is touched on this path.
+        if order.status == "DISPATCHED":
+            return Response(
+                {
+                    "error": (
+                        "This order has already been dispatched and cannot be "
+                        "deleted. Goods have left the warehouse."
+                    )
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
         # Deleting a live order gives back any cloth packing had already handed it.
+        # The restoration has to happen before `order.delete()`, because OrderItem,
+        # Allocation and RollAllocation all cascade and the roll records that say
+        # which roll each metre came off are gone with them.
         with transaction.atomic():
-            if order.status != "DRAFT" and order.status != "DISPATCHED":
+            if order.status != "DRAFT":
+                # Returns the metres to the exact rolls they were cut from and
+                # marks those RollAllocation rows reversed, so the same cloth can
+                # never be credited twice. Any bundle still open on a deleted
+                # order is a box that will never be sealed, so it is closed out
+                # rather than left open on an order that no longer exists.
                 stock_movement_for_lines(order.items.all(), direction="return")
+                PackingBundle.objects.filter(order=order, status="OPEN").update(
+                    status="CANCELLED"
+                )
 
             OrderLog.record(
                 order,

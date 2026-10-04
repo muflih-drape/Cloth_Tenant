@@ -137,6 +137,12 @@ export interface FabricVariantRequest {
    * only receiving, cutting or adjusting a roll may move it.
    */
   is_roll_tracked?: boolean;
+  /**
+   * Physical rolls the colour arrives on. When any are sent, the API creates them
+   * and takes the colour's stock from their sum, so `stock_meters` is not also
+   * applied on top of them.
+   */
+  rolls?: VariantRollDraft[];
 }
 
 export interface FabricRequest {
@@ -215,12 +221,29 @@ export interface CustomerRequirementResponse {
 }
 
 /** What the admin catalogue form holds in local state. */
+/**
+ * One roll the admin is receiving on the create screen. Structurally the same as
+ * `RollDraft` in `components/items/receiveRollsDialog`, declared here so the
+ * types stay free of component imports.
+ */
+export interface VariantRollDraft {
+  meters: string;
+  note: string;
+}
+
 export interface ColorVariant {
   id: string;
   stockMeters: string;
   displayOrder: string;
   image: File | null;
   imagePreview: string | null;
+  /**
+   * Physical rolls this colour arrives on, collected on the create screen and
+   * received when the fabric is saved. Present only while it is non-empty: a
+   * colour with rolls takes its stock from them, so the typed opening figure is
+   * not applied on top.
+   */
+  rolls?: VariantRollDraft[];
 }
 
 /** The fabric-wide fields the wizard collects in step 1. */

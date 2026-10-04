@@ -69,6 +69,7 @@ export function fabricToFormData(data: Record<string, any>): FormData {
       stock_meters?: string | number | null;
       remove_image?: boolean;
       is_roll_tracked?: boolean;
+      rolls?: Array<{ meters: string; note?: string }>;
     }>
   ).forEach((variant, index: number) => {
     if (variant.id !== undefined && variant.id !== null) {
@@ -89,6 +90,19 @@ export function fabricToFormData(data: Record<string, any>): FormData {
         variant.display_order ?? "",
       );
     }
+    // Rolls the colour is being created with. The API receives them as the colour's
+    // stock and does not also apply `stock_meters`, so the opening figure and the
+    // rolls can never be added together. Sent ahead of the early return below,
+    // because a colour can be created on its rolls in the same request.
+    (variant.rolls ?? []).forEach((roll, rollIndex) => {
+      formData.append(`variants[${index}]rolls[${rollIndex}][meters]`, roll.meters);
+      if (roll.note) {
+        formData.append(
+          `variants[${index}]rolls[${rollIndex}][note]`,
+          roll.note,
+        );
+      }
+    });
     // A colour tracked by physical rolls owns its own total: that figure is the
     // roll sum, and only receiving, cutting or adjusting a roll may move it.
     // Sending it here would either be refused or, worse, silently contradict the

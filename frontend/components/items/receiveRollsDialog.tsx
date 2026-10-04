@@ -16,6 +16,12 @@ interface Props {
   onConfirm: (rolls: RollDraft[]) => Promise<void>;
   /** Shown in the header, e.g. `Cotton Cambric — Natural`. */
   label?: string;
+  /**
+   * Whether to offer the per-roll note box. Receiving a whole delivery stores
+   * only the lengths, so a screen that cannot persist a note hides the box rather
+   * than quietly dropping what was typed.
+   */
+  showNote?: boolean;
 }
 
 /**
@@ -30,6 +36,7 @@ export default function ReceiveRollsDialog({
   onClose,
   onConfirm,
   label,
+  showNote = true,
 }: Props) {
   const [rolls, setRolls] = useState<RollDraft[]>([{ meters: "", note: "" }]);
   const [saving, setSaving] = useState(false);
@@ -151,16 +158,18 @@ export default function ReceiveRollsDialog({
                   aria-label={`Roll ${index + 1} metres`}
                 />
               </div>
-              <div className="flex-1">
-                <Input
-                  placeholder="Note (optional)"
-                  value={roll.note}
-                  onChange={(e) => setRoll(index, { note: e.target.value })}
-                  disabled={saving}
-                  className="h-10 text-sm"
-                  aria-label={`Roll ${index + 1} note`}
-                />
-              </div>
+              {showNote && (
+                <div className="flex-1">
+                  <Input
+                    placeholder="Note (optional)"
+                    value={roll.note}
+                    onChange={(e) => setRoll(index, { note: e.target.value })}
+                    disabled={saving}
+                    className="h-10 text-sm"
+                    aria-label={`Roll ${index + 1} note`}
+                  />
+                </div>
+              )}
               <button
                 type="button"
                 onClick={() => removeRoll(index)}

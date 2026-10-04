@@ -1,6 +1,7 @@
 import uuid
 from decimal import Decimal
 
+from django.conf import settings
 from django.core.validators import MinValueValidator
 from django.db import models
 from django.utils import timezone
@@ -149,4 +150,64 @@ class FabricRoll(models.Model):
         """Metres cut off this roll so far."""
         return (self.original_meters or Decimal("0")) - (
             self.remaining_meters or Decimal("0")
+        )
+
+
+class StockMovement(models.Model):
+    """A recorded change to a colour's warehouse total that is otherwise silent.
+
+    Most stock movement is reconstructable: a roll that was cut from says so, and
+    a roll that was received is still on the shelf. One transition is not. A colour
+    created with a plain opening metre figure has stock that belongs to no roll,
+    and the first roll received on it replaces that figure instead of adding to
+    it -- otherwise the warehouse would count the same cloth twice. Without a
+    record, the total dropping from the opening figure to the roll total looks
+    like cloth going missing, so the discard is written down here.
+
+    This is a log of notable transitions, not a complete double-entry ledger: it
+    records what would otherwise leave no trace, and nothing else.
+    """
+
+    #: A colour's metres were replaced by its first physical rolls.
+    OPENING_FIGURE_DISCARDED = "opening_figure_discarded"
+    REASON_CHOICES = [
+        (OPENING_FIGURE_DISCARDED, "Opening figure replaced by first roll"),
+    ]
+
+    variant = models.ForeignKey(
+        FabricVariant, related_name="stock_movements", on_delete=models.CASCADE
+    )
+
+    #: Signed: negative when the total went down. The figure the admin needs to
+    #: explain the change, kept alongside it.
+    metres = models.DecimalField(max_digits=14, decimal_places=3)
+
+    #: Both ends of the change, so one row is enough to explain it without
+    #: having to reconstruct the surrounding history.
+    stock_before = models.DecimalField(max_digits=14, decimal_places=3)
+    stock_after = models.DecimalField(max_digits=14, decimal_places=3)
+
+    reason = models.CharField(max_length=40, choices=REASON_CHOICES)
+
+    #: The warehouse label of the roll that triggered it, snapshotted so the
+    #: record still reads properly if that roll is later deleted.
+    roll_number = models.CharField(max_length=32, blank=True, default="")
+
+    #: Who did it, where known. Receiving can also come from a service call.
+    created_by = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name="+",
+    )
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+
+    class Meta:
+        ordering = ["-id"]
+
+    def __str__(self):
+        return (
+            f"{self.variant_id}: {self.metres} m "
+            f"({self.stock_before} -> {self.stock_after}) {self.reason}"
         )

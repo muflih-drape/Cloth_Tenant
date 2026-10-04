@@ -34,7 +34,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Max, Sum
 from django.utils import timezone
 
-from .models import FabricRoll, FabricVariant
+from .models import FabricRoll, FabricVariant, StockMovement
 from .services import sync_out_of_stock
 
 logger = logging.getLogger(__name__)
@@ -80,7 +80,7 @@ def roll_stock(variant):
     )
 
 
-def roll_summary(variant):
+def roll_summary(variant, rows=None):
     """Counts and totals the inventory screens show for one colour.
 
     Read from the variant's rolls in Python rather than as several aggregates: a
@@ -89,8 +89,12 @@ def roll_summary(variant):
     For a colour with no rolls -- every variant that predates roll tracking --
     the roll figures mirror the warehouse total, so a screen can show one number
     whichever shape the colour has.
+
+    ``rows`` is the colour's already-read rolls, for a caller that has them: a
+    screen listing a roll breaks down both from the same read, and asking again
+    here would fetch the identical rows a second time.
     """
-    rolls = list(FabricRoll.objects.filter(variant=variant))
+    rolls = list(FabricRoll.objects.filter(variant=variant) if rows is None else rows)
     tracked = bool(rolls)
     active = [r for r in rolls if r.is_active]
     remaining = sum((Decimal(str(r.remaining_meters or ZERO)) for r in active), ZERO)
@@ -115,13 +119,13 @@ def roll_summary(variant):
     }
 
 
-def roll_payload(variant):
+def roll_payload(variant, rows=None):
     """:func:`roll_summary` as strings, ready for an API response.
 
     Every metre figure in this project crosses the wire as a string, so no
     float ever gets anywhere near cloth.
     """
-    summary = roll_summary(variant)
+    summary = roll_summary(variant, rows=rows)
     return {
         "is_roll_tracked": summary["is_roll_tracked"],
         "roll_count": summary["roll_count"],
@@ -232,6 +236,58 @@ def move_variant_stock(variant, delta):
 # --------------------------------------------------------------------------- #
 
 
+def untracked_stock_for_rolls(variant):
+    """The plain metre figure a first roll would have to replace, or zero.
+
+    A colour with no roll rows keeps the original single-figure stock model: a
+    number typed in at creation that belongs to no particular cloth. The moment a
+    real roll arrives, the total has to be the sum of the rolls, so that figure is
+    discarded rather than added on top of them -- otherwise a colour opened at
+    1000 m and then given a 100 m roll would show 1100 m of cloth it does not
+    have.
+
+    Once a colour has even one roll row this is always zero, so every later
+    receive is a genuine addition. Read before the first roll is written, since
+    after it the colour is roll-tracked.
+    """
+    if variant.rolls.exists():
+        return ZERO
+    return Decimal(str(variant.stock_meters or ZERO))
+
+
+def discard_untracked_stock(variant, received_meters, *, created_by=None):
+    """Replace a colour's opening figure with the rolls just received.
+
+    Called only for the zero-rolls-to-first-roll transition. Writes the drop to
+    :class:`~apps.items.models.StockMovement` and returns how many metres to take
+    off the receive, so the receive still lands as a single net movement rather
+    than a "drop the opening figure, then add the roll" pair.
+    """
+    untracked = untracked_stock_for_rolls(variant)
+    if untracked <= ZERO:
+        return ZERO
+
+    StockMovement.objects.create(
+        variant=variant,
+        metres=-untracked,
+        stock_before=untracked,
+        stock_after=received_meters,
+        reason=StockMovement.OPENING_FIGURE_DISCARDED,
+        created_by=created_by,
+    )
+    logger.warning(
+        "Discarded %s m of untracked opening stock on variant %s (%s / %s): "
+        "its first roll makes the stock roll-tracked, and the rolls hold %s m. "
+        "Recorded as a stock movement.",
+        untracked,
+        variant.pk,
+        variant.fabric.name,
+        variant.display_order or "unlabelled",
+        received_meters,
+    )
+    return untracked
+
+
 def next_roll_number():
     """The next human-readable roll number, e.g. ``R-000007``.
 
@@ -282,13 +338,18 @@ def receive_roll(variant, metres, *, roll_number=None, note="", created_by=None)
     The roll and the variant total move together inside one transaction and
     under the variant's row lock, so a colour can never show metres on its rolls
     that the warehouse total does not have (or the other way round).
+
+    The exception is a colour's very first roll: its stock was a plain opening
+    figure belonging to no roll, so that figure is replaced rather than added to
+    (see :func:`discard_untracked_stock`).
     """
     metres = clean_meters(metres)
 
     with transaction.atomic():
         locked = lock_variant(variant)
+        discarded = discard_untracked_stock(locked, metres, created_by=created_by)
         roll = _create_roll(locked, metres, roll_number, note)
-        move_variant_stock(locked, metres)
+        move_variant_stock(locked, metres - discarded)
         logger.info(
             "Received roll %s: %s m of variant %s (stock now %s)",
             roll.roll_number,
@@ -347,6 +408,9 @@ def receive_rolls(variant, lengths, *, created_by=None):
 
     Every roll is created and every metre added in one transaction, so a bad
     figure halfway down a delivery leaves the warehouse exactly as it was.
+
+    As with a single roll, a colour's very first delivery replaces its plain
+    opening figure instead of adding to it.
     """
     parsed = []
     for index, raw in enumerate(lengths or [], start=1):
@@ -361,12 +425,13 @@ def receive_rolls(variant, lengths, *, created_by=None):
 
     with transaction.atomic():
         locked = lock_variant(variant)
+        total = sum(parsed, ZERO)
+        discarded = discard_untracked_stock(locked, total, created_by=created_by)
         created = []
         for metres in parsed:
             roll = _create_roll(locked, metres)
             created.append(roll)
-        total = sum(parsed, ZERO)
-        move_variant_stock(locked, total)
+        move_variant_stock(locked, total - discarded)
 
     for roll in created:
         roll.refresh_from_db()

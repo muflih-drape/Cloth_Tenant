@@ -5,6 +5,7 @@ from io import BytesIO
 
 from django.conf import settings
 from django.core.files.base import ContentFile
+from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
 from PIL import Image
@@ -17,6 +18,7 @@ from .rolls import (
     RollError,
     clean_meters,
     is_roll_tracked,
+    receive_rolls,
     variant_roll_info,
 )
 from .services import sync_out_of_stock, touch_catalog
@@ -141,6 +143,27 @@ class FabricSerializer(serializers.ModelSerializer):
         return max((purge - timezone.localdate()).days, 0)
 
 
+def _roll_lengths(roll_drafts):
+    """Normalise submitted roll entries into ``receive_rolls``'s own shape.
+
+    The form sends ``{"meters": "500", "note": "..."}`` per roll, but a bare
+    number is accepted too. Anything else is passed through untouched so the
+    service produces the one message the admin sees.
+    """
+    lengths = []
+    for draft in roll_drafts or []:
+        if not isinstance(draft, dict):
+            lengths.append(draft)
+            continue
+        lengths.append(
+            {
+                "meters": draft.get("meters"),
+                "note": (draft.get("note") or "").strip()[:100],
+            }
+        )
+    return lengths
+
+
 class FabricVariantRequestSerializer(serializers.Serializer):
     id = serializers.IntegerField(required=False)
     image = serializers.FileField(required=False)
@@ -154,6 +177,20 @@ class FabricVariantRequestSerializer(serializers.Serializer):
         required=False,
         allow_null=True,
         help_text="Stock in metres; applied on create and on edit.",
+    )
+    rolls = serializers.ListField(
+        child=serializers.DictField(),
+        required=False,
+        allow_empty=True,
+        # Only ever an input: what a roll-tracked colour reports back comes from
+        # `FabricVariantSerializer`, which reads the rolls themselves.
+        write_only=True,
+        help_text=(
+            "Physical rolls this colour arrives on, one entry per roll with a "
+            "'meters' figure and an optional 'note'. When any roll is given, the "
+            "rolls are the colour's stock and 'stock_meters' is not applied on "
+            "top of them."
+        ),
     )
 
 
@@ -181,23 +218,39 @@ class CreateFabricSerializer(serializers.Serializer):
 
     def create(self, validated_data):
         variants_data = validated_data.pop("variants", [])
-        fabric = Fabric.objects.create(**validated_data)
-        for variant_data in variants_data:
-            self._create_variant(fabric, variant_data)
+        # A roll figure is validated while the rows are being written, so the whole
+        # fabric goes in together: a bad length on colour three must not leave the
+        # first two colours behind.
+        with transaction.atomic():
+            fabric = Fabric.objects.create(**validated_data)
+            for variant_data in variants_data:
+                self._create_variant(fabric, variant_data)
         return fabric
 
     def _create_variant(self, fabric, variant_data):
         image_file = variant_data.pop("image", None)
         variant_data.pop("remove_image", None)  # nothing to remove on create
+        roll_drafts = variant_data.pop("rolls", None)
         stock = variant_data.pop("stock_meters", None) or 0
         display_order = variant_data.pop("display_order", None) or None
+
+        # Rolls are the opening stock whenever any are given: the colour starts at
+        # zero and ``receive_rolls`` builds the total from the rolls, so the typed
+        # opening figure is never added on top of them. The two are deliberately
+        # not required to agree -- if they differ, the rolls are what is on hand.
+        initial_stock = ZERO if roll_drafts else stock
 
         variant = FabricVariant.objects.create(
             fabric=fabric,
             qr_code=uuid.uuid4(),
             display_order=display_order,
-            stock_meters=stock,
+            stock_meters=initial_stock,
         )
+        if roll_drafts:
+            try:
+                receive_rolls(variant, _roll_lengths(roll_drafts))
+            except RollError as exc:
+                raise serializers.ValidationError({"rolls": [str(exc)]})
         if image_file:
             self._save_variant_image(variant, image_file)
         sync_out_of_stock(fabric)

@@ -12,6 +12,10 @@ import { ColorVariant, FabricDetails } from "@/types/item";
 import { formatMeters } from "@/types/item";
 import { Modal, ModalButton } from "@/components/ui/custom/Modals";
 import { normalizeImageFile } from "@/lib/image-utils";
+import ReceiveRollsDialog, {
+  type RollDraft,
+} from "@/components/items/receiveRollsDialog";
+import { Package, Plus } from "lucide-react";
 
 interface Props {
   initial: ColorVariant;
@@ -26,6 +30,12 @@ interface Props {
  * One colour of a fabric. A colour *is* the stock-keeping unit here, so the
  * opening metre count entered on this screen is the physical cloth on hand for
  * that colour -- there is no size breakdown to fill in.
+ *
+ * The cloth can also arrive on named rolls. Rolls are optional: a colour can be
+ * created with just a metre figure, exactly as before. Once a roll is added the
+ * rolls own the stock, so the opening figure below stops being the source of it
+ * (the API takes the total from the rolls instead) -- which is why the field says
+ * so rather than quietly showing two numbers that disagree.
  */
 export default function Step2AddColor({
   initial,
@@ -39,6 +49,14 @@ export default function Step2AddColor({
   const [cropSrc, setCropSrc] = useState<string | null>(null);
   const [stockInput, setStockInput] = useState(initial.stockMeters || "0");
   const [stockError, setStockError] = useState<string | null>(null);
+  const [rollsOpen, setRollsOpen] = useState(false);
+
+  const rolls = variant.rolls ?? [];
+  const rollTotal = rolls.reduce((sum, roll) => {
+    const metres = Number(roll.meters);
+    return sum + (Number.isFinite(metres) ? metres : 0);
+  }, 0);
+  const hasRolls = rolls.length > 0;
 
   const galleryRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
@@ -229,12 +247,71 @@ export default function Step2AddColor({
             />
             {stockError ? (
               <p className="mt-1.5 text-xs text-red-600">{stockError}</p>
+            ) : hasRolls ? (
+              // Once rolls exist they are the stock, so the figure above is not
+              // added on top of them. Said plainly, because the two can differ.
+              <p className="mt-1.5 text-xs text-gray-400">
+                Ignored while this colour has rolls: its stock will be the{" "}
+                {formatMeters(String(rollTotal))} m they hold.
+              </p>
             ) : (
               <p className="mt-1.5 text-xs text-gray-400">
                 {formatMeters(stockInput)} m of this colour on hand. You can
                 change this later without touching the order history.
               </p>
             )}
+          </Field>
+
+          {/* Physical rolls -- optional. Reuses the receive-delivery dialog so the
+              rows, the running total and the validation are the same ones used
+              for a colour that already exists. */}
+          <Field>
+            <FieldLabel>Physical rolls</FieldLabel>
+            {hasRolls ? (
+              <div className="rounded-2xl border border-primary/20 bg-primary/5 px-4 py-3">
+                <div className="flex items-start gap-3">
+                  <Package size={18} className="text-primary mt-0.5 flex-shrink-0" />
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-bold text-gray-700">
+                      {rolls.length} roll{rolls.length === 1 ? "" : "s"} ·{" "}
+                      {formatMeters(String(rollTotal))} m total
+                    </p>
+                    <ul className="mt-1.5 space-y-0.5">
+                      {rolls.map((roll, i) => (
+                        <li
+                          key={i}
+                          className="text-[11px] text-gray-500 truncate"
+                        >
+                          Roll {i + 1}: {formatMeters(roll.meters)} m
+                          {roll.note ? ` · ${roll.note}` : ""}
+                        </li>
+                      ))}
+                    </ul>
+                    <button
+                      type="button"
+                      onClick={() => setRollsOpen(true)}
+                      className="mt-2 text-xs text-primary font-semibold"
+                    >
+                      Edit rolls
+                    </button>
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setRollsOpen(true)}
+                className="w-full flex items-center justify-center gap-2 border-2 border-dashed border-gray-200 rounded-2xl py-4 text-xs font-semibold text-gray-400 hover:border-primary hover:text-primary transition-colors"
+              >
+                <Plus size={14} />
+                Add the rolls this colour arrives on
+              </button>
+            )}
+            <p className="mt-1.5 text-xs text-gray-400">
+              Optional. If the cloth arrives on rolls, name them here and they
+              become the stock that packing cuts from. Skip this and the colour
+              keeps a plain metre figure with no rolls behind it.
+            </p>
           </Field>
         </div>
 
@@ -248,6 +325,20 @@ export default function Step2AddColor({
           />
         </div>
       </div>
+
+      {/* The same dialog the rolls panel uses on an existing colour, so the rows,
+          running total and validation are shared rather than reinvented. */}
+      <ReceiveRollsDialog
+        open={rollsOpen}
+        onClose={() => setRollsOpen(false)}
+        onConfirm={async (drafts: RollDraft[]) => {
+          set("rolls", drafts);
+        }}
+        // A whole delivery is received by length only, so a note box here could
+        // not be saved. Hidden rather than quietly discarded.
+        showNote={false}
+        label={`${common.name} — ${variant.displayOrder || `Colour #${variantIndex}`}`}
+      />
 
       {showPicker && (
         <Modal

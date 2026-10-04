@@ -1,10 +1,9 @@
 "use client";
 
 import { useState } from "react";
-import { PackageCheck, QrCode, Undo2 } from "lucide-react";
-import QRScanModal from "@/components/items/QRScanModal";
+import { PackageCheck } from "lucide-react";
 import { packingApi } from "@/lib/api/order";
-import { toastError, toastErrorFromError, toastSuccess } from "@/lib/toast";
+import { toastErrorFromError, toastSuccess } from "@/lib/toast";
 import { packLineProblems } from "@/lib/utils/packLine";
 import { formatMeters, toMeters } from "@/types/item";
 import type { OrderItem, PackLineResponse } from "@/types/order";
@@ -29,24 +28,21 @@ type Props = {
 /**
  * The packing controls for one fabric line, rendered inside that line's own card.
  *
- * There are two of them, and which one a line gets is decided by the colour rather
- * than by the admin.
+ * This is the *typed* path only: a colour with no physical rolls, whose stock is a
+ * single figure, is packed by entering metres exactly as it always was.
  *
- * A colour with **physical rolls** is packed by scanning: the admin picks up the
- * roll, scans the label on it, and that whole roll is cut for the line. There is no
- * figure to type, because typing one would mean telling the server how much of a
- * named roll to cut, and the roll in the warehouse is never cut that way. The scan
- * names the roll, so there is nothing to get wrong, and the server refuses a label
- * belonging to another colour or a roll that is already used up. "Undo last scan"
- * puts the most recent one back on the roll it came off, which is the mistake worth
- * making easy to take back: the wrong roll scanned against the wrong line.
+ * A colour with physical rolls is not packed from here. There is no figure to type
+ * for it -- the roll itself is the unit, and typing one would mean telling the
+ * server how much of a named roll to cut, which is not how cloth leaves a roll. So
+ * those lines are packed by scanning the label on the roll, and that scan belongs to
+ * a bundle on the order rather than to one line, because a box can carry rolls of
+ * several colours and a mistake has to be undoable one roll at a time. See
+ * `PackingBundlePanel`.
  *
- * A colour with **no rolls** is packed by typing metres, exactly as it always was.
- * Its stock is a single figure, so there is no roll to name.
- *
- * Both paths really do move cloth, so the server builds a one-line packing round
- * and confirms it through the same engine: same stock rules, same `Allocation` row,
- * same `ALLOCATION_MADE` log entry, and a round that can still be cancelled.
+ * Either way the movement is the same one the board would make: the server builds a
+ * one-line packing round and confirms it through the same engine, so the stock rules,
+ * the `Allocation` row, the `ALLOCATION_MADE` log entry and a cancellable round all
+ * land as usual.
  */
 export default function PackLineRow({
   orderId,
@@ -59,13 +55,6 @@ export default function PackLineRow({
 }: Props) {
   const [busy, setBusy] = useState(false);
   const [problem, setProblem] = useState<string | null>(null);
-  const [scanOpen, setScanOpen] = useState(false);
-  /**
-   * The last roll this line was filled from, so the admin can see the cloth left a
-   * specific roll rather than an anonymous total. Reset by an undo, since after one
-   * that roll holds its cloth again.
-   */
-  const [rollsCut, setRollsCut] = useState<string[]>([]);
 
   const stock = stockMeters === null ? null : String(stockMeters);
   const label = line.fabric_name_display || line.fabric_name;
@@ -77,16 +66,9 @@ export default function PackLineRow({
   // extra metres are visible rather than silently folded into the packed figure.
   const overOrdered = Math.max(packed - toMeters(line.ordered_quantity), 0);
   // Decided by the server, not guessed here: a colour has rolls or it does not.
+  // A roll-tracked line is packed by scanning into a bundle instead, so there is no
+  // input to offer it here.
   const rollTracked = line.is_roll_tracked === true;
-
-  /** The server's own wording for what it cut, shown under the controls. */
-  const recordRolls = (result: PackLineResponse) => {
-    setRollsCut(
-      (result.rolls ?? [])
-        .filter((entry) => !entry.is_reversed)
-        .map((entry) => `${entry.roll_number} (${formatMeters(entry.metres)} m)`),
-    );
-  };
 
   const handlePack = async () => {
     const issues = packLineProblems({
@@ -108,7 +90,6 @@ export default function PackLineRow({
       // figure just packed, and the page stays in packing mode.
       onPacked(result);
       onMetresChange(metres);
-      recordRolls(result);
       toastSuccess(
         `Packed ${formatMeters(metres)} m`,
         `${label} · ${formatMeters(result.stock_meters)} m left on the roll`,
@@ -116,57 +97,6 @@ export default function PackLineRow({
     } catch (err) {
       // The server's own wording, so a refusal reads as a sentence about this
       // order rather than a generic failure.
-      toastErrorFromError(err);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  /**
-   * Pack this line from a scanned roll label.
-   *
-   * The label's payload is the roll's primary key, so anything that is not a plain
-   * number is some other kind of QR -- a fabric's own code, say -- and is refused
-   * here rather than sent on to fail as a lookup for a roll that does not exist.
-   */
-  const handleScan = async (raw: string) => {
-    const roll = Number(raw.trim());
-    if (!Number.isInteger(roll) || roll <= 0) {
-      toastError(
-        "That is not a roll label",
-        "Roll labels carry a plain number. Scan the label on the roll itself.",
-      );
-      return;
-    }
-
-    setBusy(true);
-    setProblem(null);
-    try {
-      const result = await packingApi.scanRoll(orderId, line.id, roll);
-      setScanOpen(false);
-      onPacked(result);
-      recordRolls(result);
-      toastSuccess(result.message, `${label} · ${formatMeters(result.stock_meters)} m left on the roll`);
-    } catch (err) {
-      // The scanner stays open on a refusal: the packer most likely just grabbed
-      // the wrong roll, and the fix is to scan again rather than reopen anything.
-      toastErrorFromError(err);
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  const handleUndo = async () => {
-    setBusy(true);
-    try {
-      const result = await packingApi.undoScan(orderId, line.id);
-      onPacked(result);
-      setRollsCut([]);
-      toastSuccess(
-        result.message,
-        `${label} · ${formatMeters(result.stock_meters)} m left on the roll`,
-      );
-    } catch (err) {
       toastErrorFromError(err);
     } finally {
       setBusy(false);
@@ -198,35 +128,7 @@ export default function PackLineRow({
         )}
       </div>
 
-      {rollTracked ? (
-        <div className="mt-1.5 flex items-center gap-2">
-          <button
-            type="button"
-            onClick={() => setScanOpen(true)}
-            disabled={busy}
-            className="flex items-center gap-1.5 rounded-lg bg-amber-500 px-3 py-1.5 text-[11px] font-bold text-white hover:bg-amber-600 transition-colors disabled:opacity-50"
-          >
-            {busy ? (
-              <span className="w-3 h-3 border-2 border-amber-200 border-t-white rounded-full animate-spin block" />
-            ) : (
-              <QrCode size={13} />
-            )}
-            Scan roll to pack
-          </button>
-          <span className="text-[10px] font-medium text-gray-400">
-            Packs the whole scanned roll
-          </span>
-          <button
-            type="button"
-            onClick={handleUndo}
-            disabled={busy}
-            className="ml-auto flex items-center gap-1.5 rounded-lg border border-gray-200 px-2.5 py-1.5 text-[11px] font-bold text-gray-500 hover:bg-gray-50 transition-colors disabled:opacity-50"
-          >
-            <Undo2 size={13} />
-            Undo last scan
-          </button>
-        </div>
-      ) : (
+      {!rollTracked && (
         <div className="mt-1.5 flex items-center gap-2">
           <input
             type="number"
@@ -259,9 +161,9 @@ export default function PackLineRow({
         </div>
       )}
 
-      {rollsCut.length > 0 && (
+      {rollTracked && (
         <p className="mt-1.5 text-[11px] font-medium text-gray-400">
-          Cut from {rollsCut.join(", ")}
+          Packed by scanning the roll into a bundle above.
         </p>
       )}
 
@@ -270,12 +172,6 @@ export default function PackLineRow({
           {problem}
         </p>
       )}
-
-      <QRScanModal
-        isOpen={scanOpen}
-        onClose={() => setScanOpen(false)}
-        onScan={handleScan}
-      />
     </div>
   );
 }

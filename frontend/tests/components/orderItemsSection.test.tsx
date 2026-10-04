@@ -25,7 +25,15 @@ vi.mock("@/lib/api/item", () => ({
 vi.mock("@/components/items/QRScanModal", () => ({ default: () => null }));
 
 vi.mock("@/lib/api/order", () => ({
-  packingApi: { packLine: vi.fn(), scanRoll: vi.fn(), undoScan: vi.fn() },
+  packingApi: {
+    packLine: vi.fn(),
+    listBundles: vi.fn().mockResolvedValue([]),
+    createBundle: vi.fn(),
+    scanIntoBundle: vi.fn(),
+    removeRollFromBundle: vi.fn(),
+    sealBundle: vi.fn(),
+    cancelBundle: vi.fn(),
+  },
   orderApi: { deleteItem: vi.fn(), updateItem: vi.fn() },
 }));
 
@@ -101,10 +109,6 @@ const overResult: PackLineResponse = {
 const inputFor = (name: RegExp) =>
   screen.getByLabelText(name) as HTMLInputElement;
 
-const openPacking = async (user: ReturnType<typeof userEvent.setup>) => {
-  await user.click(screen.getByRole("button", { name: /^update packing$/i }));
-};
-
 beforeEach(() => {
   vi.clearAllMocks();
   roleRef.current = "ADMIN";
@@ -133,52 +137,26 @@ function section() {
   );
 }
 
-describe("OrderItemsSection packing mode", () => {
-  it("shows one Update packing button for the whole order", async () => {
+describe("OrderItemsSection line packing", () => {
+  it("has no whole-order packing toggle any more", () => {
     section();
 
-    await waitFor(() =>
-      expect(screen.getByRole("button", { name: /^update packing$/i })).toBeTruthy(),
-    );
-    // Exactly one, however many lines there are.
-    expect(screen.getAllByRole("button", { name: /update packing/i })).toHaveLength(1);
+    // Packing moved to the bundle above the lines, so nothing switches the lines
+    // into an editable state first.
+    expect(screen.queryByRole("button", { name: /update packing/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^done$/i })).toBeNull();
   });
 
-  it("hides the packing controls until the button is used", () => {
+  it("shows a pack box on every line straight away", () => {
     section();
-
-    // No per-line input, and no second yellow card behind the lines.
-    expect(screen.queryByLabelText(/metres of .* to pack/i)).toBeNull();
-    expect(screen.queryByRole("button", { name: /pack this line/i })).toBeNull();
-  });
-
-  it("opens every line for editing at once and relabels the button Done", async () => {
-    const user = userEvent.setup();
-    section();
-
-    await openPacking(user);
 
     expect(inputFor(/metres of cotton cambric to pack/i)).toBeTruthy();
     expect(inputFor(/metres of linen blend to pack/i)).toBeTruthy();
     // One control per line, each packing itself.
     expect(screen.getAllByRole("button", { name: /pack this line/i })).toHaveLength(2);
-    expect(screen.queryByRole("button", { name: /^update packing$/i })).toBeNull();
-    expect(screen.getByRole("button", { name: /^done$/i })).toBeTruthy();
   });
 
-  it("closes packing mode again on Done", async () => {
-    const user = userEvent.setup();
-    section();
-
-    await openPacking(user);
-    await user.click(screen.getByRole("button", { name: /^done$/i }));
-
-    expect(screen.queryByLabelText(/metres of .* to pack/i)).toBeNull();
-    expect(screen.getByRole("button", { name: /^update packing$/i })).toBeTruthy();
-  });
-
-  it("prefills a line with what is already packed on it", async () => {
-    const user = userEvent.setup();
+  it("prefills a line with what is already packed on it", () => {
     render(
       <OrderItemsSection
         items={[{ ...lineA, allocated_quantity: "250.000", outstanding_quantity: "350.000" }]}
@@ -188,16 +166,12 @@ describe("OrderItemsSection packing mode", () => {
       />,
     );
 
-    await openPacking(user);
-
     expect(inputFor(/metres of cotton cambric to pack/i).value).toBe("250");
   });
 
   it("prefills an unpacked line with what the roll can cover", async () => {
-    const user = userEvent.setup();
     section();
 
-    await openPacking(user);
     await waitFor(() =>
       expect(inputFor(/metres of cotton cambric to pack/i).value).toBe("600"),
     );
@@ -212,7 +186,6 @@ describe("OrderItemsSection packing mode", () => {
     packLine.mockResolvedValue(aResult);
     section();
 
-    await openPacking(user);
     await waitFor(() =>
       expect(inputFor(/metres of cotton cambric to pack/i).value).toBe("600"),
     );
@@ -230,19 +203,18 @@ describe("OrderItemsSection packing mode", () => {
     expect(inputFor(/metres of linen blend to pack/i).value).toBe("123");
   });
 
-  it("stays in packing mode after a pack and marks the line as Packed", async () => {
+  it("stays editable after a pack and marks the line as Packed", async () => {
     const user = userEvent.setup();
     packLine.mockResolvedValue(aResult);
     section();
 
-    await openPacking(user);
     await waitFor(() =>
       expect(inputFor(/metres of cotton cambric to pack/i).value).toBe("600"),
     );
     await user.click(screen.getAllByRole("button", { name: /pack this line/i })[0]);
 
     // Still editable, so the admin can carry on with the other lines.
-    expect(screen.getByRole("button", { name: /^done$/i })).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /pack this line/i })).toHaveLength(2);
     expect(screen.getByText("Packed")).toBeTruthy();
     expect(inputFor(/metres of linen blend to pack/i)).toBeTruthy();
   });
@@ -252,7 +224,6 @@ describe("OrderItemsSection packing mode", () => {
     packLine.mockResolvedValue(aResult);
     section();
 
-    await openPacking(user);
     await waitFor(() =>
       expect(inputFor(/metres of cotton cambric to pack/i).value).toBe("600"),
     );
@@ -264,7 +235,7 @@ describe("OrderItemsSection packing mode", () => {
     expect(screen.getByText("1800 m on the roll")).toBeTruthy();
   });
 
-  it("offers no packing button on a dispatched order", () => {
+  it("offers no packing controls on a dispatched order", () => {
     render(
       <OrderItemsSection
         items={[lineA, lineB]}
@@ -274,14 +245,16 @@ describe("OrderItemsSection packing mode", () => {
       />,
     );
 
-    expect(screen.queryByRole("button", { name: /update packing/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /pack this line/i })).toBeNull();
+    expect(screen.queryByLabelText(/metres of .* to pack/i)).toBeNull();
   });
 
-  it("offers no packing button to a non-admin", () => {
+  it("offers no packing controls to a non-admin", () => {
     roleRef.current = "AGENT";
     section();
 
-    expect(screen.queryByRole("button", { name: /update packing/i })).toBeNull();
+    expect(screen.queryByRole("button", { name: /pack this line/i })).toBeNull();
+    expect(screen.queryByLabelText(/metres of .* to pack/i)).toBeNull();
   });
 });
 
@@ -298,7 +271,6 @@ describe("OrderItemsSection over-packed quantities", () => {
       />,
     );
 
-    await openPacking(user);
     const input = inputFor(/metres of cotton cambric to pack/i);
     await user.clear(input);
     await user.type(input, "55");
@@ -324,7 +296,6 @@ describe("OrderItemsSection over-packed quantities", () => {
       />,
     );
 
-    await openPacking(user);
     const input = inputFor(/metres of cotton cambric to pack/i);
     await user.clear(input);
     await user.type(input, "55");
@@ -346,7 +317,6 @@ describe("OrderItemsSection over-packed quantities", () => {
       />,
     );
 
-    await openPacking(user);
     const input = inputFor(/metres of cotton cambric to pack/i);
     await user.clear(input);
     await user.type(input, "55");
@@ -370,7 +340,6 @@ describe("OrderItemsSection over-packed quantities", () => {
       />,
     );
 
-    await openPacking(user);
     const input = inputFor(/metres of cotton cambric to pack/i);
     await user.clear(input);
     await user.type(input, "50");
@@ -392,17 +361,13 @@ describe("OrderItemsSection over-packed quantities", () => {
       />,
     );
 
-    await openPacking(user);
     const input = inputFor(/metres of cotton cambric to pack/i);
     await user.clear(input);
     await user.type(input, "55");
     await user.click(screen.getByRole("button", { name: /pack this line/i }));
 
-    // Re-opening packing mode starts from the 55 m stored, not the 50 m ordered.
+    // The box settles on the 55 m stored, not the 50 m ordered.
     await waitFor(() => expect(input.value).toBe("55"));
-    await user.click(screen.getByRole("button", { name: /^done$/i }));
-    await user.click(screen.getByRole("button", { name: /^update packing$/i }));
-
     expect(inputFor(/metres of cotton cambric to pack/i).value).toBe("55");
   });
 
@@ -422,7 +387,6 @@ describe("OrderItemsSection over-packed quantities", () => {
       />,
     );
 
-    await openPacking(user);
     const input = inputFor(/metres of cotton cambric to pack/i);
     await user.clear(input);
     await user.type(input, "49");
@@ -449,7 +413,6 @@ describe("OrderItemsSection over-packed quantities", () => {
       />,
     );
 
-    await user.click(screen.getByRole("button", { name: /^update packing$/i }));
     await waitFor(() =>
       expect(screen.getByRole("button", { name: /pack this line/i })).toBeTruthy(),
     );

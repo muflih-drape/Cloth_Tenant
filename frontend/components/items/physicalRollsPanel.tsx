@@ -2,6 +2,7 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
+  AlertTriangle,
   ChevronDown,
   ChevronUp,
   History,
@@ -18,6 +19,8 @@ import { formatMeters } from "@/types/item";
 import type { FabricRoll, RollHistoryEntry, VariantRollsResponse } from "@/types/item";
 import ReceiveRollsDialog, { type RollDraft } from "./receiveRollsDialog";
 import RollLabelDialog from "./rollLabelDialog";
+import RollSummary from "./rollSummary";
+import { Modal, ModalButton } from "@/components/ui/custom/Modals";
 
 interface Props {
   variantId: number;
@@ -26,8 +29,12 @@ interface Props {
   /**
    * Called after any change to the colour's stock, so the page can refresh the
    * read-only metre figure it shows next to the colour name.
+   *
+   * The roll count travels with it because the badge above the panel quotes the
+   * same number: sending only the metres left the badge reading the count the
+   * page loaded with, so it said "0 rolls" over a panel showing one.
    */
-  onStockChanged?: (stockMeters: string) => void;
+  onStockChanged?: (stockMeters: string, rollCount: number) => void;
 }
 
 /**
@@ -53,6 +60,16 @@ export default function PhysicalRollsPanel({
   const [shownVariant, setShownVariant] = useState<number | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [receiveOpen, setReceiveOpen] = useState(false);
+  /**
+   * A delivery waiting on the admin's answer to "this replaces your opening
+   * figure?". Held rather than sent straight away, because the first roll onto a
+   * colour that was created with a plain metre figure makes the stock drop from
+   * that figure to the roll total -- correct, but not something to do silently.
+   */
+  const [pendingReplace, setPendingReplace] = useState<{
+    drafts: RollDraft[];
+    untracked: number;
+  } | null>(null);
   const [historyFor, setHistoryFor] = useState<FabricRoll | null>(null);
   const [labelFor, setLabelFor] = useState<FabricRoll | null>(null);
   const [adjusting, setAdjusting] = useState<number | null>(null);
@@ -79,12 +96,12 @@ export default function PhysicalRollsPanel({
 
   useEffect(() => {
     let cancelled = false;
-    fetchRolls()
-      .then((rolls) => {
-        if (cancelled) return;
-        setData(rolls);
-        notifyStock.current?.(rolls.stock_meters);
-      })
+fetchRolls()
+        .then((rolls) => {
+          if (cancelled) return;
+          setData(rolls);
+          notifyStock.current?.(rolls.stock_meters, rolls.roll_count);
+        })
       .catch((e) => {
         if (!cancelled) toastError("Failed to load rolls", e);
       })
@@ -101,7 +118,7 @@ export default function PhysicalRollsPanel({
     try {
       const rolls = await fetchRolls();
       setData(rolls);
-      notifyStock.current?.(rolls.stock_meters);
+      notifyStock.current?.(rolls.stock_meters, rolls.roll_count);
     } catch (e) {
       toastError("Failed to load rolls", e);
     } finally {
@@ -109,24 +126,55 @@ export default function PhysicalRollsPanel({
     }
   };
 
+  const submitReceive = async (drafts: RollDraft[]) => {
+    if (drafts.length === 1) {
+      await rollApi.receive(variantId, {
+        meters: drafts[0].meters,
+        ...(drafts[0].note ? { note: drafts[0].note } : {}),
+      });
+      toastSuccess(`Received ${formatMeters(drafts[0].meters)} m`);
+    } else {
+      const result = await rollApi.bulkReceive(variantId, drafts);
+      toastSuccess(
+        `Received ${result.created} rolls, ${formatMeters(result.total_meters)} m`,
+      );
+    }
+    await load();
+  };
+
+  /**
+   * A colour created with a plain metre figure has stock that belongs to no roll.
+   * Its first real roll replaces that figure -- adding them would count the same
+   * cloth twice -- so the swap is confirmed first. Once a colour has a roll this
+   * is never reached again: receiving then genuinely adds stock, as always.
+   */
   const handleReceive = async (drafts: RollDraft[]) => {
+    const untracked =
+      data && data.roll_count === 0 ? Number(data.stock_meters) || 0 : 0;
+
+    if (untracked > 0) {
+      setPendingReplace({ drafts, untracked });
+      return;
+    }
+
     try {
-      if (drafts.length === 1) {
-        await rollApi.receive(variantId, {
-          meters: drafts[0].meters,
-          ...(drafts[0].note ? { note: drafts[0].note } : {}),
-        });
-        toastSuccess(`Received ${formatMeters(drafts[0].meters)} m`);
-      } else {
-        const result = await rollApi.bulkReceive(variantId, drafts);
-        toastSuccess(
-          `Received ${result.created} rolls, ${formatMeters(result.total_meters)} m`,
-        );
-      }
-      await load();
+      await submitReceive(drafts);
     } catch (e) {
       // Re-throw so the dialog can show the message beside the rows it came from.
       throw e;
+    }
+  };
+
+  /** The confirmed answer to the warning above. */
+  const confirmReplace = async () => {
+    const job = pendingReplace;
+    setPendingReplace(null);
+    if (!job) return;
+    try {
+      await submitReceive(job.drafts);
+    } catch (e) {
+      // The receive dialog has already closed, so this one is reported as a toast.
+      toastError("Could not receive these rolls", e);
     }
   };
 
@@ -222,24 +270,10 @@ export default function PhysicalRollsPanel({
                   className="rounded-xl border border-gray-100 px-3 py-2"
                 >
                   <div className="flex items-center gap-2">
-                    <div className="flex-1 min-w-0">
-                      <p className="text-xs font-black text-gray-700">
-                        {roll.roll_number}
-                        {roll.note && (
-                          <span className="ml-2 font-normal text-gray-400">
-                            {roll.note}
-                          </span>
-                        )}
-                      </p>
-                      <p className="text-[11px] text-gray-400">
-                        {formatMeters(roll.remaining_meters)} m left of{" "}
-                        {formatMeters(roll.original_meters)}
-                        {roll.is_exhausted && " · used up"}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => setHistoryFor(roll)}
+                    <RollSummary roll={roll} />
+                  <button
+                    type="button"
+                    onClick={() => setHistoryFor(roll)}
                       className="p-1.5 rounded-lg text-gray-400 hover:text-primary hover:bg-primary/5 transition-colors"
                       aria-label={`History for ${roll.roll_number}`}
                       title="History"
@@ -334,6 +368,32 @@ export default function PhysicalRollsPanel({
         onConfirm={handleReceive}
         label={`${label} (${data.display_order || "unlabelled"})`}
       />
+
+      {pendingReplace && (
+        <Modal
+          icon={<AlertTriangle size={18} className="text-amber-600" />}
+          iconBg="bg-amber-100"
+          title="Replace untracked stock?"
+          description={
+            `This colour currently has ${formatMeters(String(pendingReplace.untracked))} m ` +
+            "of stock that is not tracked on any roll. Adding a physical roll makes " +
+            "its stock roll-tracked, and the rolls become the total — so that " +
+            `${formatMeters(String(pendingReplace.untracked))} m will no longer be counted. ` +
+            "Continue?"
+          }
+          onClose={() => setPendingReplace(null)}
+          actions={
+            <>
+              <ModalButton variant="ghost" onClick={() => setPendingReplace(null)}>
+                Cancel
+              </ModalButton>
+              <ModalButton variant="primary" onClick={confirmReplace}>
+                Replace stock
+              </ModalButton>
+            </>
+          }
+        />
+      )}
 
       {historyFor && (
         <RollHistoryDialog

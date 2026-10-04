@@ -10,6 +10,7 @@ import { OrderItem as OrderItemType, OrderStatus, PackLineResponse } from "@/typ
 import { formatMeters, toMeters } from "@/types/item";
 import OrderItem from "@/components/pages/admin/order-item/OrderItem";
 import PackLineRow from "@/components/pages/admin/packing/PackLineRow";
+import PackingBundlePanel from "@/components/pages/order/PackingBundlePanel";
 
 interface OrderItemsSectionProps {
   items?: OrderItemType[];
@@ -64,11 +65,12 @@ export default function OrderItemsSection({
   const liveItems = (items ?? []).map((line) => patched[line.id] ?? line);
 
   const [stock, setStock] = useState<Record<number, string>>({});
+  // Bumped whenever cloth moves off a roll from the bundle panel, so the stock
+  // figures beside each line are re-read rather than drifting behind the scans.
+  const [stockRefresh, setStockRefresh] = useState(0);
 
-  // Packing is edited for the whole order at once, from one button. The figure in
-  // each line's box is held here, keyed by line, so packing one line leaves the
-  // others' typed-in figures alone.
-  const [isPackingMode, setIsPackingMode] = useState(false);
+  // Each line's packing figures are held here, keyed by line, so packing one line
+  // leaves the others' typed-in figures alone.
   const [metresDraft, setMetresDraft] = useState<Record<number, string>>({});
   const [justPacked, setJustPacked] = useState<Record<number, boolean>>({});
 
@@ -103,15 +105,11 @@ export default function OrderItemsSection({
       .getOutstandingDemand()
       .then((rows) => {
         if (!active) return;
-        setStock((prev) => {
-          const next = { ...prev };
-          for (const row of rows) {
-            // Keep a figure the admin has just seen move off the roll, rather
-            // than letting a slower fetch put a stale number back.
-            if (next[row.variant] === undefined) next[row.variant] = row.stock_meters;
-          }
-          return next;
-        });
+        const next: Record<number, string> = {};
+        for (const row of rows) {
+          next[row.variant] = row.stock_meters;
+        }
+        setStock(next);
       })
       .catch(() => {
         // Stock figures are an aid here; the endpoint refuses an impossible
@@ -120,7 +118,7 @@ export default function OrderItemsSection({
     return () => {
       active = false;
     };
-  }, [canEditPacking]);
+  }, [canEditPacking, stockRefresh]);
 
   /** What to offer as the starting figure for a line's box. */
   const prefillFor = (line: OrderItemType) => {
@@ -138,7 +136,7 @@ export default function OrderItemsSection({
       setStock((prev) =>
         applyPackStock(prev, result.item.variant, result.stock_meters),
       );
-      // Stay in packing mode so the admin can carry on with the other lines.
+      // The pack figures stay put, so the admin can carry on with the other lines.
       setJustPacked((prev) => ({ ...prev, [result.item.id]: true }));
       if (result.order_status && result.order_status !== status) {
         onOrderStatusChange?.(result.order_status);
@@ -154,9 +152,20 @@ export default function OrderItemsSection({
     [onItemsChange, onOrderStatusChange, status],
   );
 
+  /**
+   * Cloth left the shelf through a bundle. The lines and the stock figures on this
+   * page both moved, so re-read them rather than leaving the panel's own view of the
+   * order as the only current one.
+   */
+  const handleBundleChanged = useCallback(() => {
+    setStockRefresh((n) => n + 1);
+    setPatched({});
+    onItemsChange?.();
+  }, [onItemsChange]);
+
   return (
     <>
-      <div className="mb-4 border-b border-gray-100 pb-2 flex items-start justify-between gap-3">
+      <div className="mb-4 border-b border-gray-100 pb-2">
         <div>
           <h2 className="text-lg font-extrabold text-gray-900 leading-tight">
             Fabric lines
@@ -165,26 +174,6 @@ export default function OrderItemsSection({
             {formatMeters(ordered)} m ordered · {formatMeters(allocated)} m packed
           </p>
         </div>
-
-        {canEditPacking && (
-          <button
-            type="button"
-            onClick={() => {
-              setIsPackingMode((on) => {
-                // Leaving packing mode discards the typed-in figures, so coming
-                // back starts again from what is actually on each line.
-                if (on) {
-                  setMetresDraft({});
-                  setJustPacked({});
-                }
-                return !on;
-              });
-            }}
-            className="flex shrink-0 items-center gap-1.5 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] font-bold text-amber-800 transition-colors hover:bg-amber-100"
-          >
-            {isPackingMode ? "Done" : "Update packing"}
-          </button>
-        )}
       </div>
 
       {false && awaitingPacking && (
@@ -208,6 +197,15 @@ export default function OrderItemsSection({
         </div>
       )}
 
+      {canPack && orderId !== undefined && (
+        <PackingBundlePanel
+          orderId={orderId}
+          enabled={canEditPacking}
+          onChanged={handleBundleChanged}
+          onOrderStatusChange={onOrderStatusChange}
+        />
+      )}
+
       <div className="bg-white rounded-2xl overflow-hidden">
         <OrderItem
           items={liveItems}
@@ -217,7 +215,7 @@ export default function OrderItemsSection({
           onAllocationChange={onItemsChange}
           onDeleteItem={onItemsChange}
           renderLineFooter={(line) => {
-            if (!orderId || !isPackingMode) return null;
+            if (!orderId || !canEditPacking) return null;
             // A line with no colour has no roll to take metres off, so there is
             // nothing to pack for it.
             if (line.variant === null) return null;

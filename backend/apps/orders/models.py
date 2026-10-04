@@ -324,6 +324,66 @@ class Allocation(models.Model):
         return f"{self.metres}m -> {self.order_item_id}"
 
 
+class PackingBundle(models.Model):
+    """A named, reversible group of rolls packed for one order.
+
+    A round moves stock to a single line of a single colour; a *bundle* is the
+    unit a warehouse worker actually hands over -- a box that leaves with rolls of
+    possibly different colours, tied to one customer and one order. Rolls are
+    added by scanning their labels, and until the bundle is sealed any one of them
+    can be taken back out, which is why the link to :class:`RollAllocation` lives
+    on the roll allocation rather than being baked into the round.
+
+    ``number`` counts from 1 within the order, so an order shows "Bundle 1",
+    "Bundle 2" and so on and the human-readable code on the packing slip is
+    ``Order #<id> -- Bundle <number>``.
+
+    Sealing is what makes a bundle final. An ``OPEN`` bundle is still being worked
+    on and can be scanned into or removed from; ``SEALED`` is immutable, so the
+    packing slip printed for it stays true for as long as the record exists.
+    ``CANCELLED`` is a bundle whose rolls were all given back.
+    """
+
+    STATUS_CHOICES = (
+        ("OPEN", "Open"),
+        ("SEALED", "Sealed"),
+        ("CANCELLED", "Cancelled"),
+    )
+
+    order = models.ForeignKey(
+        Order, related_name="packing_bundles", on_delete=models.CASCADE
+    )
+    #: 1-based sequence within the order. Assigned under a lock on the order so
+    #: two bundles started at once cannot claim the same number.
+    number = models.PositiveIntegerField()
+    status = models.CharField(max_length=12, choices=STATUS_CHOICES, default="OPEN")
+    created_by = models.ForeignKey(
+        User, on_delete=models.SET_NULL, null=True, blank=True
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    sealed_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["number"]
+        constraints = [
+            models.UniqueConstraint(
+                fields=["order", "number"], name="packingbundle_unique_number_per_order"
+            )
+        ]
+
+    def __str__(self):
+        return f"Order #{self.order_id} - Bundle {self.number} ({self.status})"
+
+    @property
+    def code(self):
+        """The label a human reads out loud and reads on the slip."""
+        return f"Order #{self.order_id} -- Bundle {self.number}"
+
+    @property
+    def is_open(self):
+        return self.status == "OPEN"
+
+
 class RollAllocation(models.Model):
     """Which physical roll a packing allocation's metres were cut from.
 
@@ -349,6 +409,16 @@ class RollAllocation(models.Model):
     metres = models.DecimalField(max_digits=14, decimal_places=3)
     #: Which roll of the allocation this was, i.e. the order they were cut.
     sequence = models.PositiveSmallIntegerField(default=1)
+    #: The bundle this roll was scanned into, if it was scanned rather than packed
+    #: by hand. Null on every row written before bundles existed, and on roll-less
+    #: packing, which has no roll to bundle in the first place.
+    bundle = models.ForeignKey(
+        PackingBundle,
+        related_name="roll_allocations",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     is_reversed = models.BooleanField(default=False)
     created_at = models.DateTimeField(auto_now_add=True)
 

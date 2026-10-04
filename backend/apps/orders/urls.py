@@ -1,7 +1,7 @@
 from django.urls import path
 from rest_framework.routers import DefaultRouter
 
-from . import packing_views
+from . import bundle_views, packing_views
 from .views import (
     AddOrderItemView,
     DeleteOrderItemView,
@@ -35,15 +35,32 @@ urlpatterns = [
         packing_views.pack_line,
         name="packing-pack-line",
     ),
+    # Bundles are an order-level concept, so their paths hang off the order too
+    # and likewise precede the router. "bundles" is a literal segment here and
+    # never reaches the router's catch-all detail route.
+    path("<int:order_id>/bundles/", bundle_views.list_bundles, name="bundle-list"),
     path(
-        "<int:order_id>/items/<int:item_id>/pack/scan-roll/",
-        packing_views.scan_roll,
-        name="packing-scan-roll",
+        "<int:order_id>/bundles/create/", bundle_views.create_bundle, name="bundle-create"
     ),
     path(
-        "<int:order_id>/items/<int:item_id>/pack/undo-scan/",
-        packing_views.undo_scan,
-        name="packing-undo-scan",
+        "<int:order_id>/bundles/<int:pk>/scan/",
+        bundle_views.scan_into_bundle,
+        name="bundle-scan",
+    ),
+    path(
+        "<int:order_id>/bundles/<int:pk>/rolls/<int:roll_allocation_id>/remove/",
+        bundle_views.remove_roll,
+        name="bundle-remove-roll",
+    ),
+    path(
+        "<int:order_id>/bundles/<int:pk>/seal/",
+        bundle_views.seal_bundle,
+        name="bundle-seal",
+    ),
+    path(
+        "<int:order_id>/bundles/<int:pk>/cancel/",
+        bundle_views.cancel_bundle,
+        name="bundle-cancel",
     ),
 ] + router.urls + [
     path("<int:order_id>/place-order/", PlaceOrderView.as_view()),

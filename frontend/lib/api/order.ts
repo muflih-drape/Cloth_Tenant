@@ -1,5 +1,7 @@
 import type {
   AddOrderItemRequest,
+  BundleMutationResponse,
+  CreatePackingBundleResponse,
   DispatchResponse,
   MergeOrderItemsRequest,
   OrderAllResponse,
@@ -7,6 +9,7 @@ import type {
   OrderRegisterResponse,
   OrderResponse,
   OrderTotals,
+  PackingBundleListResponse,
   PackingPlan,
   PackingQueue,
   PackingRoundSummary,
@@ -14,6 +17,7 @@ import type {
   PackLineRollOverride,
   PlaceOrderResponse,
   PlanOverrideEntry,
+  ScanIntoBundleResponse,
   UpdateOrderItemRequest,
   UpdateOrderRequest,
 } from "@/types/order";
@@ -348,8 +352,9 @@ export const packingApi = {
    * still be cancelled if the admin changes their mind.
    *
    * For a colour tracked by physical rolls the server refuses this without a
-   * `rolls` breakdown rather than guessing which cloth to cut -- `scanRoll` is the
-   * path there, since the roll's label already says which roll it is.
+   * `rolls` breakdown rather than guessing which cloth to cut -- scan the roll into a
+   * bundle instead (see `scanIntoBundle`), since the roll's label already says
+   * which roll it is.
    */
   packLine(
     orderId: number,
@@ -367,36 +372,100 @@ export const packingApi = {
   },
 
   /**
-   * Pack one order line by scanning a roll's label, for a colour whose metres
-   * live on physical rolls.
-   *
-   * `roll` is the primary key encoded in that label, so the admin never picks a
-   * roll from a list: they pick up the roll and scan it. The whole roll is cut for
-   * the line, because rolls are not split at the warehouse, and the server
-   * refuses a roll belonging to another colour or one that is already used up.
+   * Every bundle on this order, sealed ones included. Sealed bundles keep their
+   * rolls in the response, which is what lets a packing slip be reprinted long
+   * after the box has gone.
    */
-  scanRoll(
-    orderId: number,
-    itemId: number,
-    roll: number,
-  ): Promise<PackLineResponse> {
+  listBundles(orderId: number): Promise<PackingBundleListResponse> {
     return api
-      .post<PackLineResponse>(
-        `/api/orders/${orderId}/items/${itemId}/pack/scan-roll/`,
+      .get<PackingBundleListResponse>(`/api/orders/${orderId}/bundles/`)
+      .then((r) => r.data);
+  },
+
+  /**
+   * Open a new empty bundle on this order. Nothing is fixed yet: rolls can be
+   * scanned in and taken back out until it is sealed.
+   */
+  createBundle(orderId: number): Promise<CreatePackingBundleResponse> {
+    return api
+      .post<CreatePackingBundleResponse>(
+        `/api/orders/${orderId}/bundles/create/`,
+        {},
+      )
+      .then((r) => r.data);
+  },
+
+  /**
+   * Cut a whole scanned roll into an open bundle.
+   *
+   * `roll` is the primary key encoded in the label, so the admin never picks a roll
+   * from a list: they pick up the roll and scan it. No line is chosen either -- the
+   * colour on the roll decides which order line it satisfies, and the whole roll
+   * moves, because rolls are not split at the warehouse. A sealed bundle, a spent
+   * roll, or a colour this order never asked for is refused.
+   */
+  scanIntoBundle(
+    orderId: number,
+    bundleId: number,
+    roll: number,
+  ): Promise<ScanIntoBundleResponse> {
+    return api
+      .post<ScanIntoBundleResponse>(
+        `/api/orders/${orderId}/bundles/${bundleId}/scan/`,
         { roll },
       )
       .then((r) => r.data);
   },
 
   /**
-   * Reverse the most recent scan on one line, putting the metres back on the very
-   * roll they came off. Only scans are undone, so a line packed by hand keeps its
-   * pack. Each scan is its own round, so this reverses exactly one of them.
+   * Take one roll back out of an open bundle.
+   *
+   * `rollAllocationId` names the RollAllocation row rather than the roll, so the
+   * same label appearing twice in one bundle is still removable on its own. The
+   * metres go back on the very roll they came off and the line's packed total comes
+   * down; the rest of the bundle is untouched.
    */
-  undoScan(orderId: number, itemId: number): Promise<PackLineResponse> {
+  removeRollFromBundle(
+    orderId: number,
+    bundleId: number,
+    rollAllocationId: number,
+  ): Promise<BundleMutationResponse> {
     return api
-      .post<PackLineResponse>(
-        `/api/orders/${orderId}/items/${itemId}/pack/undo-scan/`,
+      .post<BundleMutationResponse>(
+        `/api/orders/${orderId}/bundles/${bundleId}/rolls/${rollAllocationId}/remove/`,
+        {},
+      )
+      .then((r) => r.data);
+  },
+
+  /**
+   * Seal a bundle, freezing its contents. This is the point of no return: the slip
+   * printed from a sealed bundle is a promise about what is in the box, so afterwards
+   * no roll can be added and none can be taken out.
+   */
+  sealBundle(
+    orderId: number,
+    bundleId: number,
+  ): Promise<BundleMutationResponse> {
+    return api
+      .post<BundleMutationResponse>(
+        `/api/orders/${orderId}/bundles/${bundleId}/seal/`,
+        {},
+      )
+      .then((r) => r.data);
+  },
+
+  /**
+   * Throw an open bundle away, giving back every roll in it in one go. The bundle is
+   * kept as CANCELLED rather than deleted, so the order still shows what was tried.
+   */
+  cancelBundle(
+    orderId: number,
+    bundleId: number,
+  ): Promise<BundleMutationResponse> {
+    return api
+      .post<BundleMutationResponse>(
+        `/api/orders/${orderId}/bundles/${bundleId}/cancel/`,
         {},
       )
       .then((r) => r.data);

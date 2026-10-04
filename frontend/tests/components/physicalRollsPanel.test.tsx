@@ -115,11 +115,14 @@ describe("PhysicalRollsPanel", () => {
       />,
     );
 
-    // The header reads "Total: 90 m · 2 rolls"; assert the figures rather than
+// The header reads "Total: 90 m · 2 rolls"; assert the figures rather than
     // the separator between them.
     await waitFor(() => expect(screen.getByText(/Total: 90 m/i)).toBeTruthy());
     expect(screen.getByText(/2 rolls/i)).toBeTruthy();
-    expect(onStockChanged).toHaveBeenCalledWith("90.000");
+    // The count travels with the metres: the badge above the panel quotes the
+    // same number, so sending only the metres left it stale at whatever the page
+    // loaded with.
+    expect(onStockChanged).toHaveBeenCalledWith("90.000", 2);
   });
 
   it("lists each roll with what is left when opened", async () => {
@@ -330,5 +333,181 @@ describe("PhysicalRollsPanel", () => {
 
     expect(print).toHaveBeenCalled();
     print.mockRestore();
+  });
+});
+
+/**
+ * The first roll onto a colour created with a plain metre figure replaces that
+ * figure rather than adding to it, so the swap is confirmed before it happens.
+ */
+describe("PhysicalRollsPanel first roll on untracked stock", () => {
+  /** A colour with no rolls but a plain opening figure on hand. */
+  function untracked(overrides: Partial<VariantRollsResponse> = {}) {
+    return rollsResponse({
+      rolls: [],
+      roll_count: 0,
+      active_roll_count: 0,
+      exhausted_roll_count: 0,
+      total_received_meters: "0.000",
+      roll_stock_meters: "0.000",
+      consumed_meters: "0.000",
+      largest_roll_meters: "0.000",
+      smallest_roll_meters: "0.000",
+      stock_meters: "1000.000",
+      is_roll_tracked: false,
+      ...overrides,
+    });
+  }
+
+  /** Open the panel, expand it and open the receive dialog. */
+  async function startReceive() {
+    await waitFor(() => screen.getByText(/no rolls received yet/i));
+    await expand();
+    await userEvent.click(screen.getByRole("button", { name: /receive rolls/i }));
+  }
+
+  /** Fill the first row and press Receive in the dialog. */
+  async function submitDraft(metres: string) {
+    await userEvent.type(screen.getByLabelText("Roll 1 metres"), metres);
+    await userEvent.click(screen.getByRole("button", { name: /^Receive$/i }));
+  }
+
+  it("warns that the untracked quantity will stop counting, and sends nothing yet", async () => {
+    getForVariant.mockResolvedValue(untracked());
+    render(<PhysicalRollsPanel variantId={7} label="Cotton Cambric" />);
+
+    await startReceive();
+    await submitDraft("100");
+
+    expect(await screen.findByText(/Replace untracked stock\?/i)).toBeTruthy();
+    expect(screen.getByText(/1000 m of stock that is not tracked/i)).toBeTruthy();
+    expect(screen.getByText(/will no longer be counted/i)).toBeTruthy();
+    // Nothing has been received yet: the warning is the thing being answered.
+    expect(receive).not.toHaveBeenCalled();
+    expect(bulkReceive).not.toHaveBeenCalled();
+  });
+
+  it("receives the roll once the admin confirms", async () => {
+    getForVariant.mockResolvedValue(untracked());
+    receive.mockResolvedValue({
+      ...rollsResponse(),
+      roll: rollsResponse().rolls[0],
+    } as never);
+    // The panel reloads after receiving, and now has its first roll.
+    getForVariant
+      .mockResolvedValueOnce(untracked())
+      .mockResolvedValueOnce(rollsResponse({ roll_count: 1, stock_meters: "100.000" }));
+    render(<PhysicalRollsPanel variantId={7} label="Cotton Cambric" />);
+
+    await startReceive();
+    await submitDraft("100");
+    await userEvent.click(
+      await screen.findByRole("button", { name: /replace stock/i }),
+    );
+
+    await waitFor(() => expect(receive).toHaveBeenCalledWith(7, { meters: "100" }));
+  });
+
+  it("sends nothing when the warning is dismissed", async () => {
+    getForVariant.mockResolvedValue(untracked());
+    render(<PhysicalRollsPanel variantId={7} label="Cotton Cambric" />);
+
+    await startReceive();
+    await submitDraft("100");
+    await userEvent.click(await screen.findByRole("button", { name: /^Cancel$/i }));
+
+    expect(receive).not.toHaveBeenCalled();
+    expect(bulkReceive).not.toHaveBeenCalled();
+  });
+
+  it("does not warn once the colour already has a roll", async () => {
+    // Second roll on: stock is roll-derived and receiving genuinely adds, so the
+    // warning would be a lie.
+    receive.mockResolvedValue({
+      ...rollsResponse(),
+      roll: rollsResponse().rolls[0],
+    } as never);
+    render(<PhysicalRollsPanel variantId={7} label="Cotton Cambric" />);
+
+    await waitFor(() => screen.getByText(/2 rolls/i));
+    await expand();
+    await userEvent.click(screen.getByRole("button", { name: /receive rolls/i }));
+    await submitDraft("35");
+
+    await waitFor(() =>
+      expect(receive).toHaveBeenCalledWith(7, { meters: "35" }),
+    );
+    expect(screen.queryByText(/Replace untracked stock\?/i)).toBeNull();
+  });
+
+  it("does not warn for a colour whose opening figure is zero", async () => {
+    getForVariant.mockResolvedValue(untracked({ stock_meters: "0.000" }));
+    receive.mockResolvedValue({
+      ...rollsResponse(),
+      roll: rollsResponse().rolls[0],
+    } as never);
+    render(<PhysicalRollsPanel variantId={7} label="Cotton Cambric" />);
+
+    await startReceive();
+    await submitDraft("100");
+
+    await waitFor(() =>
+      expect(receive).toHaveBeenCalledWith(7, { meters: "100" }),
+    );
+    expect(screen.queryByText(/Replace untracked stock\?/i)).toBeNull();
+  });
+
+  it("reports the new roll's count up so the badge above cannot go stale", async () => {
+    const onStockChanged = vi.fn();
+    getForVariant
+      .mockResolvedValueOnce(untracked())
+      .mockResolvedValueOnce(rollsResponse({ roll_count: 1, stock_meters: "100.000" }));
+    receive.mockResolvedValue({
+      ...rollsResponse(),
+      roll: rollsResponse().rolls[0],
+    } as never);
+    render(
+      <PhysicalRollsPanel
+        variantId={7}
+        label="Cotton Cambric"
+        onStockChanged={onStockChanged}
+      />,
+    );
+
+    await startReceive();
+    await submitDraft("100");
+    await userEvent.click(
+      await screen.findByRole("button", { name: /replace stock/i }),
+    );
+
+    // The pair that keeps the badge and the panel agreeing: 100 m on one roll.
+    await waitFor(() =>
+      expect(onStockChanged).toHaveBeenLastCalledWith("100.000", 1),
+    );
+  });
+
+  it("reports a consumed roll's remaining total without changing the count", async () => {
+    // Packing empties a roll but keeps the row, so the count holds while the
+    // total falls. The badge quotes the count, so both numbers must be reported.
+    const onStockChanged = vi.fn();
+    getForVariant.mockResolvedValue(
+      rollsResponse({
+        roll_count: 2,
+        active_roll_count: 1,
+        roll_stock_meters: "40.000",
+        stock_meters: "40.000",
+      }),
+    );
+    render(
+      <PhysicalRollsPanel
+        variantId={7}
+        label="Cotton Cambric"
+        onStockChanged={onStockChanged}
+      />,
+    );
+
+    await waitFor(() => screen.getByText(/Total: 40 m/i));
+    expect(screen.getByText(/2 rolls/i)).toBeTruthy();
+    expect(onStockChanged).toHaveBeenCalledWith("40.000", 2);
   });
 });

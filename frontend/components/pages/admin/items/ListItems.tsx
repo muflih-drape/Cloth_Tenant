@@ -4,6 +4,7 @@ import { useEffect, useState, useCallback } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { fabricApi } from "@/lib/api/item";
+import { invalidateRolls } from "@/lib/rollsCache";
 import { FabricStockEntry, OutstandingDemandRow, UIItem } from "@/types/item";
 import { ItemList, StockTab } from "@/components/items";
 
@@ -54,6 +55,10 @@ const ListItems: React.FC<ListItemsProps> = ({ initialTab }) => {
     fetchData();
 
     const handleFocus = () => {
+      // Coming back to the tab means something may have been received or packed on
+      // another device, so any colour's rolls held in memory are dropped rather
+      // than trusted for the rest of their lifetime.
+      invalidateRolls();
       fetchData();
     };
 

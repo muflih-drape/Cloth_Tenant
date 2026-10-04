@@ -27,7 +27,7 @@ import time
 from django.test import TestCase
 from rest_framework import status
 
-from apps.items.models import Fabric, FabricRoll, FabricVariant
+from apps.items.models import Fabric, FabricRoll, FabricVariant, StockMovement
 from apps.items.rolls import (
     MAX_ROLLS_FOR_EXACT_FIT,
     RollError,
@@ -110,19 +110,27 @@ class RollTestBase(FabricTestBase):
     def confirm(self, packing_round):
         return confirm_round(packing_round, user=self.admin_user)
 
-    def scan(self, order, line, roll):
-        """Pack one line by scanning ``roll``'s label."""
+    def open_bundle(self, order):
+        """Open a bundle on ``order``; a scanned roll always lives in one."""
         self.auth()
         return self.client.post(
-            f"/api/orders/{order.pk}/items/{line.pk}/pack/scan-roll/",
+            f"/api/orders/{order.pk}/bundles/create/", {}, format="json"
+        ).data["bundle"]
+
+    def scan(self, order, bundle, roll):
+        """Cut all of ``roll`` into ``bundle``."""
+        self.auth()
+        return self.client.post(
+            f"/api/orders/{order.pk}/bundles/{bundle['id']}/scan/",
             {"roll": roll.pk},
             format="json",
         )
 
-    def undo_scan(self, order, line):
+    def cancel_bundle(self, order, bundle):
+        """Throw the bundle away, giving back every roll it held."""
         self.auth()
         return self.client.post(
-            f"/api/orders/{order.pk}/items/{line.pk}/pack/undo-scan/", {}, format="json"
+            f"/api/orders/{order.pk}/bundles/{bundle['id']}/cancel/", {}, format="json"
         )
 
     def pack(self, order, line, metres, rolls=None):
@@ -209,6 +217,169 @@ class RollReceiptTests(RollTestBase):
         sync_variant_stock(self.tracked, force=True)
         self.assertEqual(self.tracked.stock_meters, D("250.000"))
         self.assertTrue(roll_invariant_holds(self.tracked))
+
+
+class FirstRollReplacesOpeningStockTests(RollTestBase):
+    """The one transition where receiving a roll takes stock away.
+
+    A colour created with a plain metre figure has stock belonging to no roll. Its
+    first real roll has to *replace* that figure -- the rolls become the total, and
+    adding them would count the same cloth twice (1000 untracked + a 100 m roll =
+    1100 m that does not exist). After that first roll the rule is the ordinary
+    one again: receiving adds.
+    """
+
+    def untracked_colour(self, metres="1000"):
+        """A colour with a plain opening figure and no roll rows, as created."""
+        variant = FabricVariant.objects.create(
+            fabric=self.fabric,
+            display_order="Untracked",
+            stock_meters=D(metres),
+        )
+        self.assertFalse(is_roll_tracked(variant))
+        return variant
+
+    def test_first_roll_replaces_the_opening_figure_rather_than_adding_to_it(self):
+        variant = self.untracked_colour("1000")
+
+        self.receive(D("100"), variant=variant)
+
+        variant.refresh_from_db()
+        # 100, not 1100: the untracked 1000 m is gone, not stacked on top of.
+        self.assertEqual(variant.stock_meters, D("100.000"))
+        self.assertTrue(is_roll_tracked(variant))
+        self.assert_in_step(variant)
+
+    def test_the_first_roll_satisfies_the_invariant_the_old_total_broke(self):
+        variant = self.untracked_colour("1000")
+        self.receive(D("100"), variant=variant)
+
+        # Before the fix the total would have been 1100 against 100 m of rolls,
+        # which is exactly the drift the invariant exists to catch.
+        variant.refresh_from_db()
+        self.assertEqual(
+            variant.stock_meters,
+            sum(
+                FabricRoll.objects.filter(variant=variant).values_list(
+                    "remaining_meters", flat=True
+                ),
+                ZERO,
+            ),
+        )
+
+    def test_the_discarded_quantity_is_recorded_as_a_stock_movement(self):
+        variant = self.untracked_colour("1000")
+
+        self.receive(D("100"), variant=variant)
+
+        # Without a record, stock dropping 1000 -> 100 looks like cloth vanishing.
+        movement = StockMovement.objects.get(variant=variant)
+        self.assertEqual(movement.reason, StockMovement.OPENING_FIGURE_DISCARDED)
+        self.assertEqual(movement.metres, D("-1000.000"))
+        self.assertEqual(movement.stock_before, D("1000.000"))
+        self.assertEqual(movement.stock_after, D("100.000"))
+
+    def test_a_bulk_first_delivery_is_recorded_once_for_the_whole_delivery(self):
+        variant = self.untracked_colour("1000")
+
+        receive_rolls(variant, [D("500"), D("450")], created_by=self.admin_user)
+
+        variant.refresh_from_db()
+        self.assertEqual(variant.stock_meters, D("950.000"))
+        self.assert_in_step(variant)
+        movement = StockMovement.objects.get(variant=variant)
+        self.assertEqual(movement.stock_before, D("1000.000"))
+        self.assertEqual(movement.stock_after, D("950.000"))
+        self.assertEqual(movement.created_by, self.admin_user)
+
+    def test_a_second_roll_adds_normally_and_records_nothing(self):
+        variant = self.untracked_colour("1000")
+        self.receive(D("100"), variant=variant)
+
+        self.receive(D("250"), variant=variant)
+
+        variant.refresh_from_db()
+        # Ordinary additive behaviour: 100 from the first roll, plus 250 more.
+        self.assertEqual(variant.stock_meters, D("350.000"))
+        self.assert_in_step(variant)
+        # The transition happened once. It is not repeated on every receive.
+        self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 1)
+
+    def test_later_receives_never_write_another_movement(self):
+        variant = self.untracked_colour("1000")
+        self.receive(D("100"), variant=variant)
+        self.receive(D("250"), variant=variant)
+        receive_rolls(variant, [D("10"), D("20")])
+
+        variant.refresh_from_db()
+        self.assertEqual(variant.stock_meters, D("380.000"))
+        self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 1)
+
+    def test_a_colour_opened_at_zero_records_no_movement(self):
+        # Nothing to discard, so there is nothing to explain away.
+        variant = self.untracked_colour("0")
+
+        self.receive(D("100"), variant=variant)
+
+        variant.refresh_from_db()
+        self.assertEqual(variant.stock_meters, D("100.000"))
+        self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 0)
+
+    def test_the_transition_survives_a_failed_receive_being_rolled_back(self):
+        variant = self.untracked_colour("1000")
+
+        with self.assertRaises(RollError):
+            receive_rolls(variant, [D("100"), "not a number"])
+
+        # A refused delivery must not leave the opening figure discarded.
+        variant.refresh_from_db()
+        self.assertEqual(variant.stock_meters, D("1000.000"))
+        self.assertFalse(is_roll_tracked(variant))
+        self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 0)
+
+    def test_the_api_reports_the_replacement_not_an_inflated_total(self):
+        variant = self.untracked_colour("1000")
+        self.auth()
+
+        resp = self.client.post(
+            f"/api/items/variants/{variant.pk}/rolls/",
+            {"meters": "100"},
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        self.assertEqual(resp.data["stock_meters"], "100.000")
+        self.assertEqual(resp.data["roll_stock_meters"], "100.000")
+        self.assertEqual(resp.data["roll_count"], 1)
+        self.assertTrue(resp.data["is_roll_tracked"])
+
+    def test_creating_a_colour_on_its_rolls_is_untouched_by_this(self):
+        """The create form starts such a colour at zero, so there is nothing to
+        discard: the roll sum is the whole stock and no movement is written."""
+        self.auth()
+        resp = self.client.post(
+            "/api/items/",
+            {
+                "name": "Cotton Lawn",
+                "description": "Light lawn",
+                "price_per_meter": "180.00",
+                "variants": [
+                    {
+                        "display_order": "Natural",
+                        "stock_meters": "1000",
+                        "rolls": [{"meters": "500"}, {"meters": "450"}],
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        created = Fabric.objects.get(name="Cotton Lawn")
+        variant = created.variants.get(display_order="Natural")
+        # Still the roll sum, exactly as before: 950 and not 1950.
+        self.assertEqual(variant.stock_meters, D("950.000"))
+        self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 0)
 
 
 class RollAdjustmentTests(RollTestBase):
@@ -536,9 +707,10 @@ class PackingConsumesRollsTests(RollTestBase):
         second = self.receive(D("200"))
         order = self.make_order(self.customer1)
         line = self.make_line(order, D("500"), variant=self.tracked)
+        bundle = self.open_bundle(order)
 
-        self.scan(order, line, first)
-        self.scan(order, line, second)
+        self.scan(order, bundle, first)
+        self.scan(order, bundle, second)
 
         entries = RollAllocation.objects.order_by("allocation_id")
         self.assertEqual([e.roll_id for e in entries], [first.pk, second.pk])
@@ -546,17 +718,19 @@ class PackingConsumesRollsTests(RollTestBase):
         self.assertEqual([e.metres for e in entries], [D("300.000"), D("200.000")])
         self.assertEqual([e.sequence for e in entries], [1, 1])
         self.assertFalse(any(e.is_reversed for e in entries))
+        # Both are tagged with the bundle they were scanned into.
+        self.assertEqual({e.bundle_id for e in entries}, {bundle["id"]})
 
     def test_cancelling_puts_the_cloth_back_on_the_same_rolls(self):
         first = self.receive(D("300"))
         second = self.receive(D("200"))
         order = self.make_order(self.customer1)
-        line = self.make_line(order, D("500"), variant=self.tracked)
-        self.scan(order, line, first)
-        self.scan(order, line, second)
+        self.make_line(order, D("500"), variant=self.tracked)
+        bundle = self.open_bundle(order)
+        self.scan(order, bundle, first)
+        self.scan(order, bundle, second)
 
-        self.undo_scan(order, line)
-        self.undo_scan(order, line)
+        self.cancel_bundle(order, bundle)
 
         first.refresh_from_db()
         second.refresh_from_db()
@@ -568,27 +742,32 @@ class PackingConsumesRollsTests(RollTestBase):
         self.assertEqual(self.tracked.stock_meters, D("500.000"))
         self.assertTrue(all(e.is_reversed for e in RollAllocation.objects.all()))
 
-    def test_a_second_cancellation_does_not_credit_the_rolls_twice(self):
+    def test_a_cancelled_roll_is_not_credited_a_second_time(self):
         roll = self.receive(D("300"))
         order = self.make_order(self.customer1)
-        line = self.make_line(order, D("300"), variant=self.tracked)
-        self.scan(order, line, roll)
-        self.undo_scan(order, line)
+        self.make_line(order, D("300"), variant=self.tracked)
+        bundle = self.open_bundle(order)
+        self.scan(order, bundle, roll)
+        self.cancel_bundle(order, bundle)
 
-        response = self.undo_scan(order, line)
-
-        self.assertEqual(response.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("no scan to undo", response.data["error"])
-        self.assert_in_step()
+        # The roll is whole again, so a fresh bundle can take it once more...
+        again = self.open_bundle(order)
+        response = self.scan(order, again, roll)
+        self.assertEqual(response.status_code, status.HTTP_201_CREATED, response.data)
+        # ...and the old, reversed entry is still marked reversed rather than
+        # quietly reused, so the two records cannot be mistaken for one cut.
+        entries = RollAllocation.objects.order_by("id")
+        self.assertEqual([e.is_reversed for e in entries], [True, False])
+        self.assertEqual([e.bundle_id for e in entries], [bundle["id"], again["id"]])
         roll.refresh_from_db()
-        self.assertEqual(roll.remaining_meters, D("300.000"))
-        self.assertEqual(self.tracked.stock_meters, D("300.000"))
+        self.assertEqual(roll.remaining_meters, D("0.000"))
+        self.assertEqual(self.tracked.stock_meters, D("0.000"))
 
     def test_the_roll_history_shows_where_the_metres_went(self):
         roll = self.receive(D("300"))
         order = self.make_order(self.customer1)
         line = self.make_line(order, D("300"), variant=self.tracked)
-        self.scan(order, line, roll)
+        self.scan(order, self.open_bundle(order), roll)
         self.auth()
 
         response = self.client.get(f"/api/items/rolls/{roll.pk}/history/")
@@ -611,7 +790,7 @@ class PackingConsumesRollsTests(RollTestBase):
         order = self.make_order(self.customer1)
         line = self.make_line(order, D("450"), variant=self.tracked)
 
-        self.scan(order, line, roll)
+        self.scan(order, self.open_bundle(order), roll)
 
         # Only the roll's own 100 m moved; the drifted total was not packed against.
         roll.refresh_from_db()
@@ -654,8 +833,9 @@ class PackingConsumesRollsTests(RollTestBase):
         second = self.receive(D("100"))
         order = self.make_order(self.customer1)
         line = self.make_line(order, D("200"), variant=self.tracked)
-        self.scan(order, line, first)
-        self.scan(order, line, second)
+        bundle = self.open_bundle(order)
+        self.scan(order, bundle, first)
+        self.scan(order, bundle, second)
         # The scans moved the packed total on the row, so hand the return the
         # line as it now stands rather than as it was when it was created.
         line.refresh_from_db()

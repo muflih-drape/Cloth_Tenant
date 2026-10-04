@@ -130,12 +130,21 @@ export default function FabricEditPage() {
   /**
    * A roll received, cut or adjusted moves the colour's warehouse total, so the
    * read-only figure beside the colour has to follow it without a page reload.
+   *
+   * The roll count comes back with it, because the badge on the same row quotes
+   * it. Refreshing only the metres left that badge on the count the page loaded
+   * with -- "derived from physical rolls · 0 rolls" sitting directly above a
+   * panel that had just received one.
    */
-  const handleRollStockChanged = (localId: string, stockMeters: string) =>
+  const handleRollStockChanged = (
+    localId: string,
+    stockMeters: string,
+    rollCount: number,
+  ) =>
     setVariants((prev) =>
       prev.map((v) =>
         v.localId === localId
-          ? { ...v, stockMeters, isRollTracked: true }
+          ? { ...v, stockMeters, isRollTracked: true, rollCount }
           : v,
       ),
     );
@@ -417,8 +426,8 @@ export default function FabricEditPage() {
                     <PhysicalRollsPanel
                       variantId={variant.backendId}
                       label={common.name || "Fabric"}
-                      onStockChanged={(stock) =>
-                        handleRollStockChanged(variant.localId, stock)
+                      onStockChanged={(stock, rollCount) =>
+                        handleRollStockChanged(variant.localId, stock, rollCount)
                       }
                     />
                   </div>

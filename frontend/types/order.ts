@@ -307,3 +307,79 @@ export interface PackLineResponse {
   stock_meters: string;
   rolls?: RollHistoryEntry[];
 }
+
+/**
+ * Lifecycle of a box of cloth. An open bundle is still being worked on: rolls can
+ * go in and come back out. Sealed means the contents are final and the packing slip
+ * describes exactly what is in the box. Cancelled means every roll was given back.
+ */
+export type PackingBundleStatus = "OPEN" | "SEALED" | "CANCELLED";
+
+/**
+ * One roll sitting in a bundle, with the order line it was cut for and the money
+ * on that line. `rate_per_meter` is the rate agreed for this customer, snapshotted
+ * onto the line, so a slip printed today matches the invoice for the same cloth.
+ */
+export interface PackingBundleRoll {
+  /** Primary key of the RollAllocation -- what "Remove from bundle" names. */
+  id: number;
+  roll: number;
+  roll_number: string;
+  colour: string;
+  fabric: string;
+  metres: string;
+  item: number;
+  fabric_name: string;
+  variant_display_order: string;
+  rate_per_meter: string;
+  value: string;
+  round: number | null;
+  scanned_at: string;
+}
+
+/**
+ * A bundle and everything the packing slip needs to print, so the sheet can be
+ * produced in the browser and reprinted later without asking the server again.
+ */
+export interface PackingBundle {
+  id: number;
+  /** 1-based within the order, so an order shows Bundle 1, Bundle 2, ... */
+  number: number;
+  /** The human-readable code: "Order #48 -- Bundle 1". */
+  code: string;
+  status: PackingBundleStatus;
+  created_at: string;
+  sealed_at: string | null;
+  created_by: string | null;
+  order: number;
+  order_number: number;
+  customer: string;
+  customer_address: string;
+  rolls: PackingBundleRoll[];
+  roll_count: number;
+  total_metres: string;
+  total_value: string;
+}
+
+export interface CreatePackingBundleResponse {
+  message: string;
+  bundle: PackingBundle;
+}
+
+export interface ScanIntoBundleResponse {
+  message: string;
+  /** Which order line the roll's colour was matched to. */
+  item_id: number;
+  fabric_name: string;
+  variant_display_order: string;
+  order_status: OrderStatus;
+  bundle: PackingBundle;
+}
+
+export interface BundleMutationResponse {
+  message: string;
+  order_status?: OrderStatus;
+  bundle: PackingBundle;
+}
+
+export type PackingBundleListResponse = PackingBundle[];
