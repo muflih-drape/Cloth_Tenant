@@ -83,6 +83,35 @@ class FabricVariant(models.Model):
         """
         return self.rolls.exists()
 
+    @property
+    def available_to_order(self):
+        """Metres of this colour that are not already promised to an order.
+
+        ``stock_meters`` minus what live orders have asked for and not yet had.
+        This is the figure that moves when an order is placed and is meant to be
+        shown instead of the raw total, because an admin deciding whether to take
+        an order cares what is still free, not what is on the shelf.
+
+        It is derived on every read rather than stored, so it cannot drift from
+        the orders behind it: placing, editing, withdrawing or packing an order
+        all show up here without anything keeping a counter in step.
+
+        Packing leaves it alone on purpose. Packing X metres takes X off
+        ``stock_meters`` *and* closes X of the promised gap, so the two cancel and
+        availability is unchanged by the act of packing itself. It moves when an
+        order is written, or when cloth is received or adjusted.
+
+        Goes negative when orders between them promise more than exists, which is
+        a real and allowed state here -- the shortage is arbitrated at packing,
+        not by refusing orders.
+        """
+        promised = getattr(self, "_committed_demand", None)
+        if promised is None:
+            from apps.orders.stock import committed_demand_for_variant
+
+            promised = committed_demand_for_variant(self)
+        return (self.stock_meters or Decimal("0")) - Decimal(str(promised or 0))
+
 
 class FabricRoll(models.Model):
     """One physical roll of cloth in the warehouse, for one colour.

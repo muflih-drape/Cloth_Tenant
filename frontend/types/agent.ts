@@ -15,6 +15,8 @@ export interface AgentItemVariant {
     display_order?: string;
     /** Physical metres on the roll, as a string from the API. */
     stock_meters: string;
+    /** Metres still orderable: warehouse total less what live orders have claimed. */
+    available_meters?: string;
     created_at: string;
 }
 

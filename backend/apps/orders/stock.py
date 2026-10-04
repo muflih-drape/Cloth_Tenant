@@ -18,7 +18,15 @@ order whose cloth was never dispatched).
 
 from decimal import Decimal
 
-from django.db.models import F, Sum
+from django.db.models import (
+    DecimalField,
+    F,
+    OuterRef,
+    Subquery,
+    Sum,
+    Value,
+)
+from django.db.models.functions import Coalesce
 from django.utils import timezone
 
 from apps.items.models import Fabric, FabricVariant
@@ -146,6 +154,65 @@ def outstanding_demand(variant, exclude_order=None):
     return qs.aggregate(total=Sum("ordered_quantity") - Sum("allocated_quantity"))[
         "total"
     ] or ZERO
+
+
+def committed_demand_for_variant(variant):
+    """Metres already promised for ``variant``, across every order still here.
+
+    Deliberately **not** :func:`outstanding_demand`. That one counts only the
+    orders a packing round can still act on (PENDING/PACKED); this one is the
+    whole claim on the cloth, so an order that has been edited or is still being
+    drafted has already spent availability.
+
+    Two details make this the figure to judge orderability by:
+
+    * It is **unfloored**. ``outstanding_quantity`` clamps at zero for display,
+      which would let an over-packed line look like it still wants cloth and hide
+      the metres it over-took. Summing the raw difference keeps the sign.
+    * An order has **no CANCELLED status** -- withdrawing one deletes it and the
+      lines cascade away -- so "not cancelled and not deleted" means simply
+      "still here". DISPATCHED orders count too: dispatching ships the packed
+      portion, and a partial dispatch (``allow_partial``) leaves the rest owed,
+      which is still a claim on the cloth.
+    """
+    from apps.orders.models import OrderItem
+
+    total = OrderItem.objects.filter(variant=variant).aggregate(
+        total=Sum("ordered_quantity") - Sum("allocated_quantity")
+    )["total"]
+    return Decimal(str(total or ZERO))
+
+
+def _committed_demand_expression(variant_ref):
+    """The same sum inlined as a subquery, so a whole page costs one query."""
+    from apps.orders.models import OrderItem
+
+    return Coalesce(
+        Subquery(
+            OrderItem.objects.filter(variant=variant_ref)
+            .order_by()
+            .values("variant")
+            .annotate(d=Sum("ordered_quantity") - Sum("allocated_quantity"))
+            .values("d")[:1],
+            output_field=DecimalField(max_digits=20, decimal_places=3),
+        ),
+        Value(ZERO),
+        output_field=DecimalField(max_digits=20, decimal_places=3),
+    )
+
+
+def variants_with_committed_demand():
+    """Variant queryset carrying its promised metres, for use in a ``Prefetch``.
+
+    :attr:`FabricVariant.available_to_order` reads the annotation when it is
+    there and falls back to a single query when it is not -- the same
+    annotate-then-fallback shape the catalogue serializers already use for a
+    fabric's total stock, so the Inventory list resolves every variant in one
+    extra query instead of one per colour.
+    """
+    return FabricVariant.objects.annotate(
+        _committed_demand=_committed_demand_expression(OuterRef("pk"))
+    )
 
 
 def backorder_report(order):

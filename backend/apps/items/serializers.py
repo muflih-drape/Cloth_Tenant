@@ -41,6 +41,10 @@ class FabricVariantSerializer(serializers.ModelSerializer):
     is_roll_tracked = serializers.SerializerMethodField()
     roll_count = serializers.SerializerMethodField()
     roll_stock_meters = serializers.SerializerMethodField()
+    #: What is genuinely still orderable: the warehouse total less what live
+    #: orders have already claimed. Derived per read, never stored, so it cannot
+    #: drift from the orders behind it. May be negative.
+    available_meters = serializers.SerializerMethodField()
 
     class Meta:
         model = FabricVariant
@@ -50,12 +54,16 @@ class FabricVariantSerializer(serializers.ModelSerializer):
             "image",
             "display_order",
             "stock_meters",
+            "available_meters",
             "stock_updated_at",
             "is_roll_tracked",
             "roll_count",
             "roll_stock_meters",
         ]
-        read_only_fields = ["qr_code", "stock_updated_at"]
+        read_only_fields = ["qr_code", "stock_updated_at", "available_meters"]
+
+    def get_available_meters(self, obj):
+        return str(obj.available_to_order)
 
     def get_is_roll_tracked(self, obj):
         return variant_roll_info(obj)[0]

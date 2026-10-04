@@ -110,6 +110,12 @@ class OrderItemSerializer(serializers.ModelSerializer):
     #: Whether this colour's metres live on physical rolls, so the order page can
     #: offer the scan-a-roll control instead of a typed figure.
     is_roll_tracked = serializers.SerializerMethodField()
+    #: What is still orderable of this line's colour, warehouse total less every
+    #: order's claim on it. Carried on the line so the order form can say "this
+    #: will oversell" while the agent types, instead of only after they commit.
+    #: Includes this line's own outstanding metres, so it is the figure to
+    #: compare an edit against.
+    variant_available_meters = serializers.SerializerMethodField()
     rate_overridden_by = serializers.CharField(
         source="rate_overridden_by.username", read_only=True
     )
@@ -144,6 +150,7 @@ class OrderItemSerializer(serializers.ModelSerializer):
             "line_total",
             "allocation_count",
             "is_roll_tracked",
+            "variant_available_meters",
         ]
         read_only_fields = (
             "order",
@@ -166,6 +173,13 @@ class OrderItemSerializer(serializers.ModelSerializer):
         from apps.items.rolls import is_roll_tracked
 
         return obj.variant_id is not None and is_roll_tracked(obj.variant)
+
+    def get_variant_available_meters(self, obj):
+        if obj.variant_id is None:
+            return None
+        # Reads the annotated prefetch when the order came through the viewset, and
+        # falls back to a single sum for a line fetched on its own.
+        return str(obj.variant.available_to_order)
 
     def validate(self, attrs):
         """Keep the line internally consistent and its snapshots honest.

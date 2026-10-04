@@ -16,6 +16,14 @@ export interface FabricVariant {
   image: string | null;
   display_order?: string;
   stock_meters: string;
+  /**
+   * `stock_meters` less what live orders have already claimed: the metres that
+   * are genuinely still orderable, so this is the figure to show an agent. Can
+   * be negative when orders between them promise more than the warehouse holds,
+   * which is a real state -- the shortage is settled at packing, not by
+   * refusing orders.
+   */
+  available_meters?: string;
   stock_updated_at?: string;
   is_roll_tracked?: boolean;
   roll_count?: number;
@@ -280,6 +288,8 @@ export interface UIVariant {
   qr_code: string | null;
   display_order?: string;
   stock_meters: string;
+  /** Metres still orderable: warehouse total less what live orders have claimed. */
+  available_meters?: string;
 }
 
 export interface UIItem {

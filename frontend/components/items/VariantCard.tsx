@@ -99,6 +99,7 @@ export default function VariantCard({
             <div className="flex gap-1.5 overflow-x-auto pb-1 scrollbar-none">
                 <StockMetresRow
                     stockMeters={variant.stock_meters}
+                    availableMeters={variant.available_meters}
                     isDisabled={isOutOfStock}
                     isReadonly={isReadonly}
                 />

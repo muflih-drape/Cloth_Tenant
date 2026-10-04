@@ -184,6 +184,7 @@ const OrderItem: React.FC<Props> = ({
             setEditingItem(null);
           }}
           onSave={saveEditItem}
+          availableMeters={editingItem.variant_available_meters}
         />
       )}
     </>

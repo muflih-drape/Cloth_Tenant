@@ -53,6 +53,13 @@ export interface OrderItem {
    * server will not cut cloth off a roll nobody named.
    */
   is_roll_tracked: boolean;
+  /**
+   * Metres of this line's colour still orderable: warehouse total less every
+   * order's claim on it, so it already accounts for this line's own outstanding
+   * metres. Compared against a retyped quantity to warn about overselling
+   * before the edit is saved. `null` for a line with no colour attached.
+   */
+  variant_available_meters?: string | null;
 }
 
 export interface OrderTotals {

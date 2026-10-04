@@ -5,7 +5,7 @@ from functools import partial
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import F, Q
+from django.db.models import F, Prefetch, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.dateparse import parse_datetime
@@ -32,6 +32,7 @@ from apps.orders.stock import (
     backorder_report,
     return_to_stock,
     stock_movement_for_lines,
+    variants_with_committed_demand,
 )
 from apps.orders.models import (
     Order,
@@ -253,7 +254,7 @@ class PlaceOrderView(APIView):
             short = backorder_report(order)
 
             customer_name = order.customer.name if order.customer else ""
-            order_detail = f"{customer_name} · {order.effective_total:,.2f}"
+            order_detail = f"{customer_name} Â· {order.effective_total:,.2f}"
             _notify_admins("New Order", order_detail, order_id=order.id)
 
             if short:
@@ -505,7 +506,11 @@ class OrderViewSet(ModelViewSet):
                 _restore_snapshot(stale)
 
         qs = Order.objects.select_related("customer", "agent__user").prefetch_related(
-            "items__variant", "items__fabric", "items__allocations"
+            # Carries each colour's orderable metres along with the variant, so
+            # the order page can warn about overselling without a query per line.
+            Prefetch("items__variant", queryset=variants_with_committed_demand()),
+            "items__fabric",
+            "items__allocations",
         ).order_by("-created_at")
 
         if self.action == "list":

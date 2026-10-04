@@ -8,6 +8,8 @@ from collections import defaultdict
 from django.db import transaction
 from django.db.models import Count, Prefetch
 
+from apps.orders.stock import variants_with_committed_demand
+
 from apps.accounts.permissions import (
     IsAdmin,
     IsAdminOrSelfAgent,
@@ -24,7 +26,14 @@ from .serializers import AgentFabricListSerializer, AgentSerializer
 def _assigned_fabrics(agent, request):
     """Group an agent's assigned variants by parent fabric, in stable order."""
     qs = (
-        agent.assigned_items.select_related("variant__fabric")
+        agent.assigned_items.prefetch_related(
+            # Annotated so each colour's orderable metres come along with it
+            # rather than costing one SUM per assigned colour.
+            Prefetch(
+                "variant",
+                queryset=variants_with_committed_demand().select_related("fabric"),
+            )
+        )
         .filter(variant__fabric__is_deleted=False)
         .order_by("-id")
     )

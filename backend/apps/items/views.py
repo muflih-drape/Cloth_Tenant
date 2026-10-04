@@ -3,7 +3,7 @@ from decimal import Decimal
 
 from django.conf import settings
 from django.core.exceptions import ValidationError
-from django.db.models import F, Sum, ProtectedError
+from django.db.models import F, Prefetch, Sum, ProtectedError
 from django.utils import timezone
 from drf_spectacular.utils import OpenApiTypes, extend_schema
 from rest_framework import status
@@ -71,9 +71,21 @@ def _parse_iso(raw):
 def _active_fabrics():
     """Fabrics still shown in the catalogue (not deleted, not long archived)."""
     cutoff = timezone.now() - timedelta(days=settings.ARCHIVE_AFTER_DAYS)
-    return Fabric.objects.prefetch_related("variants").filter(
+    return Fabric.objects.prefetch_related(_variants_with_availability()).filter(
         is_deleted=False
     ).exclude(out_of_stock_since__isnull=False, out_of_stock_since__lte=cutoff)
+
+
+def _variants_with_availability():
+    """Every colour's orderable metres, resolved in one extra query.
+
+    ``available_to_order`` would otherwise run one SUM per colour, which on a
+    catalogue page is a query per row. Carrying it on the prefetch keeps the
+    Inventory list at a constant query count however many colours are shown.
+    """
+    from apps.orders.stock import variants_with_committed_demand
+
+    return Prefetch("variants", queryset=variants_with_committed_demand())
 
 
 def _total_stock(qs):
@@ -205,6 +217,10 @@ class FabricViewSet(ModelViewSet):
                                 else None
                             ),
                             "stock_meters": str(variant.stock_meters),
+                            # What is still orderable, so the Inventory page shows
+                            # the figure that drops as orders are placed rather
+                            # than only the shelf total.
+                            "available_meters": str(variant.available_to_order),
                         }
                         for variant in variants
                     ],

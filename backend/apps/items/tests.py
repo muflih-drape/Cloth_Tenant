@@ -224,6 +224,224 @@ class OutstandingDemandTests(FabricTestBase):
         self.assertTrue(resp.data[0]["is_backordered"])
 
 
+class AvailableToOrderTests(FabricTestBase):
+    """``available_to_order`` = warehouse total less every order's claim.
+
+    The claim is the raw ``ordered - allocated`` sum with no clamp at zero, which
+    is what keeps an over-packed line honest, and it spans every order still in
+    the database rather than only the ones a packing round can act on.
+    """
+
+    def available(self, variant=None):
+        variant = variant or self.variant1
+        variant.refresh_from_db()
+        return variant.available_to_order
+
+    def test_with_no_orders_it_is_the_whole_warehouse(self):
+        self.assertEqual(self.available(), Decimal("3000.000"))
+
+    def test_one_pending_order_reduces_it_by_what_was_ordered(self):
+        self.make_line(self.make_order(self.customer1), 1400)
+
+        self.assertEqual(self.available(), Decimal("1600.000"))
+
+    def test_several_orders_add_up(self):
+        o1 = self.make_order(self.customer1)
+        o2 = self.make_order(self.customer2)
+        self.make_line(o1, 1000)
+        self.make_line(o2, 400)
+
+        self.assertEqual(self.available(), Decimal("1600.000"))
+
+    def test_packing_a_line_leaves_it_unchanged(self):
+        """The whole point of deriving it: packing moves both terms together.
+
+        Taking 400 m off the warehouse and closing 400 m of the promised gap is
+        the same 400 m twice over, so availability must not shift at all. The
+        two writes below are exactly what a confirmed packing round does.
+        """
+        order = self.make_order(self.customer1)
+        line = self.make_line(order, 1000)
+        before = self.available()
+        self.assertEqual(before, Decimal("2000.000"))
+
+        FabricVariant.objects.filter(pk=self.variant1.pk).update(
+            stock_meters=Decimal("2600.000")
+        )
+        line.allocated_quantity = Decimal("400")
+        line.save(update_fields=["allocated_quantity"])
+
+        self.assertEqual(self.available(), before)
+
+    def test_an_over_packed_line_puts_the_extra_metres_back(self):
+        """Unfloored on purpose: clamping at zero would inflate availability."""
+        order = self.make_order(self.customer1)
+        self.make_line(order, 400, allocated=Decimal("550"))
+
+        # 3000 - (400 - 550)
+        self.assertEqual(self.available(), Decimal("3150.000"))
+
+    def test_it_goes_negative_rather_than_clamping(self):
+        self.make_line(self.make_order(self.customer1), 3400)
+
+        self.assertEqual(self.available(), Decimal("-400.000"))
+
+    def test_a_deleted_order_releases_its_claim(self):
+        order = self.make_order(self.customer1)
+        self.make_line(order, 1200)
+        self.assertEqual(self.available(), Decimal("1800.000"))
+
+        order.delete()
+
+        self.assertEqual(self.available(), Decimal("3000.000"))
+
+    def test_editing_a_quantity_moves_it_by_the_difference(self):
+        order = self.make_order(self.customer1)
+        self.make_line(order, 1000)
+        self.assertEqual(self.available(), Decimal("2000.000"))
+
+        OrderItem.objects.filter(order=order).update(ordered_quantity=Decimal("700"))
+
+        self.assertEqual(self.available(), Decimal("2300.000"))
+
+    def test_only_the_colour_own_orders_count(self):
+        self.make_line(self.make_order(self.customer1), 1000, variant=self.variant2)
+
+        self.assertEqual(self.available(self.variant1), Decimal("3000.000"))
+        self.assertEqual(self.available(self.variant2), Decimal("500.000"))
+
+    def test_a_draft_line_already_claims_the_cloth(self):
+        """Deliberately wider than the packing queue's own view of "live"."""
+        self.make_line(self.make_order(self.customer1, status="DRAFT"), 500)
+
+        self.assertEqual(self.available(), Decimal("2500.000"))
+
+    def test_the_catalogue_serialises_it_beside_the_physical_figure(self):
+        from apps.items.serializers import FabricVariantSerializer
+
+        self.make_line(self.make_order(self.customer1), 3400)
+
+        data = FabricVariantSerializer(self.variant1).data
+
+        self.assertEqual(Decimal(data["stock_meters"]), Decimal("3000.000"))
+        self.assertEqual(Decimal(data["available_meters"]), Decimal("-400.000"))
+
+    def test_the_list_resolves_every_variant_without_a_query_each(self):
+        """The prefetch exists so a catalogue page is not a query per colour."""
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        for index in range(6):
+            FabricVariant.objects.create(
+                fabric=self.fabric,
+                display_order=f"Shade {index}",
+                stock_meters=Decimal("100"),
+            )
+        self.make_line(self.make_order(self.customer1), 40)
+
+        def load():
+            from apps.items.views import _active_fabrics
+
+            for fabric in _active_fabrics():
+                for variant in fabric.variants.all():
+                    str(variant.available_to_order)
+
+        with CaptureQueriesContext(connection) as captured:
+            load()
+
+        self.assertLessEqual(len(captured.captured_queries), 4)
+
+    def test_the_annotated_and_direct_routes_agree(self):
+        from apps.orders.stock import variants_with_committed_demand
+
+        self.make_line(self.make_order(self.customer1), 900)
+
+        annotated = {
+            v.pk: v.available_to_order for v in variants_with_committed_demand()
+        }
+
+        self.assertEqual(
+            annotated[self.variant1.pk],
+            FabricVariant.objects.get(pk=self.variant1.pk).available_to_order,
+        )
+
+
+class StockListAvailabilityTests(FabricTestBase):
+    """The Inventory page reads ``/api/items/stock-list/``, not the serializer.
+
+    That endpoint builds its variant rows by hand, so it has to carry the
+    orderable figure itself -- when it did not, the Inventory page showed the
+    shelf total and appeared to ignore orders entirely.
+    """
+
+    URL = "/api/items/stock-list/"
+
+    def row_for(self, response, variant):
+        for fabric in response.data:
+            for entry in fabric["variants"]:
+                if entry["id"] == variant.pk:
+                    return entry
+        self.fail(f"variant {variant.pk} missing from the stock list")
+
+    def test_it_reports_availability_and_the_physical_total_side_by_side(self):
+        self.auth()
+        resp = self.client.get(self.URL)
+
+        row = self.row_for(resp, self.variant1)
+        self.assertEqual(Decimal(row["stock_meters"]), Decimal("3000.000"))
+        self.assertEqual(Decimal(row["available_meters"]), Decimal("3000.000"))
+
+    def test_placing_an_order_takes_it_off_the_list(self):
+        self.make_line(self.make_order(self.customer1), 100)
+
+        self.auth()
+        row = self.row_for(self.client.get(self.URL), self.variant1)
+
+        self.assertEqual(Decimal(row["available_meters"]), Decimal("2900.000"))
+        # The cloth has not moved: only the order has.
+        self.assertEqual(Decimal(row["stock_meters"]), Decimal("3000.000"))
+
+    def test_the_order_wizard_sees_it_drop_too(self):
+        self.make_line(self.make_order(self.customer1), 100)
+        self.make_line(self.make_order(self.customer2), 400)
+
+        self.auth()
+        row = self.row_for(self.client.get(self.URL), self.variant1)
+
+        self.assertEqual(Decimal(row["available_meters"]), Decimal("2500.000"))
+
+    def test_a_later_order_is_reflected_without_a_refetch_of_the_fabric(self):
+        """Derived, not cached: the next read already has the new order in it."""
+        self.auth()
+        first = self.row_for(self.client.get(self.URL), self.variant1)
+
+        self.make_line(self.make_order(self.customer1), 250)
+        second = self.row_for(self.client.get(self.URL), self.variant1)
+
+        self.assertEqual(
+            Decimal(second["available_meters"]),
+            Decimal(first["available_meters"]) - Decimal("250.000"),
+        )
+
+    def test_resolving_every_variant_costs_a_fixed_number_of_queries(self):
+        for index in range(6):
+            FabricVariant.objects.create(
+                fabric=self.fabric,
+                display_order=f"Shade {index}",
+                stock_meters=Decimal("100"),
+            )
+        self.make_line(self.make_order(self.customer1), 40)
+
+        self.auth()
+        # Fixed regardless of how many colours are listed: authenticate, the
+        # fabrics, and one prefetch carrying every variant's orderable metres.
+        with self.assertNumQueries(3):
+            resp = self.client.get(self.URL)
+            for fabric in resp.data:
+                for entry in fabric["variants"]:
+                    str(Decimal(entry["available_meters"]))
+
+
 class StockAccountingTests(FabricTestBase):
     def test_out_of_stock_since_set_when_every_variant_empties(self):
         sync_out_of_stock(self.fabric)

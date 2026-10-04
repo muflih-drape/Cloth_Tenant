@@ -20,6 +20,7 @@ function normalizeAgentItem(item: AssignedItem): UIItem {
             qr_code: v.qr_code,
             display_order: v.display_order,
             stock_meters: v.stock_meters,
+            available_meters: v.available_meters,
         })),
     };
 }

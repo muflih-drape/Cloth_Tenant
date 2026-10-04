@@ -40,7 +40,15 @@ export default function VariantRow({
                 </p>
             </div>
 
-            <StockBadge total={Number(variant.stock_meters)} unit="m" />
+            <StockBadge
+                total={Number(variant.stock_meters)}
+                available={
+                    variant.available_meters === undefined
+                        ? undefined
+                        : Number(variant.available_meters)
+                }
+                unit="m"
+            />
 
             <button
                 type="button"

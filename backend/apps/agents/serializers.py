@@ -5,6 +5,9 @@ from rest_framework import serializers
 
 from apps.accounts.models import User
 from apps.items.models import FabricVariant
+from apps.orders.stock import variants_with_committed_demand
+
+from django.db.models import Prefetch
 
 from .models import Agent, AgentItem
 
@@ -46,6 +49,9 @@ class AgentFabricListSerializer(serializers.Serializer):
                 "created_at": ai.created_at.isoformat(),
                 "display_order": ai.variant.display_order,
                 "stock_meters": str(ai.variant.stock_meters),
+                # What is still orderable, so the agent is shown the figure that
+                # moves when an order is placed rather than the shelf total.
+                "available_meters": str(ai.variant.available_to_order),
             }
             for ai in agent_items
         ]
@@ -139,7 +145,16 @@ class AgentSerializer(serializers.ModelSerializer):
             qs = obj.assigned_items.all()
         else:
             qs = (
-                obj.assigned_items.select_related("variant__fabric")
+                obj.assigned_items.prefetch_related(
+                    # Annotated so each colour's orderable metres ride along with
+                    # it rather than costing one SUM per assigned colour.
+                    Prefetch(
+                        "variant",
+                        queryset=variants_with_committed_demand().select_related(
+                            "fabric"
+                        ),
+                    )
+                )
                 .filter(variant__fabric__is_deleted=False)
                 .order_by("-created_at")
             )

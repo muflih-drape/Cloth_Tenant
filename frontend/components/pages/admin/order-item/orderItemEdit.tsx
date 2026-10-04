@@ -1,7 +1,7 @@
 "use client";
 
 import { useEffect, useState } from "react";
-import { Pencil } from "lucide-react";
+import { Pencil, TriangleAlert } from "lucide-react";
 import { Modal, ModalButton } from "@/components/ui/custom/Modals";
 import { fabricApi } from "@/lib/api/item";
 import { OrderItem } from "@/types/order";
@@ -19,6 +19,13 @@ interface OrderItemEditModalProps {
   onSave: () => void;
   /** True while the save is in flight, so the buttons can lock. */
   saving?: boolean;
+  /**
+   * Metres of this line's colour still orderable, as the server sees it with the
+   * order in its current state. Compared against the retyped quantity to warn
+   * about overselling. Omitted when the server did not send it, which just hides
+   * the warning rather than guessing.
+   */
+  availableMeters?: string | null;
 }
 
 /**
@@ -36,6 +43,7 @@ const OrderItemEditModal: React.FC<OrderItemEditModalProps> = ({
   onClose,
   onSave,
   saving = false,
+  availableMeters,
 }) => {
   const [colours, setColours] = useState<VariantAllItem[]>([]);
   const [loading, setLoading] = useState(true);
@@ -63,6 +71,19 @@ const OrderItemEditModal: React.FC<OrderItemEditModalProps> = ({
 
   const alreadyPacked = toMeters(item.allocated_quantity);
   const selected = colours.find((colour) => colour.id === variantId);
+
+  /**
+   * Where this colour's orderable metres land once the typed quantity is saved.
+   *
+   * `availableMeters` already has this line's current claim subtracted, so
+   * retyping the quantity moves availability by exactly the difference between
+   * the old and new figures -- the packed metres cancel out and need no separate
+   * handling here.
+   */
+  const projectedAvailability =
+    availableMeters === undefined || availableMeters === null
+      ? 0
+      : toMeters(availableMeters) + toMeters(item.ordered_quantity) - toMeters(metres);
 
   return (
     <Modal
@@ -110,6 +131,30 @@ const OrderItemEditModal: React.FC<OrderItemEditModalProps> = ({
           />
           {metresError ? (
             <p className="mt-1.5 text-xs text-red-600">{metresError}</p>
+          ) : availableMeters !== undefined && availableMeters !== null ? (
+            /* Advisory only. Demand outrunning supply is a real, allowed state
+               here -- the shortage is arbitrated at packing -- so this says so
+               and never blocks the save. It uses the amber triangle already
+               used for order warnings rather than inventing a style. */
+            projectedAvailability < 0 ? (
+              <p className="mt-1.5 text-xs font-medium text-amber-600 flex items-start gap-1">
+                <TriangleAlert size={13} className="mt-px flex-shrink-0" />
+                <span>
+                  {toMeters(availableMeters) < 0
+                    ? `Already oversold by ${formatMeters(
+                        Math.abs(toMeters(availableMeters)),
+                      )} m on other orders. `
+                    : `Only ${formatMeters(toMeters(availableMeters))} m available. `}
+                  This line would take it to {formatMeters(projectedAvailability)}{" "}
+                  m. You can still proceed.
+                </span>
+              </p>
+            ) : (
+              <p className="mt-1.5 text-xs text-gray-400">
+                {formatMeters(toMeters(availableMeters))} m of this colour
+                available for ordering
+              </p>
+            )
           ) : selected ? (
             <p className="mt-1.5 text-xs text-gray-400">
               {formatMeters(selected.stock_meters)} m of this colour in stock

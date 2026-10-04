@@ -12,7 +12,7 @@ interface ListItemsProps {
   initialTab?: StockTab;
 }
 
-function normalizeAdminItem(item: FabricStockEntry): UIItem {
+export function normalizeAdminItem(item: FabricStockEntry): UIItem {
   return {
     id: item.id,
     name: item.name,
@@ -23,6 +23,7 @@ function normalizeAdminItem(item: FabricStockEntry): UIItem {
       qr_code: variant.qr_code,
       display_order: variant.display_order,
       stock_meters: variant.stock_meters,
+      available_meters: variant.available_meters,
     })),
   };
 }
