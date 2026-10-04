@@ -6,6 +6,7 @@ import { toast } from "sonner";
 
 import PackingBundlePanel from "@/components/pages/order/PackingBundlePanel";
 import { packingApi } from "@/lib/api/order";
+import { transportApi } from "@/lib/api/transport";
 import type {
   OrderItem,
   PackingBundle,
@@ -24,7 +25,13 @@ vi.mock("@/lib/api/order", () => ({
     removeRollFromBundle: vi.fn(),
     sealBundle: vi.fn(),
     cancelBundle: vi.fn(),
+    dispatchBundle: vi.fn(),
   },
+}));
+
+/** Transport companies, loaded only when a dispatch actually needs a choice. */
+vi.mock("@/lib/api/transport", () => ({
+  transportApi: { getActive: vi.fn() },
 }));
 
 /**
@@ -89,10 +96,12 @@ const scanIntoBundle = vi.mocked(packingApi.scanIntoBundle);
 const removeRollFromBundle = vi.mocked(packingApi.removeRollFromBundle);
 const sealBundle = vi.mocked(packingApi.sealBundle);
 const cancelBundle = vi.mocked(packingApi.cancelBundle);
+const dispatchBundle = vi.mocked(packingApi.dispatchBundle);
 
 function roll(overrides: Partial<PackingBundleRoll> = {}): PackingBundleRoll {
   return {
     id: 11,
+    allocation_id: 4,
     roll: 3,
     roll_number: "NAT-0001",
     colour: "Natural",
@@ -111,6 +120,7 @@ function roll(overrides: Partial<PackingBundleRoll> = {}): PackingBundleRoll {
 
 function bundle(overrides: Partial<PackingBundle> = {}): PackingBundle {
   const rolls = overrides.rolls ?? [];
+  const dispatchedAt = overrides.dispatched_at ?? null;
   return {
     id: 1,
     number: 1,
@@ -118,13 +128,19 @@ function bundle(overrides: Partial<PackingBundle> = {}): PackingBundle {
     status: "OPEN",
     created_at: "2026-02-01T09:00:00Z",
     sealed_at: null,
+    dispatched_at: dispatchedAt,
+    is_dispatched: dispatchedAt !== null,
     created_by: "admin1",
     order: 5,
     order_number: 5,
     customer: "Riya Textiles",
     customer_address: "14 Mill Lane",
     rolls,
-    roll_count: rolls.length,
+    // Only pieces with a roll behind them count as rolls; a hand-packed box has
+    // pieces on the slip but nothing off a roll.
+    roll_count: rolls.filter((r) => Boolean(r.roll_number)).length,
+    piece_count: rolls.length,
+    is_roll_based: rolls.some((r) => Boolean(r.roll_number)),
     total_metres: rolls.reduce((sum, r) => sum + Number(r.metres), 0).toFixed(3),
     total_value: rolls
       .reduce((sum, r) => sum + Number(r.value), 0)
@@ -152,6 +168,10 @@ const scanButton = () =>
   screen.getByRole("button", { name: /scan a roll into this bundle/i });
 const sealButton = () =>
   screen.getByRole("button", { name: /complete bundle/i });
+const dispatchButtons = () =>
+  screen.queryAllByRole("button", { name: /^dispatch$/i });
+const transportPicker = () =>
+  screen.queryByRole("dialog", { name: /dispatch order #5 -- bundle/i });
 
 /** Types into the stubbed scanner and fires it, as scanning a label would. */
 async function scan(user: ReturnType<typeof userEvent.setup>, value: string) {
@@ -892,5 +912,166 @@ describe("PackingBundlePanel showing the lines a bundle packed", () => {
     // still stands against a bundle and the other 400 m reads as hand-packed.
     // Counting the cancelled box as well would leave nothing to report here.
     expect(screen.getByText(/400 m packed by hand/)).toBeTruthy();
+  });
+});
+describe("PackingBundlePanel dispatching a bundle", () => {
+  const TRANSPORTS = [
+    { id: 2, name: "Khushi Carriers" },
+    { id: 3, name: "Roadways Freight" },
+  ];
+
+  beforeEach(() => {
+    vi.mocked(transportApi.getActive).mockResolvedValue(TRANSPORTS as never);
+  });
+
+  const sealed = (overrides: Partial<PackingBundle> = {}) =>
+    bundle({
+      status: "SEALED",
+      sealed_at: "2026-02-01T11:00:00Z",
+      rolls: [roll()],
+      ...overrides,
+    });
+
+  it("offers a Dispatch button on every sealed bundle that is still here", async () => {
+    listBundles.mockResolvedValue([
+      sealed({ id: 1, number: 1, code: "Order #5 -- Bundle 1" }),
+      sealed({
+        id: 2,
+        number: 2,
+        code: "Order #5 -- Bundle 2",
+        rolls: [roll({ id: 12, metres: "400.000", value: "3600.00" })],
+      }),
+    ]);
+    panel();
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+    expect(dispatchButtons()).toHaveLength(2);
+  });
+
+  it("offers nothing on a bundle that has already gone out", async () => {
+    listBundles.mockResolvedValue([
+      sealed({ dispatched_at: "2026-02-02T09:00:00Z" }),
+    ]);
+    panel();
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+    expect(dispatchButtons()).toHaveLength(0);
+    // And it says so, with the date, because a slip reprinted later needs to say
+    // this box is already on a truck.
+    expect(screen.getByText(/Dispatched 2026-02-02/)).toBeTruthy();
+  });
+
+  it("asks which transport on the first bundle to leave, offering the customer's preference", async () => {
+    listBundles.mockResolvedValue([sealed()]);
+    panel({ preferredTransportId: 3 });
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+    await user.click(dispatchButtons()[0]);
+
+    const dialog = await screen.findByRole("dialog", {
+      name: /dispatch order #5 -- bundle 1/i,
+    });
+    const select = within(dialog).getByLabelText(/transport/i) as HTMLSelectElement;
+    expect(select.value).toBe("3");
+    // Nothing was sent yet: choosing is a separate step from pressing Dispatch.
+    expect(dispatchBundle).not.toHaveBeenCalled();
+  });
+
+  it("will not let the first bundle go out without a transport", async () => {
+    listBundles.mockResolvedValue([sealed()]);
+    panel();
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+    await user.click(dispatchButtons()[0]);
+    await screen.findByRole("dialog", { name: /dispatch order #5 -- bundle 1/i });
+
+expect(
+      (
+        screen.getByRole("button", { name: /dispatch bundle/i }) as HTMLButtonElement
+      ).disabled,
+    ).toBe(true);
+    expect(dispatchBundle).not.toHaveBeenCalled();
+  });
+
+  it("sends the chosen transport with the bundle and reports the new order status", async () => {
+    const gone = sealed({ dispatched_at: "2026-02-03T08:00:00Z" });
+    listBundles.mockResolvedValue([sealed()]);
+    dispatchBundle.mockResolvedValue({
+      message: "Bundle dispatched",
+      order_status: "DISPATCHED",
+      bundle: gone,
+    });
+    const onOrderStatusChange = vi.fn();
+    const onChanged = vi.fn();
+    panel({ preferredTransportId: 2, onOrderStatusChange, onChanged });
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+    await user.click(dispatchButtons()[0]);
+    await user.selectOptions(
+      await screen.findByLabelText(/transport/i),
+      "2",
+    );
+    await user.click(screen.getByRole("button", { name: /dispatch bundle/i }));
+
+    await waitFor(() =>
+      expect(dispatchBundle).toHaveBeenCalledWith(5, 1, {
+        transport_company: 2,
+      }),
+    );
+    // The badge on the page follows the server's answer rather than guessing.
+    await waitFor(() =>
+      expect(onOrderStatusChange).toHaveBeenCalledWith("DISPATCHED"),
+    );
+    expect(onChanged).toHaveBeenCalled();
+    // And the button goes with it: a box already gone has nothing to dispatch.
+    await waitFor(() => expect(dispatchButtons()).toHaveLength(0));
+  });
+
+  it("asks nothing once the order already has a transport", async () => {
+    listBundles.mockResolvedValue([sealed()]);
+    dispatchBundle.mockResolvedValue({
+      message: "Bundle dispatched",
+      order_status: "PARTIALLY_DISPATCHED",
+      bundle: sealed({ dispatched_at: "2026-02-03T08:00:00Z" }),
+    });
+    panel({ transportCompanyId: 2 });
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+    await user.click(dispatchButtons()[0]);
+
+    // No dialog, and no transport named again: the order already knows.
+    await waitFor(() =>
+      expect(dispatchBundle).toHaveBeenCalledWith(5, 1, {}),
+    );
+    expect(transportPicker()).toBeNull();
+    expect(transportApi.getActive).not.toHaveBeenCalled();
+  });
+
+  it("keeps the bundle on screen when the server refuses", async () => {
+    listBundles.mockResolvedValue([sealed()]);
+    dispatchBundle.mockRejectedValue(
+      Object.assign(new Error("nope"), {
+        response: { data: { error: "Order #5 is still open for editing." } },
+      }),
+    );
+    panel({ preferredTransportId: 2 });
+    const user = userEvent.setup();
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+    await user.click(dispatchButtons()[0]);
+    await user.click(await screen.findByRole("button", { name: /dispatch bundle/i }));
+
+    await waitFor(() =>
+      expect(toast.error).toHaveBeenCalledWith(
+        expect.stringContaining("still open for editing"),
+        expect.anything(),
+      ),
+    );
+    // Nothing was claimed, so the box is still there to try again.
+    expect(dispatchButtons()).toHaveLength(1);
   });
 });

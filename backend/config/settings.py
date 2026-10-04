@@ -130,6 +130,14 @@ DATABASES = {
         "PASSWORD": config("DB_PASSWORD"),
         "HOST": config("DB_HOST"),
         "PORT": config("DB_PORT", cast=int),
+        # The database is a remote Supabase pooler, so every handshake costs a
+        # TLS round trip to the internet. Django's default of 0 closes the
+        # connection after each request, which made *every* endpoint pay that
+        # handshake before it ran a single query. Holding the connection open
+        # between requests removes it; the health check keeps a connection that
+        # the pooler has since dropped from raising on the next query.
+        "CONN_MAX_AGE": 60,
+        "CONN_HEALTH_CHECKS": True,
     }
 }
 

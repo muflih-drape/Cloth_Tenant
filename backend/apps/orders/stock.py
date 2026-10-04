@@ -20,6 +20,7 @@ from decimal import Decimal
 
 from django.db.models import (
     DecimalField,
+    Exists,
     F,
     OuterRef,
     Subquery,
@@ -29,14 +30,21 @@ from django.db.models import (
 from django.db.models.functions import Coalesce
 from django.utils import timezone
 
-from apps.items.models import Fabric, FabricVariant
+from apps.items.models import Fabric, FabricRoll, FabricVariant
+from apps.items.rolls import (
+    return_metres_for_allocations,
+)
 from apps.items.rolls import return_metres_for_lines as return_metres_to_rolls
 from apps.items.services import sync_out_of_stock
 
 ZERO = Decimal("0")
 
 #: Order statuses whose lines still compete for cloth in a packing round.
-OPEN_STATUSES = ("PENDING", "PACKED")
+#:
+#: A part-dispatched order is still in play: some bundles have gone out on a truck
+#: while others are still sealed on the shelf, and those can still be packed. It
+#: stays here so its outstanding lines keep competing for cloth.
+OPEN_STATUSES = ("PENDING", "PACKED", "PARTIALLY_DISPATCHED")
 
 #: Order statuses that are still alive and may be edited or cancelled.
 LIVE_STATUSES = ("DRAFT", "PENDING", "EDITING", "PACKED")
@@ -108,7 +116,7 @@ def allocated_totals_by_variant(lines):
     return totals
 
 
-def stock_movement_for_lines(lines, direction="consume"):
+def stock_movement_for_lines(lines, direction="consume", keep_allocation_ids=None):
     """Move the cloth allocated to ``lines`` on or off the roll.
 
     ``direction`` is ``"consume"`` (cloth leaves the warehouse) or ``"return"``
@@ -120,8 +128,19 @@ def stock_movement_for_lines(lines, direction="consume"):
     exact rolls it was cut from, found through each line's allocation records.
     Cloth packed before rolls existed has no records and simply goes back on the
     warehouse total.
+
+    ``keep_allocation_ids`` narrows a ``"return"`` to one set of allocations instead
+    of everything these lines have. This exists for deleting an order whose bundles
+    have partly shipped: a line's metres can sit in a bundle that went out on a truck
+    and a bundle still on the shelf, and only the shelf one may come back. It is
+    counted per allocation rather than per line for exactly that reason -- the line
+    total cannot tell the two apart. Ignored for ``"consume"``.
     """
     lines = list(lines)
+
+    if direction == "return" and keep_allocation_ids is not None:
+        return _return_named_allocations(keep_allocation_ids)
+
     totals = allocated_totals_by_variant(lines)
     if not totals:
         return {}
@@ -134,6 +153,40 @@ def stock_movement_for_lines(lines, direction="consume"):
     else:
         raise ValueError(f"Unknown stock direction: {direction!r}")
 
+    return totals
+
+
+def _return_named_allocations(allocation_ids):
+    """Return exactly these allocations' metres, and nothing else.
+
+    Split out of :func:`stock_movement_for_lines` because returning a *subset* of a
+    line's cloth cannot go through the line totals -- those would credit the whole
+    line, including any metres already on a truck. It credits the variant total and
+    then the underlying rolls for precisely the allocations named, in that order,
+    which is the same pair of writes the whole-line path performs.
+    """
+    from apps.orders.models import Allocation
+
+    allocations = list(
+        Allocation.objects.filter(pk__in=allocation_ids).select_related(
+            "order_item", "order_item__variant"
+        )
+    )
+    if not allocations:
+        return {}
+
+    totals = {}
+    for allocation in allocations:
+        variant_id = allocation.order_item.variant_id
+        if variant_id is None:
+            continue
+        totals[variant_id] = totals.get(variant_id, ZERO) + allocation.metres
+
+    if not totals:
+        return {}
+
+    return_to_stock(totals)
+    return_metres_for_allocations(allocations)
     return totals
 
 
@@ -211,7 +264,11 @@ def variants_with_committed_demand():
     extra query instead of one per colour.
     """
     return FabricVariant.objects.annotate(
-        _committed_demand=_committed_demand_expression(OuterRef("pk"))
+        _committed_demand=_committed_demand_expression(OuterRef("pk")),
+        # Rolls are needed to answer "is this colour tracked in rolls?" for every
+        # line on an order page. Folding that into the query this Prefetch already
+        # makes turns one round trip per line into none.
+        _has_rolls=Exists(FabricRoll.objects.filter(variant_id=OuterRef("pk"))),
     )
 
 

@@ -175,6 +175,16 @@ export default function ProductDetailPage() {
     };
 
     const onHandMetres = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
+    /**
+     * Not already promised to another order, straight from the scan.
+     *
+     * Falls back to what is on hand when the server predates this field, so the
+     * screen still shows a sensible figure rather than a blank or a zero.
+     */
+    const availableMetres =
+        selectedVariant?.available_meters !== undefined
+            ? toMeters(selectedVariant.available_meters)
+            : onHandMetres;
     /** The agreed rate already on this colour's line, if the order has one. */
     const existingRate = selectedVariant
         ? rateByVariant[selectedVariant.id]
@@ -319,6 +329,7 @@ export default function ProductDetailPage() {
                     metres={metres}
                     onChange={setMetres}
                     onHandMetres={onHandMetres}
+                    availableMetres={availableMetres}
                     isEditMode={isEditMode}
                 />
 

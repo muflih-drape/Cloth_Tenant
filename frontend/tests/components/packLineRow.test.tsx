@@ -55,6 +55,8 @@ function packedResult(
       allocation_count: 2,
     }),
     stock_meters: "1800.000",
+    bundle_id: 9,
+    bundle_code: "Order #5 -- Bundle 1",
     ...overrides,
   };
 }
@@ -72,6 +74,8 @@ function overPackedResult(): PackLineResponse {
       allocation_count: 2,
     }),
     stock_meters: "1800.000",
+    bundle_id: 9,
+    bundle_code: "Order #5 -- Bundle 1",
   };
 }
 

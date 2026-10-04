@@ -123,6 +123,23 @@ const [overriddenByVariant, setOverriddenByVariant] = useState<
   };
 
   const onHandMetres = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
+  /**
+   * Give this line's own claim back before comparing.
+   *
+   * Availability already has every line of this order subtracted, including the
+   * one being edited, so measuring the typed total against it directly would
+   * warn an agent who simply left the line exactly as it was. Adding back what
+   * this line already holds and taking off what it will hold leaves the figure
+   * comparable with the number in the box.
+   */
+  const availableMetres = useMemo(() => {
+    if (!selectedVariant) return 0;
+    const scanned =
+      selectedVariant.available_meters !== undefined
+        ? toMeters(selectedVariant.available_meters)
+        : onHandMetres;
+    return scanned + (existingMetres[selectedVariant.id] ?? 0);
+  }, [selectedVariant, existingMetres, onHandMetres]);
   const requested = useMemo(() => toMeters(metres), [metres]);
 
   const catalogRate = data?.price_per_meter ?? "";
@@ -243,6 +260,7 @@ const [overriddenByVariant, setOverriddenByVariant] = useState<
           metres={metres}
           onChange={setMetres}
           onHandMetres={onHandMetres}
+        availableMetres={availableMetres}
           isEditMode={isEditMode}
         />
 

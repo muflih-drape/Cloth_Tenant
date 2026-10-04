@@ -1,6 +1,7 @@
 from decimal import Decimal
 
 from django.conf import settings
+from django.db.models import prefetch_related_objects
 from django.utils import timezone
 from rest_framework import serializers
 
@@ -344,6 +345,16 @@ class OrderSerializer(serializers.ModelSerializer):
 
     def get_totals(self, obj):
         return order_totals_payload(obj)
+
+    def to_representation(self, instance):
+        # `items` and `totals` both read this order's lines. `get_queryset`
+        # prefetches them, so on the list and retrieve paths they share one
+        # query already; a freshly created order has no such cache and each
+        # reader issued its own. Prime it once so creating a draft costs a
+        # single round trip instead of two.
+        if "items" not in getattr(instance, "_prefetched_objects_cache", {}):
+            prefetch_related_objects([instance], "items")
+        return super().to_representation(instance)
 
 
 class AddOrderItemSerializer(serializers.Serializer):

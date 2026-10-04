@@ -31,19 +31,26 @@ from datetime import timezone as dt_timezone
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import F, Min, Sum
+from django.db.models import F, Min, Q, Sum
 from django.utils import timezone
 
 from apps.customers.models import Customer
 from apps.items.models import FabricVariant
 from apps.items.rolls import consume_for_allocation, return_metres_for_allocations
 from apps.items.services import sync_out_of_stock
-from apps.orders.models import Allocation, Order, OrderItem, OrderLog, PackingRound
+from apps.orders.models import (
+    Allocation,
+    Order,
+    OrderItem,
+    OrderLog,
+    PackingRound,
+    RollAllocation,
+)
 
 ZERO = Decimal("0")
 
 #: Order statuses whose lines still compete for cloth in a packing round.
-OPEN_STATUSES = ("PENDING", "PACKED")
+OPEN_STATUSES = ("PENDING", "PACKED", "PARTIALLY_DISPATCHED")
 
 
 # --------------------------------------------------------------------------- #
@@ -468,3 +475,68 @@ def sync_order_after_allocation(
         details=details,
         performed_by=user,
     )
+
+
+def sync_order_after_dispatch(order):
+    """Move the order between PARTIALLY_DISPATCHED and DISPATCHED after a bundle goes out.
+
+    Dispatch is counted in bundles rather than in metres, because a bundle is what
+    actually left. An order is fully dispatched once every one of its live bundles
+    has been dispatched *and* nothing is still owed on any line -- the two conditions
+    are separate on purpose. A line that was never fully packed holds cloth that has
+    not gone anywhere, so sealing and dispatching every bundle still leaves the order
+    only partly dispatched until that shortfall is dealt with.
+
+    An order with nothing dispatched yet is left alone: this answers "how far along is
+    the dispatch", and before the first bundle leaves there is no answer to give, so
+    the packing status (PENDING/PACKED) keeps owning the field.
+
+    Cancelled bundles and empty ones are excluded from both sides of the comparison.
+    A cancelled box had its cloth given back, and an emptied one -- a hand-packed
+    bundle whose round was later reversed -- holds nothing that went anywhere, so
+    neither counts as dispatched nor as still outstanding. Counting them would leave
+    such an order permanently "partly dispatched" with nothing left to send.
+    """
+    live_ids = set(
+        order.packing_bundles.exclude(status="CANCELLED").values_list("id", flat=True)
+    )
+    dispatched = set(
+        order.packing_bundles.filter(dispatched_at__isnull=False).values_list(
+            "id", flat=True
+        )
+    )
+
+    if not dispatched:
+        return order.status
+
+    holds_rolls = set(
+        RollAllocation.objects.filter(
+            bundle_id__in=live_ids, is_reversed=False
+        ).values_list("bundle_id", flat=True)
+    )
+    holds_metres = set(
+        Allocation.objects.filter(bundle_id__in=live_ids)
+        .filter(Q(round__isnull=True) | ~Q(round__status="CANCELLED"))
+        .values_list("bundle_id", flat=True)
+    )
+    occupied = (holds_rolls | holds_metres) & live_ids
+
+    lines = list(order.items.all())
+    allocated = sum((line.allocated_quantity for line in lines), ZERO)
+    ordered = sum((line.ordered_quantity for line in lines), ZERO)
+    fully_packed = ordered > ZERO and allocated >= ordered
+
+    everything_gone = bool(occupied) and occupied <= dispatched
+    status = "DISPATCHED" if everything_gone and fully_packed else "PARTIALLY_DISPATCHED"
+
+    if order.status != status:
+        order.status = status
+        fields = ["status"]
+        if status == "DISPATCHED" and not order.dispatched_at:
+            # Kept for the order-level "dispatched at" stamp that existed before
+            # dispatch moved onto bundles; it is the moment the last bundle left.
+            order.dispatched_at = timezone.now()
+            fields.append("dispatched_at")
+        order.save(update_fields=fields)
+
+    return status

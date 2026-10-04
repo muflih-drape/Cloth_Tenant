@@ -1,4 +1,18 @@
-export type OrderStatus = "DRAFT" | "PENDING" | "EDITING" | "PACKED" | "DISPATCHED";
+/**
+ * Where an order has got to.
+ *
+ * Dispatch counts bundles, not orders: PARTIALLY_DISPATCHED means some sealed bundle
+ * has gone out while others are still sealed or some lines are still unpacked, and
+ * DISPATCHED means every bundle has gone and nothing is still owed. Both are worked
+ * out by the server from the bundles, never set by hand.
+ */
+export type OrderStatus =
+  | "DRAFT"
+  | "PENDING"
+  | "EDITING"
+  | "PACKED"
+  | "PARTIALLY_DISPATCHED"
+  | "DISPATCHED";
 
 /**
  * A fabric variant is one colour/finish of a fabric, and it is what carries the

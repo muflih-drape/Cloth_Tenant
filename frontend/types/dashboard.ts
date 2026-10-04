@@ -5,6 +5,12 @@ export interface AnalyticsKPIs {
   editing: number;
   packed: number;
   dispatched: number;
+  /**
+   * Orders where some sealed bundles have gone on a truck and others have not.
+   * Counted apart from `dispatched` because the two mean different things: one is
+   * finished, the other still has boxes waiting in the warehouse.
+   */
+  partially_dispatched: number;
   /** Metres ordered across placed (non-DRAFT) orders in the range. */
   total_metres_ordered: string;
   /** Metres allocated on dispatched orders. */

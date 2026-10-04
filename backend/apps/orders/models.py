@@ -28,6 +28,7 @@ class Order(models.Model):
         ("PENDING", "Pending"),
         ("EDITING", "Editing"),
         ("PACKED", "Packed"),
+        ("PARTIALLY_DISPATCHED", "Partially Dispatched"),
         ("DISPATCHED", "Dispatched"),
     )
 
@@ -315,6 +316,23 @@ class Allocation(models.Model):
     metres = models.DecimalField(max_digits=14, decimal_places=3)
     sequence = models.PositiveSmallIntegerField(default=1)
     is_priority_award = models.BooleanField(default=False)
+    #: The bundle these metres were handed over in.
+    #:
+    #: A scanned roll carries its own bundle link (see :class:`RollAllocation`), so
+    #: this is only populated for a roll-less colour packed by hand -- there is no
+    #: roll to hang the link on, but the metres still leave the warehouse in a box,
+    #: so they still need to belong to one. That is what lets dispatch treat every
+    #: handover the same way regardless of how it was packed.
+    #:
+    #: SET_NULL, matching ``RollAllocation.bundle``, so a bundle that is deleted as
+    #: bookkeeping never takes the record of cloth that moved with it.
+    bundle = models.ForeignKey(
+        "PackingBundle",
+        related_name="allocations",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+    )
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -342,6 +360,13 @@ class PackingBundle(models.Model):
     on and can be scanned into or removed from; ``SEALED`` is immutable, so the
     packing slip printed for it stays true for as long as the record exists.
     ``CANCELLED`` is a bundle whose rolls were all given back.
+
+    Dispatch is tracked as its own fact rather than a fourth status. A dispatched
+    bundle is still the sealed bundle whose slip was printed -- flipping its status
+    would quietly drop it out of the sealed list and out of the slip reprint, which
+    is exactly the record you most want to keep once the truck has left. So
+    ``SEALED`` stays ``SEALED`` and ``dispatched_at`` carries the fact that it also
+    went out.
     """
 
     STATUS_CHOICES = (
@@ -362,6 +387,10 @@ class PackingBundle(models.Model):
     )
     created_at = models.DateTimeField(auto_now_add=True)
     sealed_at = models.DateTimeField(null=True, blank=True)
+    #: When this sealed bundle went out on a truck, or null while it is still here.
+    #: The transport is not repeated per bundle: it is chosen once on the order
+    #: (:attr:`Order.transport_company`) and reused for every bundle it covers.
+    dispatched_at = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         ordering = ["number"]
@@ -382,6 +411,10 @@ class PackingBundle(models.Model):
     @property
     def is_open(self):
         return self.status == "OPEN"
+
+    @property
+    def is_dispatched(self):
+        return self.dispatched_at is not None
 
 
 class RollAllocation(models.Model):

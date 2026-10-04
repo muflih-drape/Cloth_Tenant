@@ -20,6 +20,18 @@ interface OrderItemsSectionProps {
   onItemsChange: () => void;
   /** Lets the page move its own status badge when a pack fills the order. */
   onOrderStatusChange?: (status: OrderStatus) => void;
+  /** Reports the sealed/dispatched bundle counts up to the page. */
+  onBundlesChange?: (counts: {
+    pending: number;
+    dispatched: number;
+  }) => void;
+  /**
+   * Transport already chosen for the order, and what the customer asked for. Passed
+   * to the bundle panel so the first bundle to leave can offer the preference
+   * instead of making the packer hunt for it.
+   */
+  transportCompanyId?: number | null;
+  preferredTransportId?: number | null;
 }
 
 /**
@@ -44,6 +56,9 @@ export default function OrderItemsSection({
   orderId,
   onItemsChange,
   onOrderStatusChange,
+  onBundlesChange,
+  transportCompanyId,
+  preferredTransportId,
 }: OrderItemsSectionProps) {
   const { role } = useAuth();
   const isAdmin = role === "ADMIN";
@@ -103,8 +118,16 @@ export default function OrderItemsSection({
   // Packing is offered while the order is still open for cloth, mirroring the
   // engine's OPEN_STATUSES. There is no cancelled order status to guard against;
   // DISPATCHED is the point of no return, and a DRAFT has no cloth against it yet.
+  //
+  // PARTIALLY_DISPATCHED is still open for cloth: some bundles have gone on a truck
+  // and others have not, so the order still needs packing and still needs its
+  // remaining bundles dispatched. Locking packing here would strand the boxes that
+  // have not left.
   const canEditPacking =
-    canPack && (status === "PENDING" || status === "PACKED");
+    canPack &&
+    (status === "PENDING" ||
+      status === "PACKED" ||
+      status === "PARTIALLY_DISPATCHED");
 
   // The order page has never carried stock figures, so the roll behind each
   // colour is fetched once here. One request covers every variant on the order.
@@ -214,6 +237,9 @@ export default function OrderItemsSection({
           items={liveItems}
           onChanged={handleBundleChanged}
           onOrderStatusChange={onOrderStatusChange}
+          onBundlesChange={onBundlesChange}
+          transportCompanyId={transportCompanyId}
+          preferredTransportId={preferredTransportId}
         />
       )}
 

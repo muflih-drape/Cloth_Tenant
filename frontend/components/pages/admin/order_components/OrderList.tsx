@@ -86,7 +86,16 @@ const OrderList: React.FC<Props> = ({
                         page: currentPage,
                         page_size: pageSize,
                         search,
-                        status: status === "ALL" ? [] : [status],
+                        // The Dispatched tab means "on its way out", which now
+                        // includes an order where some bundles have gone and others
+                        // have not. Asking for DISPATCHED alone would hide exactly
+                        // the orders an admin needs to chase the remaining boxes for.
+                        status:
+                            status === "ALL"
+                                ? []
+                                : status === "DISPATCHED"
+                                  ? ["DISPATCHED", "PARTIALLY_DISPATCHED"]
+                                  : [status],
                     });
 
                 const results = response.results.filter(
