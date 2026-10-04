@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   Box,
+  ChevronDown,
+  ChevronRight,
   Download,
   Lock,
   PackageX,
@@ -14,17 +16,35 @@ import {
 import { pdf } from "@react-pdf/renderer";
 
 import QRScanModal from "@/components/items/QRScanModal";
+import { ImagePreview } from "@/components/pages/ImagePreview";
 import { BundlePackingSlipPdf } from "@/components/pages/order/BundlePackingSlipPdf";
 import { packingApi } from "@/lib/api/order";
+import { orderItemColorSuffix } from "@/lib/colorLabel";
 import { toastError, toastErrorFromError, toastSuccess } from "@/lib/toast";
 import { bundleSlipFilename, parseRollScan } from "@/lib/utils/bundleSlip";
-import { formatMeters } from "@/types/item";
-import type { OrderStatus, PackingBundle } from "@/types/order";
+import {
+  bundleCoverageMetres,
+  bundleLineShares,
+  metresPackedOutsideBundles,
+  packedOutsideBundleLines,
+} from "@/lib/utils/bundleLines";
+import { formatMeters, toMeters } from "@/types/item";
+import type {
+  OrderItem as OrderItemType,
+  OrderStatus,
+  PackingBundle,
+} from "@/types/order";
 
 type Props = {
   orderId: number;
   /** False once the order is out of reach, so no bundle can be opened. */
   enabled: boolean;
+  /**
+   * Every line on the order, settled ones included. A bundle says which line each
+   * of its rolls fed and how many metres that was, but not what the line looks
+   * like, so the thumbnail beside a packed line is read from here.
+   */
+  items?: OrderItemType[];
   /**
    * Called after anything that moved cloth, so the page can refresh the lines and
    * the stock figures it shows beside them.
@@ -33,6 +53,66 @@ type Props = {
   /** Lets the page move its own status badge when a scan fills the order. */
   onOrderStatusChange?: (status: OrderStatus) => void;
 };
+
+/**
+ * The order lines a single bundle packed, once its box is opened.
+ *
+ * Reads as the line cards do -- thumbnail, name, price -- but scoped to what this
+ * one box carried, so a line whose metres were split over two bundles shows only
+ * its share under each. The thumbnail comes from the order's own line, because the
+ * bundle records the line's id and metres but not what the fabric looks like.
+ */
+function BundleLineList({
+  bundle,
+  lineFor,
+}: {
+  bundle: PackingBundle;
+  lineFor: (itemId: number) => OrderItemType | undefined;
+}) {
+  const shares = bundleLineShares(bundle);
+  if (shares.length === 0) return null;
+
+  return (
+    <ul className="mt-2 flex flex-col gap-1.5 border-t border-amber-200 pt-2">
+      {shares.map((share) => {
+        const line = lineFor(share.itemId);
+        return (
+          <li
+            key={share.itemId}
+            className="flex items-center gap-3 rounded-xl border border-gray-100 bg-white px-3 py-2"
+          >
+            <div className="relative h-12 w-12 flex-shrink-0 overflow-hidden rounded-lg border border-gray-100 bg-gray-50">
+              {line?.variant_image ? (
+                <ImagePreview src={line.variant_image} alt={share.fabricName} />
+              ) : (
+                <div className="h-full w-full bg-gray-100" />
+              )}
+            </div>
+
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-semibold text-gray-900">
+                {`${share.fabricName}${orderItemColorSuffix(share.colour)}`}
+              </p>
+              <p className="mt-1 text-xs font-medium text-gray-600">
+                <span className="font-bold text-gray-900">
+                  {`${formatMeters(share.metres)} m packed in this bundle`}
+                </span>
+              </p>
+              <p className="mt-0.5 text-[10px] text-gray-400">
+                {share.rollNumbers.join(", ")}
+              </p>
+            </div>
+
+            {/* What this box's share of the line came to, not the whole line. */}
+            <span className="flex-shrink-0 text-base font-black text-gray-900">
+              ₹{share.value.toLocaleString("en-IN")}
+            </span>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
 
 /**
  * Bundles: the boxes of cloth that actually leave the warehouse.
@@ -57,6 +137,7 @@ type Props = {
 export default function PackingBundlePanel({
   orderId,
   enabled,
+  items,
   onChanged,
   onOrderStatusChange,
 }: Props) {
@@ -66,6 +147,12 @@ export default function PackingBundlePanel({
   const [scanOpen, setScanOpen] = useState(false);
   const [confirmCancel, setConfirmCancel] = useState(false);
   const [slipMessage, setSlipMessage] = useState<string | null>(null);
+  // Which boxes the admin has opened, by bundle id. Held per bundle rather than
+  // as one flag so opening Bundle 2 leaves Bundle 1 as it was.
+  const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+
+  const toggleExpanded = (bundleId: number) =>
+    setExpanded((prev) => ({ ...prev, [bundleId]: !prev[bundleId] }));
 
   useEffect(() => {
     let live = true;
@@ -89,6 +176,16 @@ export default function PackingBundlePanel({
   /** The bundle being worked on, if one is. */
   const openBundle = bundles.find((bundle) => bundle.status === "OPEN") ?? null;
   const sealedBundles = bundles.filter((bundle) => bundle.status === "SEALED");
+
+  // A line that packing has finished is shown against the box that carried it, so
+  // the two views have to be worked out from the same figures rather than from two
+  // separate ideas of what is packed.
+  const coverage = bundleCoverageMetres(bundles);
+  const lineFor = (itemId: number) =>
+    (items ?? []).find((line) => line.id === itemId);
+  // Metres can also be packed by typing a figure, and that path writes no bundle.
+  // Those lines are collected here so they are still shown somewhere.
+  const packedByHand = packedOutsideBundleLines(items ?? [], coverage);
 
   const replaceBundle = (next: PackingBundle) =>
     setBundles((prev) =>
@@ -370,6 +467,30 @@ export default function PackingBundlePanel({
             </ul>
           )}
 
+          {/* The open box's own view of what it has packed so far, in the same
+              line-card shape the sealed boxes use. No slip buttons here: a slip
+              is a promise about a box that can no longer change. */}
+          {openBundle.rolls.length > 0 && (
+            <div className="mt-2">
+              <button
+                type="button"
+                onClick={() => toggleExpanded(openBundle.id)}
+                aria-expanded={expanded[openBundle.id] === true}
+                className="flex items-center gap-1 rounded-lg border border-amber-200 bg-white px-2 py-1 text-[10px] font-bold text-amber-800 transition-colors hover:bg-amber-100"
+              >
+                {expanded[openBundle.id] ? (
+                  <ChevronDown size={11} />
+                ) : (
+                  <ChevronRight size={11} />
+                )}
+                Lines packed
+              </button>
+              {expanded[openBundle.id] && (
+                <BundleLineList bundle={openBundle} lineFor={lineFor} />
+              )}
+            </div>
+          )}
+
           <div className="mt-3 flex flex-wrap items-center gap-2">
             <button
               type="button"
@@ -437,35 +558,112 @@ export default function PackingBundlePanel({
             {sealedBundles.map((bundle) => (
               <li
                 key={bundle.id}
-                className="flex flex-wrap items-center gap-2 rounded-xl border border-gray-200 bg-white px-3 py-2"
+                className="rounded-xl border border-gray-200 bg-white px-3 py-2"
               >
-                <span className="text-[11px] font-bold text-gray-900">
-                  {bundle.code}
-                </span>
-                <span className="text-[11px] font-medium text-gray-500">
-                  {bundle.roll_count} roll{bundle.roll_count === 1 ? "" : "s"} ·{" "}
-                  {formatMeters(bundle.total_metres)} m ·{" "}
-                  {bundle.sealed_at ? bundle.sealed_at.slice(0, 10) : "sealed"}
-                </span>
-                <span className="ml-auto flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => handleSlipPrint(bundle)}
-                    disabled={busy}
-                    className="flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 text-[10px] font-bold text-gray-500 transition-colors hover:bg-gray-50 disabled:opacity-50"
-                  >
-                    <Printer size={11} />
-                    Print slip
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => handleSlipDownload(bundle)}
-                    disabled={busy}
-                    className="flex items-center gap-1 rounded-lg bg-gray-900 px-2 py-1 text-[10px] font-bold text-white transition-colors hover:bg-gray-700 disabled:opacity-50"
-                  >
-                    <Download size={11} />
-                    Download slip
-                  </button>
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[11px] font-bold text-gray-900">
+                    {bundle.code}
+                  </span>
+                  <span className="text-[11px] font-medium text-gray-500">
+                    {bundle.roll_count} roll{bundle.roll_count === 1 ? "" : "s"} ·{" "}
+                    {formatMeters(bundle.total_metres)} m ·{" "}
+                    {bundle.sealed_at ? bundle.sealed_at.slice(0, 10) : "sealed"}
+                  </span>
+                  <span className="ml-auto flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => toggleExpanded(bundle.id)}
+                      aria-expanded={expanded[bundle.id] === true}
+                      className="flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 text-[10px] font-bold text-gray-500 transition-colors hover:bg-gray-50"
+                    >
+                      {expanded[bundle.id] ? (
+                        <ChevronDown size={11} />
+                      ) : (
+                        <ChevronRight size={11} />
+                      )}
+                      Lines packed
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleSlipPrint(bundle)}
+                      disabled={busy}
+                      className="flex items-center gap-1 rounded-lg border border-gray-200 px-2 py-1 text-[10px] font-bold text-gray-500 transition-colors hover:bg-gray-50 disabled:opacity-50"
+                    >
+                      <Printer size={11} />
+                      Print slip
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => handleSlipDownload(bundle)}
+                      disabled={busy}
+                      className="flex items-center gap-1 rounded-lg bg-gray-900 px-2 py-1 text-[10px] font-bold text-white transition-colors hover:bg-gray-700 disabled:opacity-50"
+                    >
+                      <Download size={11} />
+                      Download slip
+                    </button>
+                  </span>
+                </div>
+
+                {expanded[bundle.id] && (
+                  <BundleLineList bundle={bundle} lineFor={lineFor} />
+                )}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {/* Metres can also be packed by typing a figure rather than scanning a roll,
+          and that path records no bundle to hang them on. Shown here rather than
+          left out of the page, since the main list below only carries what is
+          still owed. */}
+      {packedByHand.length > 0 && (
+        <div className="mt-3 border-t border-amber-200 pt-3">
+          <p className="text-[11px] font-bold text-amber-900">
+            Packed without a bundle
+          </p>
+          <ul className="mt-1.5 flex flex-col gap-1.5">
+            {packedByHand.map((line) => (
+              <li
+                key={line.id}
+                className="flex items-center gap-3 rounded-xl border border-gray-200 bg-white px-3 py-2"
+              >
+                <div className="relative h-12 w-12 flex-shrink-0 overflow-hidden rounded-lg border border-gray-100 bg-gray-50">
+                  {line.variant_image ? (
+                    <ImagePreview
+                      src={line.variant_image}
+                      alt={line.fabric_name}
+                    />
+                  ) : (
+                    <div className="h-full w-full bg-gray-100" />
+                  )}
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-semibold text-gray-900">
+                    {line.fabric_name}
+                    {orderItemColorSuffix(line.variant_display_order)}
+                  </p>
+                  <p className="mt-1 text-xs font-medium text-gray-600">
+                    <span className="font-bold text-gray-900">
+                      {`${formatMeters(metresPackedOutsideBundles(line, coverage))} m packed by hand`}
+                    </span>
+                  </p>
+                  {/* A line packed past what was ordered leaves the main list, so
+                      its surplus is noted here rather than lost with it. */}
+                  {toMeters(line.allocated_quantity) >
+                    toMeters(line.ordered_quantity) && (
+                    <p className="mt-0.5 text-[11px] font-semibold text-amber-600">
+                      +{formatMeters(toMeters(line.allocated_quantity) - toMeters(line.ordered_quantity))}{" "}
+                      m over ordered
+                    </p>
+                  )}
+                </div>
+                <span className="flex-shrink-0 text-base font-black text-gray-900">
+                  ₹
+                  {(
+                    (metresPackedOutsideBundles(line, coverage) *
+                      Number(line.rate_per_meter || 0))
+                  ).toLocaleString("en-IN")}
                 </span>
               </li>
             ))}

@@ -6,6 +6,7 @@ import Link from "next/link";
 import { fabricApi } from "@/lib/api/item";
 import { applyPackStock, prefillPackMetres } from "@/lib/utils/packLine";
 import { useAuth } from "@/context/AuthContext";
+import { outstandingMeters } from "@/lib/utils/orderItemSort";
 import { OrderItem as OrderItemType, OrderStatus, PackLineResponse } from "@/types/order";
 import { formatMeters, toMeters } from "@/types/item";
 import OrderItem from "@/components/pages/admin/order-item/OrderItem";
@@ -89,6 +90,15 @@ export default function OrderItemsSection({
   const isEditable = status === "DRAFT" || status === "PENDING" || status === "EDITING";
   const isDeletable = isEditable;
   const awaitingPacking = outstanding > 0 && status !== "DISPATCHED";
+
+  // A line packing has finished belongs with the box that carried it, so the list
+  // below carries only what is still owed. That only holds while the bundles are
+  // actually on screen to receive those lines: without the panel there would be
+  // nowhere for a settled line to be shown, so the list stays whole.
+  const bundlesVisible = canPack && orderId !== undefined;
+  const outstandingLines = bundlesVisible
+    ? liveItems.filter((line) => outstandingMeters(line) > 0)
+    : liveItems;
 
   // Packing is offered while the order is still open for cloth, mirroring the
   // engine's OPEN_STATUSES. There is no cancelled order status to guard against;
@@ -201,14 +211,20 @@ export default function OrderItemsSection({
         <PackingBundlePanel
           orderId={orderId}
           enabled={canEditPacking}
+          items={liveItems}
           onChanged={handleBundleChanged}
           onOrderStatusChange={onOrderStatusChange}
         />
       )}
 
       <div className="bg-white rounded-2xl overflow-hidden">
+        {bundlesVisible && outstandingLines.length === 0 ? (
+          <p className="px-4 py-6 text-center text-xs font-medium text-gray-400">
+            All items packed — see the bundles above.
+          </p>
+        ) : (
         <OrderItem
-          items={liveItems}
+          items={outstandingLines}
           isDeletable={isDeletable}
           isEditable={isEditable}
           orderId={orderId}
@@ -235,6 +251,7 @@ export default function OrderItemsSection({
             );
           }}
         />
+        )}
       </div>
     </>
   );

@@ -3,7 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import OrderItemsSection from "@/components/pages/order/OrderItemsSection";
 import { packingApi } from "@/lib/api/order";
-import type { OrderItem, PackLineResponse } from "@/types/order";
+import type { OrderItem, PackLineResponse, PackingBundle } from "@/types/order";
 
 vi.mock("sonner", () => ({
   toast: { success: vi.fn(), error: vi.fn(), warning: vi.fn() },
@@ -24,6 +24,13 @@ vi.mock("@/lib/api/item", () => ({
 
 vi.mock("@/components/items/QRScanModal", () => ({ default: () => null }));
 
+// The real preview pulls in next/image, which jsdom will not render here.
+vi.mock("@/components/pages/ImagePreview", () => ({
+  ImagePreview: ({ src, alt }: { src: string; alt?: string }) => (
+    <span data-testid="fabric-thumb" data-src={src} aria-label={alt} />
+  ),
+}));
+
 vi.mock("@/lib/api/order", () => ({
   packingApi: {
     packLine: vi.fn(),
@@ -41,8 +48,53 @@ vi.mock("@/lib/api/order", () => ({
 import { fabricApi, rollApi } from "@/lib/api/item";
 
 const packLine = vi.mocked(packingApi.packLine);
+const listBundles = vi.mocked(packingApi.listBundles);
 const getOutstandingDemand = vi.mocked(fabricApi.getOutstandingDemand);
 const preview = vi.mocked(rollApi.preview);
+
+/** A sealed bundle that packed `metres` of line `item`. */
+function sealedBundle(
+  item: number,
+  metres: string,
+  overrides: Partial<PackingBundle> = {},
+): PackingBundle {
+  const rate = "9.00";
+  const value = (Number(metres) * Number(rate)).toFixed(2);
+  return {
+    id: 1,
+    number: 1,
+    code: "Order #5 -- Bundle 1",
+    status: "SEALED",
+    created_at: "2026-02-01T09:00:00Z",
+    sealed_at: "2026-02-01T11:00:00Z",
+    created_by: "admin1",
+    order: 5,
+    order_number: 5,
+    customer: "Riya Textiles",
+    customer_address: "14 Mill Lane",
+    rolls: [
+      {
+        id: 11,
+        roll: 3,
+        roll_number: "NAT-0001",
+        colour: "Natural",
+        fabric: "Cotton Cambric",
+        metres,
+        item,
+        fabric_name: "Cotton Cambric",
+        variant_display_order: "Natural",
+        rate_per_meter: rate,
+        value,
+        round: 42,
+        scanned_at: "2026-02-01T10:00:00Z",
+      },
+    ],
+    roll_count: 1,
+    total_metres: metres,
+    total_value: value,
+    ...overrides,
+  };
+}
 
 const lineA: OrderItem = {
   id: 7,
@@ -203,7 +255,7 @@ describe("OrderItemsSection line packing", () => {
     expect(inputFor(/metres of linen blend to pack/i).value).toBe("123");
   });
 
-  it("stays editable after a pack and marks the line as Packed", async () => {
+  it("takes a finished line out of the list and shows it under the bundles", async () => {
     const user = userEvent.setup();
     packLine.mockResolvedValue(aResult);
     section();
@@ -213,13 +265,20 @@ describe("OrderItemsSection line packing", () => {
     );
     await user.click(screen.getAllByRole("button", { name: /pack this line/i })[0]);
 
-    // Still editable, so the admin can carry on with the other lines.
-    expect(screen.getAllByRole("button", { name: /pack this line/i })).toHaveLength(2);
-    expect(screen.getByText("Packed")).toBeTruthy();
-    expect(inputFor(/metres of linen blend to pack/i)).toBeTruthy();
+    // Nothing is owed on line A any more, so it is no longer work to do and the
+    // list stops carrying it. It has not gone missing: it is with the bundles.
+    await waitFor(() =>
+      expect(screen.queryByLabelText(/metres of cotton cambric to pack/i)).toBeNull(),
+    );
+    // Only the line still owing something keeps its packing box.
+    expect(screen.getAllByRole("button", { name: /pack this line/i })).toHaveLength(1);
+    expect(screen.getByText("Packed without a bundle")).toBeTruthy();
+    expect(screen.getByText(/600 m packed by hand/)).toBeTruthy();
+    // The order header still counts what was packed.
+    expect(screen.getByText("1000 m ordered · 600 m packed")).toBeTruthy();
   });
 
-  it("updates the packed line's own figures in place", async () => {
+it("leaves the list once a line is packed and keeps the order total honest", async () => {
     const user = userEvent.setup();
     packLine.mockResolvedValue(aResult);
     section();
@@ -229,10 +288,13 @@ describe("OrderItemsSection line packing", () => {
     );
     await user.click(screen.getAllByRole("button", { name: /pack this line/i })[0]);
 
-    await waitFor(() => expect(screen.getByText("600 m packed")).toBeTruthy());
-    // Never negative, even once a line is packed past what was ordered.
-    expect(screen.getByText("0 m still owed")).toBeTruthy();
-    expect(screen.getByText("1800 m on the roll")).toBeTruthy();
+    // The line is settled, so it belongs with the bundles now.
+    await waitFor(() =>
+      expect(screen.queryByLabelText(/metres of cotton cambric to pack/i)).toBeNull(),
+    );
+    expect(screen.getByText(/600 m packed by hand/)).toBeTruthy();
+    // The header is worked out from every line, so it still reads true.
+    expect(screen.getByText("1000 m ordered · 600 m packed")).toBeTruthy();
   });
 
   it("offers no packing controls on a dispatched order", () => {
@@ -279,8 +341,9 @@ describe("OrderItemsSection over-packed quantities", () => {
     await waitFor(() => expect(packLine).toHaveBeenCalledWith(5, 7, "55"));
 
     // The line and the order header both report the real 55 m, not the 50 m
-    // that were ordered.
-    expect(screen.getByText("55 m packed")).toBeTruthy();
+    // that were ordered. The line itself has left the list -- it is settled -- so
+    // the metres are read off it where it now sits.
+    await waitFor(() => expect(screen.getByText(/55 m packed by hand/)).toBeTruthy());
     expect(screen.getByText("50 m ordered · 55 m packed")).toBeTruthy();
   });
 
@@ -301,8 +364,12 @@ describe("OrderItemsSection over-packed quantities", () => {
     await user.type(input, "55");
     await user.click(screen.getByRole("button", { name: /pack this line/i }));
 
-    await waitFor(() => expect(screen.getByText("0 m still owed")).toBeTruthy());
+    await waitFor(() =>
+      expect(screen.queryByLabelText(/metres of cotton cambric to pack/i)).toBeNull(),
+    );
+    // A line past its order is settled, so there is no negative shortfall to show.
     expect(screen.queryByText(/-5 m still owed/i)).toBeNull();
+    expect(screen.queryByText(/still owed/i)).toBeNull();
   });
 
   it("notes the surplus on an over-packed line", async () => {
@@ -322,7 +389,9 @@ describe("OrderItemsSection over-packed quantities", () => {
     await user.type(input, "55");
     await user.click(screen.getByRole("button", { name: /pack this line/i }));
 
-    await waitFor(() => expect(screen.getByText("+5 m over ordered")).toBeTruthy());
+    // The surplus would have been noted on the line's own packing row, which the
+    // line has now left -- so it is carried with the line instead of being lost.
+    await waitFor(() => expect(screen.getByText(/\+5 m over ordered/)).toBeTruthy());
   });
 
   it("shows no surplus note on a line packed exactly", async () => {
@@ -345,13 +414,17 @@ describe("OrderItemsSection over-packed quantities", () => {
     await user.type(input, "50");
     await user.click(screen.getByRole("button", { name: /pack this line/i }));
 
-    await waitFor(() => expect(screen.getByText("50 m packed")).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/50 m packed by hand/)).toBeTruthy());
     expect(screen.queryByText(/over ordered/i)).toBeNull();
   });
 
   it("pre-fills the box with the metres actually packed", async () => {
     const user = userEvent.setup();
-    packLine.mockResolvedValue(overResult);
+    packLine.mockResolvedValue({
+      ...overResult,
+      order_status: "PENDING",
+      item: { ...overLine, allocated_quantity: "49.000", outstanding_quantity: "1.000" },
+    });
     render(
       <OrderItemsSection
         items={[overLine]}
@@ -363,12 +436,13 @@ describe("OrderItemsSection over-packed quantities", () => {
 
     const input = inputFor(/metres of cotton cambric to pack/i);
     await user.clear(input);
-    await user.type(input, "55");
+    await user.type(input, "49");
     await user.click(screen.getByRole("button", { name: /pack this line/i }));
 
-    // The box settles on the 55 m stored, not the 50 m ordered.
-    await waitFor(() => expect(input.value).toBe("55"));
-    expect(inputFor(/metres of cotton cambric to pack/i).value).toBe("55");
+    // One metre is still owed, so the line keeps its box -- and the box settles on
+    // the 49 m already stored rather than the 50 m ordered.
+    await waitFor(() => expect(input.value).toBe("49"));
+    expect(screen.getByText("1 m still owed")).toBeTruthy();
   });
 
   it("shows the packed metres and the shortfall on a part-packed line", async () => {
@@ -419,5 +493,126 @@ describe("OrderItemsSection over-packed quantities", () => {
     await user.click(screen.getByRole("button", { name: /pack this line/i }));
 
     await waitFor(() => expect(onItemsChange).toHaveBeenCalled());
+  });
+});
+
+/**
+ * A line packing has finished is not work in progress, so it leaves the list of
+ * lines still to pack and is shown against the box that carried it. A line with
+ * metres still owing it stays in the list and is also shown under whichever box
+ * has already packed part of it, until the last metre moves.
+ */
+describe("OrderItemsSection packed lines moving under their bundle", () => {
+  it("takes a finished line out of the list and shows it under its bundle", async () => {
+    const user = userEvent.setup();
+    // Line A is packed to the metre by the bundle; line B is untouched.
+    listBundles.mockResolvedValue([sealedBundle(7, "600.000")]);
+    render(
+      <OrderItemsSection
+        items={[
+          { ...lineA, allocated_quantity: "600.000", outstanding_quantity: "0.000" },
+          lineB,
+        ]}
+        status="PACKED"
+        orderId={5}
+        onItemsChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+    // Nothing is owed on line A, so it is no longer in the list of lines to pack.
+    expect(screen.queryByLabelText(/metres of cotton cambric to pack/i)).toBeNull();
+    // Line B is untouched, so it is still there.
+    expect(screen.getByLabelText(/metres of linen blend to pack/i)).toBeTruthy();
+
+    await user.click(screen.getByRole("button", { name: /lines packed/i }));
+
+    // Line A is with the box that packed it, showing that box's own metres.
+    expect(screen.getByText(/600 m packed in this bundle/)).toBeTruthy();
+    expect(screen.getByText("₹5,400")).toBeTruthy();
+    // It was packed in a box, so it is not also reported as hand-packed.
+    expect(screen.queryByText("Packed without a bundle")).toBeNull();
+  });
+
+  it("keeps a part-packed line in the list and shows its packed portion too", async () => {
+    const user = userEvent.setup();
+    // One box has packed 400 m of line A's 600, leaving 200 m to come.
+    listBundles.mockResolvedValue([sealedBundle(7, "400.000")]);
+    render(
+      <OrderItemsSection
+        items={[
+          {
+            ...lineA,
+            allocated_quantity: "400.000",
+            outstanding_quantity: "200.000",
+          },
+          lineB,
+        ]}
+        status="PACKED"
+        orderId={5}
+        onItemsChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+
+    // Still owed something, so it stays in the list with its true figures.
+    expect(screen.getByLabelText(/metres of cotton cambric to pack/i)).toBeTruthy();
+    expect(screen.getByText("600 m ordered")).toBeTruthy();
+    expect(screen.getByText("200 m awaiting packing")).toBeTruthy();
+    expect(screen.queryByText(/fully packed/)).toBeNull();
+
+    // And what the box already packed is shown against that box.
+    await user.click(screen.getByRole("button", { name: /lines packed/i }));
+    expect(screen.getByText(/400 m packed in this bundle/)).toBeTruthy();
+    expect(screen.queryByText(/600 m packed in this bundle/)).toBeNull();
+  });
+
+  it("says so when there is nothing left to pack", async () => {
+    listBundles.mockResolvedValue([
+      sealedBundle(7, "600.000"),
+      sealedBundle(8, "400.000", {
+        id: 2,
+        number: 2,
+        code: "Order #5 -- Bundle 2",
+      }),
+    ]);
+    render(
+      <OrderItemsSection
+        items={[
+          { ...lineA, allocated_quantity: "600.000", outstanding_quantity: "0.000" },
+          { ...lineB, allocated_quantity: "400.000", outstanding_quantity: "0.000" },
+        ]}
+        status="PACKED"
+        orderId={5}
+        onItemsChange={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => expect(listBundles).toHaveBeenCalled());
+
+    // Every line is settled, so an empty list would just look broken.
+    expect(screen.getByText(/All items packed/)).toBeTruthy();
+    expect(screen.queryByLabelText(/metres of .* to pack/i)).toBeNull();
+    // The bundles are still there to say where the cloth went.
+    expect(screen.getByText("Sealed bundles")).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /lines packed/i })).toHaveLength(2);
+  });
+
+  it("leaves the list whole for a viewer who cannot see the bundles", () => {
+    roleRef.current = "AGENT";
+    render(
+      <OrderItemsSection
+        items={[{ ...lineA, allocated_quantity: "600.000", outstanding_quantity: "0.000" }]}
+        status="PACKED"
+        orderId={5}
+        onItemsChange={vi.fn()}
+      />,
+    );
+
+    // Without the bundles on screen there is nowhere for a settled line to be
+    // shown, so nothing is taken away from this view.
+    expect(screen.getByText(/Cotton Cambric/)).toBeTruthy();
+    expect(screen.getByText(/fully packed/)).toBeTruthy();
   });
 });

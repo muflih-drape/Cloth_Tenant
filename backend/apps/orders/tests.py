@@ -2048,6 +2048,113 @@ class PackingBundleTests(OrderTestBase):
         self.assertEqual(listing.data[0]["roll_count"], 1)
         self.assertEqual(listing.data[0]["rolls"][0]["roll"], self.rolls[0].pk)
 
+    # -- more than one bundle on one order ---------------------------------
+    #
+    # An order's cloth does not always leave in one box. Rolls are packed across
+    # several bundles -- several boxes, or several sessions on different days --
+    # so sealing a bundle has to leave the next one available on the same order,
+    # with each bundle keeping its own contents and its own slip.
+
+    def seal_bundle(self, bundle):
+        self.auth(self.admin)
+        resp = self.client.post(self.seal_url(bundle), {}, format="json")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        return resp.data["bundle"]
+
+    def test_a_second_bundle_can_be_opened_and_sealed_on_the_same_order(self):
+        first, resp = self.scan(self.rolls[0])
+        self.seal_bundle(first)
+
+        second = self.open_bundle()
+
+        # The counter carries on rather than restarting, so the two slips can never
+        # be mistaken for one another.
+        self.assertEqual(second["number"], 2)
+        self.assertEqual(second["status"], "OPEN")
+
+        second, resp = self.scan(self.rolls[1], bundle=second)
+        sealed_second = self.seal_bundle(second)
+
+        self.assertEqual(sealed_second["number"], 2)
+        self.assertEqual(sealed_second["roll_count"], 1)
+        self.assertEqual(PackingBundle.objects.count(), 2)
+
+    def test_both_sealed_bundles_keep_their_own_rolls_and_totals(self):
+        first, _ = self.scan(self.rolls[0])
+        self.seal_bundle(first)
+        second = self.open_bundle()
+        second, _ = self.scan(self.rolls[1], bundle=second)
+        self.seal_bundle(second)
+
+        listing = self.client.get(self.bundles_url())
+
+        self.assertEqual(len(listing.data), 2)
+        one, two = listing.data
+        self.assertEqual([one["number"], two["number"]], [1, 2])
+        self.assertEqual(one["status"], "SEALED")
+        self.assertEqual(two["status"], "SEALED")
+        # Independent contents: neither bundle has grown the other's roll, which is
+        # what makes each slip a true statement about its own box.
+        self.assertEqual([r["roll"] for r in one["rolls"]], [self.rolls[0].pk])
+        self.assertEqual([r["roll"] for r in two["rolls"]], [self.rolls[1].pk])
+        self.assertEqual(one["roll_count"], 1)
+        self.assertEqual(two["roll_count"], 1)
+        self.assertEqual(one["total_metres"], "600.000")
+        self.assertEqual(two["total_metres"], "400.000")
+
+    def test_a_sealed_bundle_still_refuses_a_late_scan(self):
+        # Sealing Bundle 1 must not open it back up just because Bundle 2 exists.
+        first, _ = self.scan(self.rolls[0])
+        self.seal_bundle(first)
+        self.open_bundle()
+        self.auth(self.admin)
+
+        resp = self.client.post(
+            self.scan_url(first), {"roll": self.rolls[1].pk}, format="json"
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("sealed", resp.data["error"].lower())
+
+    def test_opening_a_third_bundle_still_needs_only_one_box_open(self):
+        first, _ = self.scan(self.rolls[0])
+        self.seal_bundle(first)
+        second = self.open_bundle()
+        self.scan(self.rolls[1], bundle=second)
+        self.auth(self.admin)
+
+        resp = self.client.post(self.bundles_url() + "create/", {}, format="json")
+
+        # Blocking, not auto-sealing: a half-filled box must never be sealed off
+        # behind the packer's back, so the third bundle is refused by name.
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn(second["code"], resp.data["error"])
+        self.assertIn("Seal or cancel", resp.data["error"])
+        self.assertEqual(
+            PackingBundle.objects.filter(status="OPEN").count(), 1
+        )
+        # And the two sealed ones are untouched by the refusal.
+        self.assertEqual(PackingBundle.objects.filter(status="SEALED").count(), 1)
+
+    def test_cancelling_a_second_bundle_leaves_the_first_sealed_one_alone(self):
+        first, _ = self.scan(self.rolls[0])
+        self.seal_bundle(first)
+        second = self.open_bundle()
+        self.scan(self.rolls[1], bundle=second)
+        self.auth(self.admin)
+
+        self.client.post(
+            f"/api/orders/{self.order.pk}/bundles/{second['id']}/cancel/",
+            {},
+            format="json",
+        )
+
+        rows = {row.number: row for row in PackingBundle.objects.all()}
+        # The cancelled box gave its roll back; the sealed one did not.
+        self.assertEqual(rows[1].status, "SEALED")
+        self.assertEqual(rows[2].status, "CANCELLED")
+        self.assertEqual(rows[1].roll_allocations.count(), 1)
+
     def test_sealing_does_not_by_itself_change_the_orders_packing_status(self):
         # An open bundle is just a container. What decides PACKED is still whether
         # every line has been fully packed, so sealing half a box leaves the order
