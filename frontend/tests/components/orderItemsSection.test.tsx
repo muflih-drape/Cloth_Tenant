@@ -67,6 +67,8 @@ function sealedBundle(
     status: "SEALED",
     created_at: "2026-02-01T09:00:00Z",
     sealed_at: "2026-02-01T11:00:00Z",
+    dispatched_at: null,
+    is_dispatched: false,
     created_by: "admin1",
     order: 5,
     order_number: 5,
@@ -75,6 +77,7 @@ function sealedBundle(
     rolls: [
       {
         id: 11,
+        allocation_id: 4,
         roll: 3,
         roll_number: "NAT-0001",
         colour: "Natural",
@@ -90,6 +93,8 @@ function sealedBundle(
       },
     ],
     roll_count: 1,
+    piece_count: 1,
+    is_roll_based: true,
     total_metres: metres,
     total_value: value,
     ...overrides,
@@ -145,6 +150,8 @@ const aResult: PackLineResponse = {
   order_status: "PENDING",
   item: { ...lineA, allocated_quantity: "600.000", outstanding_quantity: "0.000", allocation_count: 1 },
   stock_meters: "1800.000",
+  bundle_id: 9,
+  bundle_code: "Order #5 -- Bundle 1",
 };
 
 /** A line ordered 50 m that came off the roll as 55 m. */
@@ -156,6 +163,8 @@ const overResult: PackLineResponse = {
   order_status: "PACKED",
   item: { ...overLine, allocated_quantity: "55.000", outstanding_quantity: "0.000", allocation_count: 1 },
   stock_meters: "2345.000",
+  bundle_id: 9,
+  bundle_code: "Order #5 -- Bundle 1",
 };
 
 const inputFor = (name: RegExp) =>
@@ -309,6 +318,22 @@ it("leaves the list once a line is packed and keeps the order total honest", asy
 
     expect(screen.queryByRole("button", { name: /pack this line/i })).toBeNull();
     expect(screen.queryByLabelText(/metres of .* to pack/i)).toBeNull();
+  });
+
+  it("keeps packing on a partly dispatched order, which still has boxes to go", () => {
+    // Some bundles have gone on a truck, but the order still owes cloth and still
+    // has sealed bundles waiting in the warehouse. Locking packing here would strand
+    // both.
+    render(
+      <OrderItemsSection
+        items={[lineA, lineB]}
+        status="PARTIALLY_DISPATCHED"
+        orderId={5}
+        onItemsChange={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByRole("button", { name: /pack this line/i }).length).toBeGreaterThan(0);
   });
 
   it("offers no packing controls to a non-admin", () => {

@@ -65,9 +65,18 @@ class RollError(ValueError):
 
 
 def is_roll_tracked(variant):
-    """Whether this colour's metres are broken down into rolls."""
+    """Whether this colour's metres are broken down into rolls.
+
+    Serialising a list of order lines calls this once per line, and an
+    unsaved-or-bare variant would otherwise cost one round trip each. A variant
+    fetched through ``variants_with_committed_demand()`` already carries the
+    answer as ``_has_rolls``, so use it and keep the whole page to one query.
+    """
     if variant is None or variant.pk is None:
         return False
+    annotated = getattr(variant, "_has_rolls", None)
+    if annotated is not None:
+        return bool(annotated)
     return FabricRoll.objects.filter(variant=variant).exists()
 
 

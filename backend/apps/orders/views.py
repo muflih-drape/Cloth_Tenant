@@ -28,6 +28,7 @@ from apps.orders.pricing import (
     recompute_order_total,
     set_final_total,
 )
+
 from apps.orders.stock import (
     backorder_report,
     return_to_stock,
@@ -35,6 +36,7 @@ from apps.orders.stock import (
     variants_with_committed_demand,
 )
 from apps.orders.models import (
+    Allocation,
     Order,
     OrderItem,
     OrderLog,
@@ -543,9 +545,13 @@ class OrderViewSet(ModelViewSet):
 
         if user.role == "ADMIN":
             # An admin only sees their own drafts; everything else is shared.
-            qs = qs.filter(
-                Q(status="DRAFT", created_by=user) | ~Q(status="DRAFT")
-            ).distinct()
+            #
+            # No `.distinct()` anywhere here: every join this queryset uses is
+            # many-to-one (`customer`, `agent__user`, and the `icontains` filters
+            # join the same way), so no row can be duplicated and DISTINCT only
+            # bought a sort plus a much slower `COUNT(*)` over a DISTINCT
+            # subquery on every page of the list.
+            qs = qs.filter(Q(status="DRAFT", created_by=user) | ~Q(status="DRAFT"))
 
             search = self.request.query_params.get("search")
             if search:
@@ -553,7 +559,7 @@ class OrderViewSet(ModelViewSet):
                     Q(customer__name__icontains=search)
                     | Q(agent__user__username__icontains=search)
                     | Q(id__icontains=search)
-                ).distinct()
+                )
             return qs
 
         search = self.request.query_params.get("search")
@@ -562,7 +568,7 @@ class OrderViewSet(ModelViewSet):
                 Q(customer__name__icontains=search)
                 | Q(agent__user__username__icontains=search)
                 | Q(id__icontains=search)
-            ).distinct()
+            )
 
         return qs.filter(agent__user=user)
 
@@ -591,9 +597,15 @@ class OrderViewSet(ModelViewSet):
         order = self.get_object()
         new_status = request.data.get("status")
 
-        if new_status == "DISPATCHED":
+        if new_status in ("DISPATCHED", "PARTIALLY_DISPATCHED"):
             return Response(
-                {"error": "Use the dispatch endpoint to mark an order as dispatched"},
+                {
+                    "error": (
+                        "Use the dispatch endpoint to mark an order as "
+                        f"{new_status.lower()}. How far an order has got is worked "
+                        "out from its bundles, not set by hand."
+                    )
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -637,15 +649,43 @@ class OrderViewSet(ModelViewSet):
         # which roll each metre came off are gone with them.
         with transaction.atomic():
             if order.status != "DRAFT":
-                # Returns the metres to the exact rolls they were cut from and
-                # marks those RollAllocation rows reversed, so the same cloth can
-                # never be credited twice. Any bundle still open on a deleted
-                # order is a box that will never be sealed, so it is closed out
-                # rather than left open on an order that no longer exists.
-                stock_movement_for_lines(order.items.all(), direction="return")
-                PackingBundle.objects.filter(order=order, status="OPEN").update(
-                    status="CANCELLED"
+                # Cloth in a bundle that went out on a truck cannot be put back on its
+                # roll by deleting the paperwork, so it is left out and only the
+                # bundles still sitting on the shelf are returned. Narrowing by
+                # allocation rather than by line matters: one line's metres can sit in
+                # a dispatched bundle and an undispatched one at the same time, and the
+                # line total cannot tell those apart.
+                dispatched = PackingBundle.objects.filter(
+                    order=order, dispatched_at__isnull=False
+                ).values_list("id", flat=True)
+                shipped_ids = set(
+                    Allocation.objects.filter(
+                        bundle_id__in=list(dispatched)
+                    ).values_list("id", flat=True)
                 )
+                # Left as None when nothing shipped, so the whole-line path runs
+                # untouched; only a genuinely mixed order needs the narrower one.
+                keep_ids = None
+                if shipped_ids:
+                    keep_ids = list(
+                        Allocation.objects.filter(order_item__order=order)
+                        .exclude(id__in=shipped_ids)
+                        .values_list("id", flat=True)
+                    )
+                returned = stock_movement_for_lines(
+                    order.items.all(),
+                    direction="return",
+                    keep_allocation_ids=keep_ids,
+                )
+                # Any bundle still open on a deleted order is a box that will never be
+                # sealed, so it is closed out rather than left open on an order that no
+                # longer exists. Dispatched bundles are not touched: those boxes really
+                # did leave, and only the cascade takes their record with the order.
+                PackingBundle.objects.filter(
+                    order=order, status="OPEN", dispatched_at__isnull=True
+                ).update(status="CANCELLED")
+            else:
+                returned = {}
 
             OrderLog.record(
                 order,
@@ -654,8 +694,13 @@ class OrderViewSet(ModelViewSet):
                     "customer": order.customer.name,
                     "items_count": order.items.count(),
                     "status": order.status,
+                    "bundles_dispatched": PackingBundle.objects.filter(
+                        order=order, dispatched_at__isnull=False
+                    ).count(),
                     "metres_returned_to_stock": str(
-                        sum(
+                        sum(returned.values(), ZERO)
+                        if returned
+                        else sum(
                             (
                                 line.allocated_quantity or ZERO
                                 for line in order.items.all()
@@ -669,105 +714,6 @@ class OrderViewSet(ModelViewSet):
             order.delete()
 
         return Response(status=status.HTTP_204_NO_CONTENT)
-
-    @extend_schema(summary="Dispatch a PENDING/PACKED order")
-    @action(detail=True, methods=["post"], url_path="dispatch")
-    def dispatch_order(self, request, pk=None):
-        order = self.get_object()
-
-        if order.status not in ("PENDING", "PACKED"):
-            return Response(
-                {"error": "Only PENDING or PACKED orders can be dispatched"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        shortfall = [
-            line
-            for line in order.items.all()
-            if line.allocated_quantity < line.ordered_quantity
-        ]
-        allow_partial = str(
-            request.data.get("allow_partial", "")
-        ).lower() in ("1", "true", "yes")
-        shortfall_reason = (request.data.get("shortfall_reason") or "").strip()
-
-        if shortfall and not allow_partial:
-            return Response(
-                {
-                    "error": "This order has fabric that has not been fully packed.",
-                    "unallocated_lines": [
-                        {
-                            "order_item_id": line.pk,
-                            "fabric_name": line.fabric_name,
-                            "ordered_quantity": str(line.ordered_quantity),
-                            "allocated_quantity": str(line.allocated_quantity),
-                            "outstanding_quantity": str(line.outstanding_quantity),
-                        }
-                        for line in shortfall
-                    ],
-                    "hint": "Resend with allow_partial=true and a shortfall_reason "
-                    "to ship the packed portion only.",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        if shortfall and not shortfall_reason:
-            return Response(
-                {"error": "A shortfall_reason is required when shipping short"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        transport_company_id = request.data.get("transport_company")
-        lr_number = request.data.get("lr_number", "")
-        agent_user_id = order.agent.user_id if order.agent else None
-
-        with transaction.atomic():
-            # No stock movement: cloth already left the roll when packing
-            # confirmed the allocation, and the un-allocated remainder of a short
-            # line never left it in the first place.
-            OrderLog.record(
-                order,
-                "DISPATCHED",
-                details={
-                    "fully_packed": not shortfall,
-                    "short_lines": len(shortfall),
-                    "shortfall_meters": str(
-                        sum((line.outstanding_quantity for line in shortfall), ZERO)
-                    ),
-                    "total_items": order.items.count(),
-                },
-                performed_by=request.user,
-            )
-
-            order.status = "DISPATCHED"
-            order.dispatched_at = timezone.now()
-            order.shortfall_reason = shortfall_reason
-
-            if transport_company_id:
-                from transports.models import Transport
-
-                order.transport_company = Transport.objects.filter(
-                    id=transport_company_id
-                ).first()
-            if lr_number:
-                order.lr_number = lr_number
-            order.save()
-
-            if agent_user_id:
-                customer_name = order.customer.name if order.customer else "Customer"
-                transaction.on_commit(
-                    partial(
-                        notify_user_safely,
-                        agent_user_id,
-                        "Order Dispatched",
-                        f"Order for {customer_name} has been dispatched",
-                    ),
-                    robust=True,
-                )
-
-            UserViewedOrder.objects.filter(order=order).delete()
-
-        return Response({"message": "Order dispatched successfully"})
 
     @extend_schema(summary="Cancel an in-progress order edit")
     @action(detail=True, methods=["post"], url_path="cancel-edit")

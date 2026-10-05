@@ -12,6 +12,9 @@ const STATUS_COLORS: Record<string, string> = {
   pending: "#eab308",
   editing: "#f97316",
   packed: "#a855f7",
+  // Teal, sitting deliberately between packed and dispatched: some bundles are on a
+  // truck and some are not, which is neither of the two states either colour means.
+  partially_dispatched: "#14b8a6",
   dispatched: "#22c55e",
 };
 
@@ -20,6 +23,7 @@ const STATUS_LABELS: Record<string, string> = {
   pending: "Pending",
   editing: "Editing",
   packed: "Packed",
+  partially_dispatched: "Partly dispatched",
   dispatched: "Dispatched",
 };
 
@@ -29,6 +33,7 @@ export default function StatusDonutChart({ kpis }: StatusDonutChartProps) {
     { name: "pending", value: kpis.pending },
     { name: "editing", value: kpis.editing },
     { name: "packed", value: kpis.packed },
+    { name: "partially_dispatched", value: kpis.partially_dispatched ?? 0 },
     { name: "dispatched", value: kpis.dispatched },
   ].filter((d) => d.value > 0);
 

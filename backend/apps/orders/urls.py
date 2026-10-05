@@ -62,6 +62,11 @@ urlpatterns = [
         bundle_views.cancel_bundle,
         name="bundle-cancel",
     ),
+    path(
+        "<int:order_id>/bundles/<int:pk>/dispatch/",
+        bundle_views.dispatch_bundle,
+        name="bundle-dispatch",
+    ),
 ] + router.urls + [
     path("<int:order_id>/place-order/", PlaceOrderView.as_view()),
     path("<int:order_id>/add-item/", AddOrderItemView.as_view()),

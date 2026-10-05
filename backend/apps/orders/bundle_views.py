@@ -17,7 +17,7 @@ through; a bundle is a label on top of that, never a second way of moving stock.
 from decimal import Decimal
 
 from django.db import transaction
-from django.db.models import Max
+from django.db.models import Max, Q
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
@@ -27,16 +27,22 @@ from rest_framework.response import Response
 
 from apps.accounts.permissions import IsAdmin
 from apps.items.models import FabricRoll, FabricVariant
-from apps.orders.allocation import OPEN_STATUSES, cancel_round
+from apps.orders.allocation import (
+    OPEN_STATUSES,
+    cancel_round,
+    sync_order_after_dispatch,
+)
 from apps.orders.models import (
     Allocation,
     Order,
     OrderItem,
+    OrderLog,
     PackingBundle,
     PackingRound,
     RollAllocation,
 )
 from apps.orders.packing_views import _SCAN_NOTE, _apply_plan
+from transports.models import Transport
 
 ZERO = Decimal("0")
 
@@ -64,12 +70,81 @@ def _bundle_rolls(bundle):
     )
 
 
-def _serialise_bundle(bundle, order=None):
-    """One bundle with its rolls, plus the order fields the packing slip needs."""
-    order = order or bundle.order
-    rolls = list(_bundle_rolls(bundle))
+def _bundle_allocations(bundle):
+    """Metres in a bundle that were packed by hand rather than cut from a roll.
 
-    line_ids = {entry.allocation.order_item_id for entry in rolls}
+    The counterpart to :func:`_bundle_rolls` for a colour the warehouse does not
+    track in rolls: there is no roll label to scan and no roll to hand back, so
+    these metres are found through :attr:`Allocation.bundle` and carry no roll.
+    Allocations whose round was cancelled are left out for the same reason removed
+    rolls are -- the metres went back, so the box does not still hold them.
+    """
+    return (
+        Allocation.objects.filter(bundle=bundle)
+        .filter(Q(round__isnull=True) | ~Q(round__status="CANCELLED"))
+        .select_related(
+            "order_item__variant__fabric",
+            "round",
+        )
+        .order_by("id")
+    )
+
+
+def _bundle_entries(bundle):
+    """Everything in a bundle as one list, roll-based and hand-packed alike.
+
+    A bundle is a box of cloth, and it does not matter whether the metres in it
+    came off a roll or were typed in by hand -- so both kinds are normalised into
+    the same shape here, roll-based pieces first and then hand-packed ones. That
+    single list is what the panel, the packing slip and the dispatch view all read,
+    which is what lets a fully hand-packed bundle be sealed, listed and dispatched
+    exactly like a scanned one.
+
+    A hand-packed piece reports an empty ``roll_number`` rather than a fake one.
+    Downstream that is simply a blank in the slip's roll column, which is the truth
+    for a box of cloth that was never rolled.
+    """
+    entries = [
+        {
+            "allocation": entry.allocation,
+            "entry_id": entry.pk,
+            "roll_id": entry.roll_id,
+            "roll_number": entry.roll.roll_number,
+            "colour": entry.roll.variant.display_order,
+            "fabric": entry.roll.variant.fabric.name,
+            "metres": entry.metres,
+            "scanned_at": entry.created_at,
+        }
+        for entry in _bundle_rolls(bundle)
+    ]
+    # An allocation can carry both links -- metres packed by hand against named
+    # rolls are on the allocation and on the roll -- so anything a roll already
+    # accounts for is left out below. Otherwise it would be listed twice, and the
+    # bundle would report double the metres it actually holds.
+    from_rolls = {entry["allocation"].pk for entry in entries}
+    entries.extend(
+        {
+            "allocation": allocation,
+            "entry_id": allocation.pk,
+            "roll_id": None,
+            "roll_number": "",
+            "colour": allocation.order_item.variant.display_order,
+            "fabric": allocation.order_item.variant.fabric.name,
+            "metres": allocation.metres,
+            "scanned_at": allocation.created_at,
+        }
+        for allocation in _bundle_allocations(bundle)
+        if allocation.pk not in from_rolls
+    )
+    return entries
+
+
+def _serialise_bundle(bundle, order=None):
+    """One bundle with everything packed into it, plus the order fields the slip needs."""
+    order = order or bundle.order
+    entries = _bundle_entries(bundle)
+
+    line_ids = {entry["allocation"].order_item_id for entry in entries}
     lines = {
         line.pk: line
         for line in OrderItem.objects.filter(pk__in=line_ids).select_related("variant")
@@ -77,32 +152,41 @@ def _serialise_bundle(bundle, order=None):
 
     total_metres = ZERO
     total_value = ZERO
-    entries = []
-    for entry in rolls:
-        line = lines.get(entry.allocation.order_item_id)
+    pieces = []
+    for entry in entries:
+        allocation = entry["allocation"]
+        line = lines.get(allocation.order_item_id)
         rate = line.rate_per_meter if line is not None else ZERO
-        value = (entry.metres * rate).quantize(Decimal("0.01"))
-        total_metres += entry.metres
+        value = (entry["metres"] * rate).quantize(Decimal("0.01"))
+        total_metres += entry["metres"]
         total_value += value
-        entries.append(
+        pieces.append(
             {
-                "id": entry.pk,
-                "roll": entry.roll_id,
-                "roll_number": entry.roll.roll_number,
-                "colour": entry.roll.variant.display_order,
-                "fabric": entry.roll.variant.fabric.name,
-                "metres": str(entry.metres),
-                "item": entry.allocation.order_item_id,
+                # What the panel passes back to remove this piece. For a scanned roll
+                # that has to be the RollAllocation row, because that is what the
+                # remove endpoint takes; a hand-packed piece has no such row, so its
+                # allocation stands in for it. ``allocation_id`` is always there when
+                # a caller needs the allocation itself rather than the row to remove.
+                "id": entry["entry_id"],
+                "allocation_id": allocation.pk,
+                "roll": entry["roll_id"],
+                "roll_number": entry["roll_number"],
+                "colour": entry["colour"],
+                "fabric": entry["fabric"],
+                "metres": str(entry["metres"]),
+                "item": allocation.order_item_id,
                 "fabric_name": line.fabric_name if line is not None else "",
                 "variant_display_order": (
                     line.variant_display_order if line is not None else ""
                 ),
                 "rate_per_meter": str(rate),
                 "value": str(value),
-                "round": entry.allocation.round_id,
-                "scanned_at": entry.created_at.isoformat(),
+                "round": allocation.round_id,
+                "scanned_at": entry["scanned_at"].isoformat(),
             }
         )
+
+    roll_count = sum(1 for piece in pieces if piece["roll"] is not None)
 
     return {
         "id": bundle.pk,
@@ -111,13 +195,19 @@ def _serialise_bundle(bundle, order=None):
         "status": bundle.status,
         "created_at": bundle.created_at.isoformat(),
         "sealed_at": bundle.sealed_at.isoformat() if bundle.sealed_at else None,
+        "dispatched_at": (
+            bundle.dispatched_at.isoformat() if bundle.dispatched_at else None
+        ),
+        "is_dispatched": bundle.is_dispatched,
         "created_by": bundle.created_by.username if bundle.created_by_id else None,
         "order": order.pk,
         "order_number": order.pk,
         "customer": order.customer.name,
         "customer_address": order.customer.address,
-        "rolls": entries,
-        "roll_count": len(entries),
+        "rolls": pieces,
+        "roll_count": roll_count,
+        "piece_count": len(pieces),
+        "is_roll_based": roll_count > 0,
         "total_metres": str(total_metres),
         "total_value": str(total_value.quantize(Decimal("0.01"))),
     }
@@ -484,7 +574,7 @@ def seal_bundle(request, order_id, pk):
                 raise _BundleError(
                     f"{bundle.code} is already {bundle.status.lower()}."
                 )
-            if not _bundle_rolls(bundle).exists():
+            if not _bundle_entries(bundle):
                 raise _BundleError(
                     f"{bundle.code} is empty. Scan at least one roll into it "
                     "before sealing, or cancel it."
@@ -534,8 +624,8 @@ def cancel_bundle(request, order_id, pk):
             bundle = _locked_open_bundle(order, pk)
 
             rounds = []
-            for entry in _bundle_rolls(bundle):
-                packing_round = entry.allocation.round
+            for entry in _bundle_entries(bundle):
+                packing_round = entry["allocation"].round
                 if packing_round is not None and packing_round.status == "CONFIRMED":
                     rounds.append(packing_round)
             for packing_round in rounds:
@@ -561,6 +651,129 @@ def cancel_bundle(request, order_id, pk):
                 f"{len(rounds)} roll{'s' if len(rounds) != 1 else ''}."
             ),
             "order_status": order.status,
+            "bundle": _serialise_bundle(bundle, order),
+        }
+    )
+
+
+class _DispatchBundleSerializer(serializers.Serializer):
+    """The transport for the first bundle of an order to leave.
+
+    Optional, because on every bundle after the first the order already knows which
+    transport it is going on and asking again would be asking for an answer the
+    caller does not get to change.
+    """
+
+    transport_company = serializers.IntegerField(required=False, min_value=1)
+
+
+@extend_schema(
+    methods=["POST"],
+    summary="Send one sealed bundle out",
+    request=_DispatchBundleSerializer,
+)
+@api_view(["POST"])
+@permission_classes([IsAdmin])
+def dispatch_bundle(request, order_id, pk):
+    """Mark one sealed bundle as having left the warehouse.
+
+    This is the unit of dispatch. A sealed bundle is a finished box of cloth tied to
+    one customer and one order, so it is the smallest thing that can honestly be
+    called "shipped" -- and one truck may take the first two boxes and come back for
+    the third, which is why dispatch is not an order-wide event any more.
+
+    The transport is chosen once, on the order, and reused: the first bundle to go
+    out may name it, and after that the order already knows, so a later request
+    carrying a different transport is refused rather than quietly rewriting where
+    earlier boxes went. A bundle cannot be sent twice, and only a sealed one can be
+    sent at all -- an open box is still being filled, and dispatching it would claim
+    cloth that has not been decided yet.
+
+    The order's status follows from the bundles rather than being set here. It becomes
+    ``PARTIALLY_DISPATCHED`` while any bundle is still to go or any line still owes
+    cloth, and ``DISPATCHED`` once nothing is outstanding, so this never has to guess
+    whether the last box has left.
+    """
+    order = get_object_or_404(Order, pk=order_id)
+
+    body = _DispatchBundleSerializer(data=request.data)
+    body.is_valid(raise_exception=True)
+
+    try:
+        with transaction.atomic():
+            bundle = (
+                PackingBundle.objects.select_for_update()
+                .select_related("order")
+                .filter(pk=pk, order=order)
+                .first()
+            )
+            if bundle is None:
+                raise _BundleError(
+                    f"Order #{order.pk} has no packing bundle #{pk}."
+                )
+            if bundle.status != "SEALED":
+                raise _BundleError(
+                    f"{bundle.code} is {bundle.status.lower()}, not sealed. Only a "
+                    "sealed bundle can be dispatched."
+                )
+            if bundle.dispatched_at is not None:
+                raise _BundleError(f"{bundle.code} has already been dispatched.")
+
+            asked_for = body.validated_data.get("transport_company")
+            if order.transport_company_id is None:
+                if asked_for is None:
+                    raise _BundleError(
+                        f"Order #{order.pk} has no transport yet. Choose the "
+                        "transport company before sending the first bundle; it is "
+                        "then reused for every bundle on this order."
+                    )
+                if not Transport.objects.filter(pk=asked_for).exists():
+                    raise _BundleError(
+                        f"There is no transport company #{asked_for}."
+                    )
+                order.transport_company_id = asked_for
+                order.save(update_fields=["transport_company"])
+            elif asked_for is not None and asked_for != order.transport_company_id:
+                raise _BundleError(
+                    f"Order #{order.pk} is already going on "
+                    f"{order.transport_company}. The transport is chosen once per "
+                    "order, so it cannot be changed by dispatching a bundle."
+                )
+
+            bundle.dispatched_at = timezone.now()
+            bundle.save(update_fields=["dispatched_at"])
+
+            order_status = sync_order_after_dispatch(order)
+    except _BundleError as exc:
+        return _reject(str(exc))
+
+    order.refresh_from_db()
+    bundle.refresh_from_db()
+
+    OrderLog.record(
+        order,
+        action="DISPATCHED",
+        details={
+            "bundle": bundle.code,
+            "bundle_id": bundle.pk,
+            "dispatched_at": bundle.dispatched_at.isoformat(),
+            "transport": order.transport_company.name
+            if order.transport_company_id
+            else "",
+            "order_status": order_status,
+        },
+        performed_by=request.user,
+    )
+
+    return Response(
+        {
+            "message": (
+                f"Dispatched {bundle.code}."
+                if order_status == "DISPATCHED"
+                else f"Dispatched {bundle.code}. Order #{order.pk} is now partially "
+                "dispatched."
+            ),
+            "order_status": order_status,
             "bundle": _serialise_bundle(bundle, order),
         }
     )

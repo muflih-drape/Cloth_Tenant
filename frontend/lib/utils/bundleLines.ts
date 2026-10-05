@@ -18,40 +18,55 @@ export interface BundleLineShare {
   metres: number;
   /** What this bundle's contribution to this line came to. */
   value: number;
-  /** How many rolls in this bundle went to this line. */
+  /** How many real rolls in this bundle went to this line. */
   rolls: number;
+  /** How many pieces altogether, including metres that were never on a roll. */
+  pieces: number;
   /** The rolls themselves, for the "which roll" line under the name. */
   rollNumbers: string[];
 }
 
 /**
- * Groups a bundle's rolls by the order line they were packed against.
+ * Groups a bundle's contents by the order line they were packed against.
  *
- * Kept in first-seen order so the shares read in the order the rolls were
- * scanned, and a bundle that packed nothing resolves to no shares at all.
+ * A bundle is not a list of lines: it is a list of *pieces* of cloth, and a piece
+ * belongs to whatever line its colour matched. So the lines a bundle covered have to
+ * be gathered back out of those pieces -- and when one line's metres were split over
+ * two boxes, each box reports only the part it actually carried.
+ *
+ * A piece with no roll number was typed in by the packer rather than scanned off a
+ * roll. It counts towards the line and towards the bundle, but it is not a roll and
+ * is not given a roll number to print.
+ *
+ * Kept in first-seen order so the shares read in the order the pieces were packed,
+ * and a bundle that packed nothing resolves to no shares at all.
  */
 export function bundleLineShares(bundle: PackingBundle): BundleLineShare[] {
   const shares = new Map<number, BundleLineShare>();
 
-  for (const roll of bundle.rolls) {
-    const existing = shares.get(roll.item);
-    const metres = toMeters(roll.metres);
-    const value = Number(roll.value ?? 0);
+  for (const piece of bundle.rolls) {
+    const existing = shares.get(piece.item);
+    const metres = toMeters(piece.metres);
+    const value = Number(piece.value ?? 0);
     if (existing) {
       existing.metres += metres;
       existing.value += value;
-      existing.rolls += 1;
-      existing.rollNumbers.push(roll.roll_number);
+      existing.pieces += 1;
+      if (piece.roll_number) {
+        existing.rolls += 1;
+        existing.rollNumbers.push(piece.roll_number);
+      }
       continue;
     }
-    shares.set(roll.item, {
-      itemId: roll.item,
-      fabricName: roll.fabric_name || roll.fabric,
-      colour: roll.variant_display_order || roll.colour,
+    shares.set(piece.item, {
+      itemId: piece.item,
+      fabricName: piece.fabric_name || piece.fabric,
+      colour: piece.variant_display_order || piece.colour,
       metres,
       value,
-      rolls: 1,
-      rollNumbers: [roll.roll_number],
+      pieces: 1,
+      rolls: piece.roll_number ? 1 : 0,
+      rollNumbers: piece.roll_number ? [piece.roll_number] : [],
     });
   }
 

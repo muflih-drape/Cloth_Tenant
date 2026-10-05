@@ -11,6 +11,7 @@ import {
   Printer,
   QrCode,
   Trash2,
+  Truck,
   X,
 } from "lucide-react";
 import { pdf } from "@react-pdf/renderer";
@@ -19,6 +20,7 @@ import QRScanModal from "@/components/items/QRScanModal";
 import { ImagePreview } from "@/components/pages/ImagePreview";
 import { BundlePackingSlipPdf } from "@/components/pages/order/BundlePackingSlipPdf";
 import { packingApi } from "@/lib/api/order";
+import { transportApi } from "@/lib/api/transport";
 import { orderItemColorSuffix } from "@/lib/colorLabel";
 import { toastError, toastErrorFromError, toastSuccess } from "@/lib/toast";
 import { bundleSlipFilename, parseRollScan } from "@/lib/utils/bundleSlip";
@@ -36,7 +38,7 @@ import type {
 } from "@/types/order";
 
 type Props = {
-  orderId: number;
+orderId: number;
   /** False once the order is out of reach, so no bundle can be opened. */
   enabled: boolean;
   /**
@@ -52,6 +54,23 @@ type Props = {
   onChanged: () => void;
   /** Lets the page move its own status badge when a scan fills the order. */
   onOrderStatusChange?: (status: OrderStatus) => void;
+  /**
+   * Reports how many sealed bundles are still here and how many have gone, so the
+   * foot of the page can say what is left to dispatch without fetching the bundles a
+   * second time.
+   */
+  onBundlesChange?: (counts: {
+    pending: number;
+    dispatched: number;
+  }) => void;
+  /**
+   * The transport already chosen for this order, if any. The transport is one
+   * decision for the whole order and every bundle after the first reuses it, so
+   * this is only asked for on the first box to leave.
+   */
+  transportCompanyId?: number | null;
+  /** What the customer asked for; offered first when a choice has to be made. */
+  preferredTransportId?: number | null;
 };
 
 /**
@@ -98,8 +117,13 @@ function BundleLineList({
                   {`${formatMeters(share.metres)} m packed in this bundle`}
                 </span>
               </p>
+              {/* Only say which rolls when there were rolls to name. Metres typed in
+                  by the packer came off no roll, and printing a blank here would look
+                  like a slip in the data rather than a fact about the cloth. */}
               <p className="mt-0.5 text-[10px] text-gray-400">
-                {share.rollNumbers.join(", ")}
+                {share.rollNumbers.length > 0
+                  ? share.rollNumbers.join(", ")
+                  : "packed by hand"}
               </p>
             </div>
 
@@ -133,6 +157,12 @@ function BundleLineList({
  * return, because the packing slip is a promise about what is in the box; after that
  * nothing can go in or come out, and the slip can be printed again as often as it is
  * needed.
+ *
+ * Once sealed, a bundle is what gets dispatched. Each box leaves on its own, so one
+ * truck can take the first two and come back for the third, and the order says how
+ * far along it is -- partly dispatched while some boxes are still here, fully
+ * dispatched once the last one has gone. A dispatched box keeps its seal and its
+ * slip, so the paperwork for something already in transit can still be reprinted.
  */
 export default function PackingBundlePanel({
   orderId,
@@ -140,6 +170,9 @@ export default function PackingBundlePanel({
   items,
   onChanged,
   onOrderStatusChange,
+  onBundlesChange,
+  transportCompanyId = null,
+  preferredTransportId = null,
 }: Props) {
   const [bundles, setBundles] = useState<PackingBundle[]>([]);
   const [loading, setLoading] = useState(true);
@@ -150,6 +183,16 @@ export default function PackingBundlePanel({
   // Which boxes the admin has opened, by bundle id. Held per bundle rather than
   // as one flag so opening Bundle 2 leaves Bundle 1 as it was.
   const [expanded, setExpanded] = useState<Record<number, boolean>>({});
+  // The box waiting to go out, and the transport step that comes with it. The
+  // picker only appears for the first bundle on an order -- after that the order
+  // already knows where the cloth is going.
+  const [dispatchingBundle, setDispatchingBundle] = useState<PackingBundle | null>(
+    null,
+  );
+  const [dispatchTransport, setDispatchTransport] = useState("");
+  const [transports, setTransports] = useState<
+    { value: string; label: string }[]
+  >([]);
 
   const toggleExpanded = (bundleId: number) =>
     setExpanded((prev) => ({ ...prev, [bundleId]: !prev[bundleId] }));
@@ -193,6 +236,17 @@ export default function PackingBundlePanel({
         ? prev.map((bundle) => (bundle.id === next.id ? next : bundle))
         : [...prev, next],
     );
+
+  // Count the boxes whenever the list changes, so the foot of the page can say what
+  // is still waiting to go without asking for the bundles all over again.
+  useEffect(() => {
+    onBundlesChange?.({
+      pending: bundles.filter(
+        (bundle) => bundle.status === "SEALED" && !bundle.is_dispatched,
+      ).length,
+      dispatched: bundles.filter((bundle) => bundle.is_dispatched).length,
+    });
+  }, [bundles, onBundlesChange]);
 
   /**
    * Render the slip for a bundle and hand the file to the browser.
@@ -351,6 +405,67 @@ export default function PackingBundlePanel({
         `${result.bundle.code} sealed`,
         "Its contents can no longer be changed.",
       );
+    } catch (err) {
+      toastErrorFromError(err);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  /**
+   * Start sending a box out.
+   *
+   * Once the order already has a transport this goes straight through, because there
+   * is nothing left to decide. The first box on an order is the one that needs a
+   * choice, so that is where the picker appears -- and it opens on whatever the
+   * customer asked for, which is right far more often than not.
+   */
+  const handleDispatchClick = async (bundle: PackingBundle) => {
+    if (transportCompanyId) {
+      await handleDispatch(bundle);
+      return;
+    }
+    setDispatchingBundle(bundle);
+    // Offer the customer's preference, if we know what it is.
+    setDispatchTransport(preferredTransportId ? String(preferredTransportId) : "");
+    if (transports.length === 0) {
+      try {
+        const rows = await transportApi.getActive();
+        setTransports(
+          rows.map((row) => ({ value: String(row.id), label: row.name })),
+        );
+      } catch {
+        toastError(
+          "Could not load the transport list",
+          "Reload the page and try again.",
+        );
+      }
+    }
+  };
+
+  const handleDispatch = async (
+    bundle: PackingBundle,
+    transportCompany?: number,
+  ) => {
+    setBusy(true);
+    try {
+      const result = await packingApi.dispatchBundle(orderId, bundle.id, {
+        // Omitted once the order has a transport: naming it again would be asking a
+        // question the order has already answered.
+        ...(transportCompany ? { transport_company: transportCompany } : {}),
+      });
+      replaceBundle(result.bundle);
+      setDispatchingBundle(null);
+      setDispatchTransport("");
+      toastSuccess(
+        result.message,
+        result.order_status === "DISPATCHED"
+          ? "That was the last box, so the order is fully dispatched."
+          : "Other boxes are still here to go out.",
+      );
+      // The order's own status has moved, and the badge on the page reads it.
+      onOrderStatusChange?.(result.order_status);
+      onChanged();
     } catch (err) {
       toastErrorFromError(err);
     } finally {
@@ -565,10 +680,24 @@ export default function PackingBundlePanel({
                     {bundle.code}
                   </span>
                   <span className="text-[11px] font-medium text-gray-500">
-                    {bundle.roll_count} roll{bundle.roll_count === 1 ? "" : "s"} ·{" "}
+                    {/* A box of metres typed in rather than scanned off rolls has no
+                        rolls to count, so it says what is actually in it. */}
+                    {bundle.is_roll_based
+                      ? `${bundle.roll_count} roll${bundle.roll_count === 1 ? "" : "s"} · `
+                      : "packed by hand · "}
                     {formatMeters(bundle.total_metres)} m ·{" "}
                     {bundle.sealed_at ? bundle.sealed_at.slice(0, 10) : "sealed"}
                   </span>
+                  {/* Once a box has gone, say so, and say when -- the slip it was
+                      printed from is now the record of something in transit. */}
+                  {bundle.is_dispatched && (
+                    <span className="flex items-center gap-1 rounded-full border border-green-200 bg-green-50 px-2 py-0.5 text-[10px] font-bold uppercase tracking-wider text-green-700">
+                      <Truck size={10} />
+                      {bundle.dispatched_at
+                        ? `Dispatched ${bundle.dispatched_at.slice(0, 10)}`
+                        : "Dispatched"}
+                    </span>
+                  )}
                   <span className="ml-auto flex items-center gap-1.5">
                     <button
                       type="button"
@@ -601,6 +730,21 @@ export default function PackingBundlePanel({
                       <Download size={11} />
                       Download slip
                     </button>
+                    {/* A sealed box is the smallest thing that can honestly be called
+                        shipped, so this is the button that sends it -- not the order,
+                        and not the other boxes on it. A box already gone has nothing
+                        left to dispatch. */}
+                    {!bundle.is_dispatched && (
+                      <button
+                        type="button"
+                        onClick={() => handleDispatchClick(bundle)}
+                        disabled={busy}
+                        className="flex items-center gap-1 rounded-lg bg-green-600 px-2 py-1 text-[10px] font-bold text-white transition-colors hover:bg-green-700 disabled:opacity-50"
+                      >
+                        <Truck size={11} />
+                        Dispatch
+                      </button>
+                    )}
                   </span>
                 </div>
 
@@ -676,6 +820,88 @@ export default function PackingBundlePanel({
         onClose={() => setScanOpen(false)}
         onScan={handleScan}
       />
+
+      {/* The first box to leave an order is the only moment the transport gets
+          decided, and it gets decided once: every bundle after this one travels the
+          same way. So this is a short confirmation for one box, not a standing
+          prompt on the page. */}
+      {dispatchingBundle && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label={`Dispatch ${dispatchingBundle.code}`}
+        >
+          <div className="w-full max-w-sm rounded-2xl bg-white p-6 shadow-xl">
+            <h3 className="text-lg font-bold text-gray-900">
+              Dispatch this bundle
+            </h3>
+            <p className="mt-2 text-sm text-gray-500">
+              {dispatchingBundle.code} holds{" "}
+              {formatMeters(dispatchingBundle.total_metres)} m. Recording it here
+              means this box has left the warehouse.
+            </p>
+
+            <label className="mt-4 block text-xs font-bold text-gray-700">
+              Transport
+              <select
+                value={dispatchTransport}
+                onChange={(e) => setDispatchTransport(e.target.value)}
+                className="mt-1 w-full rounded-xl border border-gray-300 px-3 py-2 text-sm font-medium text-gray-900 focus:border-green-500 focus:outline-none"
+              >
+                <option value="">Choose a transport</option>
+                {transports.map((transport) => (
+                  <option
+                    key={transport.value}
+                    value={transport.value}
+                  >
+                    {transport.label}
+                  </option>
+                ))}
+              </select>
+            </label>
+            <p className="mt-2 text-[11px] text-gray-500">
+              The other bundles on this order are untouched -- dispatch them when
+              they go, on the same transport.
+            </p>
+
+            <div className="mt-5 flex justify-end gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setDispatchingBundle(null);
+                  setDispatchTransport("");
+                }}
+                disabled={busy}
+                className="rounded-xl border border-gray-200 px-4 py-2 text-sm font-bold text-gray-600 transition-colors hover:bg-gray-50 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  if (!dispatchTransport) {
+                    toastError(
+                      "Choose a transport",
+                      "A bundle cannot go out without knowing what carried it.",
+                    );
+                    return;
+                  }
+                  void handleDispatch(
+                    dispatchingBundle,
+                    Number(dispatchTransport),
+                  );
+                }}
+                disabled={busy || !dispatchTransport}
+                className="flex items-center gap-1.5 rounded-xl bg-green-600 px-4 py-2 text-sm font-bold text-white transition-colors hover:bg-green-700 disabled:opacity-50"
+              >
+                <Truck size={14} />
+                {busy ? "Dispatching..." : "Dispatch bundle"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </section>
   );
 }

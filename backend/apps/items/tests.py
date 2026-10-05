@@ -10,6 +10,7 @@ from datetime import timedelta
 from decimal import Decimal
 from io import BytesIO
 from unittest.mock import patch
+import uuid
 
 from django.contrib.auth import get_user_model
 from django.core.files.uploadedfile import SimpleUploadedFile
@@ -369,6 +370,86 @@ class AvailableToOrderTests(FabricTestBase):
             annotated[self.variant1.pk],
             FabricVariant.objects.get(pk=self.variant1.pk).available_to_order,
         )
+
+
+class ScanAvailabilityTests(FabricTestBase):
+    """The scanner resolves a QR before an item is added to an order.
+
+    That screen asks an agent whether there is cloth to take, so the figure it
+    shows has to be the orderable one. It used to read the shelf total, which
+    ignores every order already placed.
+    """
+
+    URL = "/api/items/by-qr/"
+
+    def setUp(self):
+        super().setUp()
+        self.variant1.qr_code = uuid.uuid4()
+        self.variant1.save(update_fields=["qr_code"])
+        self.variant2.qr_code = uuid.uuid4()
+        self.variant2.save(update_fields=["qr_code"])
+
+    def row_for(self, response, variant):
+        for row in response.data["variants"]:
+            if row["id"] == variant.pk:
+                return row
+        self.fail(f"variant {variant.pk} missing from the scan response")
+
+    def test_a_fresh_scan_reports_full_availability(self):
+        self.auth()
+        row = self.row_for(
+            self.client.get(self.URL, {"qr_code": str(self.variant1.qr_code)}),
+            self.variant1,
+        )
+
+        self.assertEqual(Decimal(row["stock_meters"]), Decimal("3000.000"))
+        self.assertEqual(Decimal(row["available_meters"]), Decimal("3000.000"))
+
+    def test_an_existing_order_has_already_taken_its_metres(self):
+        self.make_line(self.make_order(self.customer1), 100)
+
+        self.auth()
+        row = self.row_for(
+            self.client.get(self.URL, {"qr_code": str(self.variant1.qr_code)}),
+            self.variant1,
+        )
+
+        # The shelf is untouched; what is left to promise has dropped.
+        self.assertEqual(Decimal(row["stock_meters"]), Decimal("3000.000"))
+        self.assertEqual(Decimal(row["available_meters"]), Decimal("2900.000"))
+
+    def test_every_colour_of_the_fabric_carries_its_own_figure(self):
+        self.make_line(
+            self.make_order(self.customer1), 500, variant=self.variant1
+        )
+
+        self.auth()
+        resp = self.client.get(self.URL, {"qr_code": str(self.variant1.qr_code)})
+
+        self.assertEqual(
+            Decimal(self.row_for(resp, self.variant1)["available_meters"]),
+            Decimal("2500.000"),
+        )
+        self.assertEqual(
+            Decimal(self.row_for(resp, self.variant2)["available_meters"]),
+            Decimal("1500.000"),
+        )
+
+    def test_it_stays_a_fixed_number_of_queries_however_many_colours(self):
+        from django.db import connection
+        from django.test.utils import CaptureQueriesContext
+
+        FabricVariant.objects.create(
+            fabric=self.fabric, display_order="Ivory", stock_meters=Decimal("900")
+        )
+        self.auth()
+
+        with CaptureQueriesContext(connection) as ctx:
+            self.client.get(self.URL, {"qr_code": str(self.variant1.qr_code)})
+
+        # The QR lookup, its fabric, and one prefetch carrying every colour's
+        # orderable metres -- not one query per colour.
+        self.assertEqual(len(ctx.captured_queries), 3)
 
 
 class StockListAvailabilityTests(FabricTestBase):

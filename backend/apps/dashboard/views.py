@@ -120,6 +120,13 @@ class AdminAnalyticsView(APIView):
             "editing": placed_qs.filter(status="EDITING").count(),
             "packed": placed_qs.filter(status="PACKED").count(),
             "dispatched": placed_qs.filter(status="DISPATCHED").count(),
+            # Bundles go out one box at a time, so an order can be half on a truck.
+            # Counted on its own rather than folded into "dispatched", because the
+            # two mean different things: one is finished, the other still has boxes
+            # waiting in the warehouse.
+            "partially_dispatched": placed_qs.filter(
+                status="PARTIALLY_DISPATCHED"
+            ).count(),
             "total_metres_ordered": str(ordered_metres),
             "total_metres_shipped": str(shipped_metres),
             "total_value": float(total_value),

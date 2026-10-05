@@ -329,7 +329,15 @@ class FabricViewSet(ModelViewSet):
             return Response({"error": "Invalid QR code"}, status=400)
 
         fabric = variant.fabric
-        variants = list(fabric.variants.all())
+        # Annotated so each colour's orderable metres ride along with this one
+        # query. The scanner shows this figure before the line is even added, so
+        # leaving it off would mean showing the shelf total and calling it
+        # availability.
+        from apps.orders.stock import variants_with_committed_demand
+
+        variants = list(
+            variants_with_committed_demand().filter(fabric_id=fabric.id)
+        )
 
         agent_id = request.query_params.get("agent_id")
         if agent_id:
@@ -368,6 +376,7 @@ class FabricViewSet(ModelViewSet):
                         ),
                         "display_order": v.display_order,
                         "stock_meters": str(v.stock_meters),
+                        "available_meters": str(v.available_to_order),
                     }
                     for v in variants
                 ],

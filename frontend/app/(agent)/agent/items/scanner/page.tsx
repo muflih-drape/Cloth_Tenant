@@ -118,6 +118,15 @@ export default function PriceCheckScannerPage() {
   };
 
   const onHand = selectedVariant ? toMeters(selectedVariant.stock_meters) : 0;
+  /**
+   * What is still unclaimed rather than what is on the shelf. Falls back to the
+   * shelf figure if the response predates the field, so this never reads zero
+   * for a colour that plainly has cloth.
+   */
+  const available =
+    selectedVariant?.available_meters !== undefined
+      ? toMeters(selectedVariant.available_meters)
+      : onHand;
 
   if (loading) return <PageLoading />;
 
@@ -273,22 +282,32 @@ export default function PriceCheckScannerPage() {
             <p className="text-[10px] font-black uppercase tracking-widest text-gray-400 mb-3">
               Availability
             </p>
-            {onHand > 0 ? (
+            {available > 0 ? (
               <div className="flex items-center justify-between px-4 py-3 bg-green-50 border border-green-100 rounded-xl">
-                <span className="text-sm font-bold text-green-700">
-                  {formatMeters(onHand)} m on the roll
-                </span>
+                <div>
+                  <span className="text-sm font-bold text-green-700">
+                    {formatMeters(available)} m available
+                  </span>
+                  <span className="block text-[11px] text-green-600/80 font-medium">
+                    On hand: {formatMeters(onHand)} m
+                  </span>
+                </div>
                 <span className="text-xs text-green-600 font-medium">
                   worth ₹
                   {(
-                    onHand * Number(scanResult.price_per_meter)
+                    available * Number(scanResult.price_per_meter)
                   ).toLocaleString("en-IN")}
                 </span>
               </div>
             ) : (
-              <div className="flex items-center gap-2 px-4 py-3 bg-red-50 border border-red-100 rounded-xl">
+              <div className="px-4 py-3 bg-red-50 border border-red-100 rounded-xl">
                 <span className="font-bold text-sm text-red-500">
-                  Nothing on the roll
+                  {available < 0
+                    ? `Oversold by ${formatMeters(Math.abs(available))} m against existing orders`
+                    : "Nothing available"}
+                </span>
+                <span className="block text-[11px] text-red-500/80 font-medium">
+                  On hand: {formatMeters(onHand)} m
                 </span>
               </div>
             )}

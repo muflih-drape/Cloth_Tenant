@@ -201,6 +201,14 @@ export function BundlePackingSlipPdf({ bundle }: BundlePackingSlipPdfProps) {
             <Text style={styles.sealedAt}>
               Sealed: {dateOnly(bundle.sealed_at)}
             </Text>
+            {/* A slip reprinted after the box left should say so, because the sheet
+                in the customer's hand is then proof of what was sent, not just what
+                was packed. */}
+            {bundle.dispatched_at ? (
+              <Text style={styles.sealedAt}>
+                Dispatched: {dateOnly(bundle.dispatched_at)}
+              </Text>
+            ) : null}
           </View>
         </View>
 
@@ -241,11 +249,21 @@ export function BundlePackingSlipPdf({ bundle }: BundlePackingSlipPdfProps) {
 
           {rolls.length === 0 ? (
             <Text style={styles.empty}>
-              No rolls were packed into this bundle.
+              No cloth was packed into this bundle.
             </Text>
           ) : (
             rolls.map((roll) => (
-              <View key={roll.id} style={styles.tableRow} wrap={false}>
+              // `id` is the RollAllocation for a scanned roll and the Allocation for
+              // metres typed in by hand, so they live in different id spaces. Keying
+              // on both keeps two rows in one bundle from colliding on a number.
+              <View
+                key={`${roll.allocation_id}-${roll.id}`}
+                style={styles.tableRow}
+                wrap={false}
+              >
+                {/* Left blank for a hand-packed piece: there was no roll for it to
+                    come off, and an empty cell says that honestly where a dash would
+                    read like a value that went missing. */}
                 <Text style={[styles.cell, styles.colRoll]}>
                   {roll.roll_number}
                 </Text>
@@ -272,10 +290,15 @@ export function BundlePackingSlipPdf({ bundle }: BundlePackingSlipPdfProps) {
         {rolls.length > 0 ? (
           <View style={styles.totals}>
             <View style={styles.totalBox}>
-              <View style={styles.totalLine}>
-                <Text style={styles.totalLabel}>Rolls</Text>
-                <Text style={styles.totalValue}>{rolls.length}</Text>
-              </View>
+              {/* Counts the real rolls, not the rows: a box of metres typed in by
+                  hand has rows on this slip but no rolls behind them, and claiming
+                  otherwise would put a number on the sheet that is not there. */}
+              {bundle.is_roll_based && (
+                <View style={styles.totalLine}>
+                  <Text style={styles.totalLabel}>Rolls</Text>
+                  <Text style={styles.totalValue}>{bundle.roll_count}</Text>
+                </View>
+              )}
               <View style={styles.totalLine}>
                 <Text style={styles.totalLabel}>Total length</Text>
                 <Text style={styles.totalValue}>
@@ -293,8 +316,9 @@ export function BundlePackingSlipPdf({ bundle }: BundlePackingSlipPdfProps) {
         ) : null}
 
         <Text style={styles.footer}>
-          Every roll listed above was cut whole and is recorded against this order.
-          Check the contents against this slip before accepting the delivery.
+          {bundle.is_roll_based
+            ? "Every roll listed above was cut whole and is recorded against this order. Check the contents against this slip before accepting the delivery."
+            : "The cloth listed above was cut to length for this order and is recorded against it. Check the contents against this slip before accepting the delivery."}
         </Text>
       </Page>
     </Document>

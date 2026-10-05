@@ -20,12 +20,14 @@ export interface PackLineContext {
 /**
  * Whether to offer this line a packing control.
  *
- * A line is packable while the order is still open for cloth (`PENDING` or
- * `PACKED`, mirroring the engine's `OPEN_STATUSES`) and the line still owes
- * something. Lines with no colour attached can never be packed, because there is
- * no roll to take the metres off. A line already settled is not offered the
- * control either -- over-packing a finished line is allowed by the server, but
- * there is nothing to prompt it, and the settled rows should stay settled.
+ * A line is packable while the order is still open for cloth (`PENDING`, `PACKED`
+ * or `PARTIALLY_DISPATCHED`, mirroring the engine's `OPEN_STATUSES`) and the line
+ * still owes something. A partly dispatched order counts: its bundles have gone but
+ * it still owes cloth, and it still has sealed bundles waiting to go out. Lines with
+ * no colour attached can never be packed, because there is no roll to take the metres
+ * off. A line already settled is not offered the control either -- over-packing a
+ * finished line is allowed by the server, but there is nothing to prompt it, and the
+ * settled rows should stay settled.
  */
 export function isPackable(
   outstanding: string | number,

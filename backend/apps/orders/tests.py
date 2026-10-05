@@ -1,4 +1,4 @@
-﻿"""Order lifecycle tests for the metre domain.
+"""Order lifecycle tests for the metre domain.
 
 The invariant that shapes almost everything here: **placing an order records
 demand and never moves cloth**. Stock only changes when a packing round is
@@ -14,6 +14,7 @@ from django.contrib.auth import get_user_model
 from django.db import connections, transaction
 from django.test import TestCase, TransactionTestCase
 from django.conf import settings
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.test import APIClient
 from rest_framework_simplejwt.tokens import RefreshToken
@@ -31,6 +32,7 @@ from apps.orders.models import (
     RollAllocation,
 )
 from apps.orders.pricing import order_totals, recompute_order_total
+from transports.models import Transport
 
 User = get_user_model()
 
@@ -437,92 +439,7 @@ class InvoiceTests(OrderTestBase):
 
 
 
-class DispatchTests(OrderTestBase):
-    def setUp(self):
-        super().setUp()
-        self.order = self.make_draft()
-        self.line = self.add_line(self.order, 1400)
-        self.place(self.order)
-        self.order.refresh_from_db()
 
-    def _pack(self, metres):
-        """Apply a hand-set plan, the way the admin packing board does."""
-        from apps.orders.packing_views import _apply_plan
-
-        packing_round = PackingRound.objects.create(
-            variant=self.variant, round_size=Decimal("1000")
-        )
-        stored = [{"order_item": self.line.pk, "metres": str(Decimal(metres))}]
-        with transaction.atomic():
-            _apply_plan(packing_round, stored, self.admin)
-        return packing_round
-
-    def test_dispatch_blocked_while_unallocated(self):
-        self.auth(self.admin)
-        resp = self.client.post(
-            f"/api/orders/{self.order.pk}/dispatch/", {}, format="json"
-        )
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("unallocated_lines", resp.data)
-
-    def test_partial_dispatch_requires_allow_partial(self):
-        self._pack("1000")
-        self.auth(self.admin)
-        resp = self.client.post(
-            f"/api/orders/{self.order.pk}/dispatch/",
-            {"shortfall_reason": "Mill ran out of Natural"},
-            format="json",
-        )
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-
-    def test_partial_dispatch_requires_a_reason(self):
-        self._pack("1000")
-        self.auth(self.admin)
-        resp = self.client.post(
-            f"/api/orders/{self.order.pk}/dispatch/",
-            {"allow_partial": True},
-            format="json",
-        )
-        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("shortfall_reason", str(resp.data))
-
-    def test_partial_dispatch_succeeds(self):
-        self._pack("1000")
-        self.auth(self.admin)
-        resp = self.client.post(
-            f"/api/orders/{self.order.pk}/dispatch/",
-            {"allow_partial": True, "shortfall_reason": "Mill ran out of Natural"},
-            format="json",
-        )
-        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
-        self.order.refresh_from_db()
-        self.assertEqual(self.order.status, "DISPATCHED")
-
-    def test_full_dispatch_needs_no_reason(self):
-        self._pack("1400")
-        self.auth(self.admin)
-        resp = self.client.post(
-            f"/api/orders/{self.order.pk}/dispatch/", {}, format="json"
-        )
-        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
-
-    def test_dispatch_does_not_move_stock_again(self):
-        self._pack("1000")
-        self.variant.refresh_from_db()
-        after_packing = self.variant.stock_meters
-
-        self.auth(self.admin)
-        self.client.post(
-            f"/api/orders/{self.order.pk}/dispatch/",
-            {"allow_partial": True, "shortfall_reason": "ran out"},
-            format="json",
-        )
-
-        self.variant.refresh_from_db()
-        self.assertEqual(
-            self.variant.stock_meters, after_packing,
-            "cloth already left the roll at packing time",
-        )
 
 
 class PackingRoundAPITests(OrderTestBase):
@@ -1889,8 +1806,8 @@ class PackingBundleTests(OrderTestBase):
 
     def test_removing_a_roll_that_is_not_in_this_bundle_is_refused(self):
         bundle = self.open_bundle()
-        # Packed off a bundle entirely, through the manual route, so its
-        # allocation belongs to no bundle at all.
+        # Packed by hand, which puts the roll in a box of its own rather than in this
+        # one -- so it belongs to some other bundle, not to this bundle.
         self.auth(self.admin)
         packed = self.client.post(
             f"/api/orders/{self.order.pk}/items/{self.line.pk}/pack/",
@@ -1903,7 +1820,8 @@ class PackingBundleTests(OrderTestBase):
         )
         self.assertEqual(packed.status_code, status.HTTP_200_OK, packed.data)
         loose = RollAllocation.objects.get(roll=self.rolls[0], is_reversed=False)
-        self.assertIsNone(loose.bundle)
+        self.assertNotEqual(loose.bundle_id, bundle["id"])
+        self.assertEqual(PackingBundle.objects.get(pk=loose.bundle_id).status, "SEALED")
 
         resp = self.client.post(self.remove_url(bundle, loose.pk), {}, format="json")
 
@@ -2452,8 +2370,17 @@ class OrderDeletionTests(OrderTestBase):
     The records that say which roll each metre came off -- OrderItem, Allocation
     and RollAllocation -- all cascade with the order, so any restoration has to run
     before the delete, in the same transaction. A dispatched order is refused
-    outright instead, because its cloth is not on a roll any more.
+    outright instead, because its cloth is not on a roll any more. An order with a
+    *mix* is the awkward middle: the bundles that went out stay gone while the ones
+    still on the shelf come back, which is only possible because the restoration
+    works per allocation rather than per line.
     """
+
+    def setUp(self):
+        super().setUp()
+        # Dispatch needs a transport on the order, chosen once and then reused, so
+        # these tests carry one rather than re-deciding it per case.
+        self.transport = Transport.objects.create(name="VRL Logistics")
 
     def roll_backed_order(self, metres=1000):
         """A placed order on a colour tracked by two real rolls."""
@@ -2490,6 +2417,14 @@ class OrderDeletionTests(OrderTestBase):
             format="json",
         )
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return resp
+
+    def seal(self, order, bundle):
+        self.auth(self.admin)
+        resp = self.client.post(
+            f"/api/orders/{order.pk}/bundles/{bundle['id']}/seal/", {}, format="json"
+        )
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
         return resp
 
     def test_deleting_a_packed_order_returns_its_cloth(self):
@@ -2540,10 +2475,25 @@ class OrderDeletionTests(OrderTestBase):
                 self.admin,
             )
 
+        # Packing straight through the engine bypasses the bundle API, so the box is
+        # written directly: the metres are cut and there is nothing to add to it.
+        bundle = PackingBundle.objects.create(
+            order=order,
+            number=1,
+            status="SEALED",
+            sealed_at=timezone.now(),
+            created_by=self.admin,
+        )
+        Allocation.objects.filter(round=packing_round).update(bundle=bundle)
+
         self.auth(self.admin)
         self.client.post(
-            f"/api/orders/{order.pk}/dispatch/", {}, format="json"
+            f"/api/orders/{order.pk}/bundles/{bundle.pk}/dispatch/",
+            {"transport_company": self.transport.pk},
+            format="json",
         )
+        order.refresh_from_db()
+        self.assertEqual(order.status, "DISPATCHED")
         resp = self.client.delete(f"/api/orders/{order.pk}/")
 
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
@@ -2560,10 +2510,13 @@ class OrderDeletionTests(OrderTestBase):
         # Both rolls, so the order ships complete and is genuinely dispatched.
         self.scan_into(order, bundle, self.rolls[0])
         self.scan_into(order, bundle, self.rolls[1])
+        self.seal(order, bundle)
 
         self.auth(self.admin)
         dispatched = self.client.post(
-            f"/api/orders/{order.pk}/dispatch/", {}, format="json"
+            f"/api/orders/{order.pk}/bundles/{bundle['id']}/dispatch/",
+            {"transport_company": self.transport.pk},
+            format="json",
         )
         self.assertEqual(dispatched.status_code, status.HTTP_200_OK, dispatched.data)
 
@@ -2585,36 +2538,42 @@ class OrderDeletionTests(OrderTestBase):
         self.variant.refresh_from_db()
         self.assertEqual(self.variant.stock_meters, ZERO)
 
-    def test_a_partly_dispatched_order_cannot_be_deleted_either(self):
-        # A short shipment: only part of the order ever left, and the dispatch still
-        # puts the whole order in DISPATCHED. There is no per-line dispatched figure
-        # in this codebase, so any dispatched order at all is undeletable.
-        order = self.roll_backed_order(metres=1000)
-        self.scan_into(order, self.open_bundle(order), self.rolls[0])
-        self.line.refresh_from_db()
-        self.assertEqual(self.line.outstanding_quantity, Decimal("400.000"))
+    def test_a_bundle_still_open_cannot_be_dispatched(self):
+        """A box still being filled cannot be claimed as shipped."""
+        order = self.roll_backed_order()
+        bundle = self.open_bundle(order)
+        self.scan_into(order, bundle, self.rolls[0])
 
         self.auth(self.admin)
-        dispatched = self.client.post(
-            f"/api/orders/{order.pk}/dispatch/",
-            {"allow_partial": "true", "shortfall_reason": "colour discontinued"},
+        resp = self.client.post(
+            f"/api/orders/{order.pk}/bundles/{bundle['id']}/dispatch/",
+            {"transport_company": self.transport.pk},
             format="json",
         )
-        self.assertEqual(dispatched.status_code, status.HTTP_200_OK, dispatched.data)
-        order.refresh_from_db()
-        self.assertEqual(order.status, "DISPATCHED")
-        self.assertEqual(order.shortfall_reason, "colour discontinued")
-
-        resp = self.client.delete(f"/api/orders/{order.pk}/")
 
         self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
-        self.assertIn("already been dispatched", resp.data["error"])
-        # No partial restoration is attempted for the undispatched remainder.
-        self.assertTrue(Order.objects.filter(pk=order.pk).exists())
+        self.assertIn("Only a sealed bundle", resp.data["error"])
+        order.refresh_from_db()
+        # Only one of the two rolls went in, so the order was never fully packed and
+        # nothing could have been dispatched off the back of it either.
+        self.assertEqual(order.status, "PENDING")
+        self.assertIsNone(PackingBundle.objects.get().dispatched_at)
+
+    def test_a_sealed_but_undispatched_order_still_gives_its_cloth_back(self):
+        """Sealing is not shipping: an undispatched box is still here to be undone."""
+        order = self.roll_backed_order()
+        bundle = self.open_bundle(order)
+        self.scan_into(order, bundle, self.rolls[0])
+        self.seal(order, bundle)
+
+        self.auth(self.admin)
+        resp = self.client.delete(f"/api/orders/{order.pk}/")
+
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT, resp.data)
         self.rolls[0].refresh_from_db()
-        self.assertEqual(self.rolls[0].remaining_meters, ZERO)
+        self.assertEqual(self.rolls[0].remaining_meters, Decimal("600"))
         self.variant.refresh_from_db()
-        self.assertEqual(self.variant.stock_meters, Decimal("400.000"))
+        self.assertEqual(self.variant.stock_meters, Decimal("1000.000"))
 
     def test_deleting_an_order_with_packed_rolls_puts_them_back_on_their_rolls(self):
         order = self.roll_backed_order()
@@ -3563,4 +3522,383 @@ class LineRateOverrideTests(OrderTestBase):
         self.assertIsNotNone(payload["rate_overridden_at"])
         self.assertEqual(payload["line_total"], "800.00")
         self.assertNotIn("rate_override", payload)
+
+
+class BundleDispatchTests(OrderTestBase):
+    """Dispatch is a per-bundle event: a sealed box is what leaves the warehouse.
+
+    These cover the three things that follow from moving dispatch off the order and
+    onto the bundle. Hand-packed metres have to become a bundle so they can be sent
+    at all; one box leaving must leave the order honestly part-dispatched rather than
+    wholly sent; and the transport is one decision for the order, not a fresh choice
+    every time a truck leaves.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # No FabricRoll rows for this variant, so it is a roll-less colour and the
+        # only way to pack it is by typing a figure.
+        self.assertFalse(FabricRoll.objects.filter(variant=self.variant).exists())
+        self.transport = Transport.objects.create(name="VRL Logistics")
+        self.other_transport = Transport.objects.create(name="TC Freight")
+
+        self.order = self.make_draft()
+        self.line = self.add_line(self.order, 100)
+        self.place(self.order)
+        self.order.refresh_from_db()
+
+    # -- helpers -----------------------------------------------------------
+
+    def pack_line(self, line=None, metres="100", **extra):
+        line = line or self.line
+        body = {"metres": metres}
+        body.update(extra)
+        self.auth(self.admin)
+        return self.client.post(
+            f"/api/orders/{self.order.pk}/items/{line.pk}/pack/",
+            body,
+            format="json",
+        )
+
+    def dispatch_bundle(self, bundle_id, **body):
+        self.auth(self.admin)
+        return self.client.post(
+            f"/api/orders/{self.order.pk}/bundles/{bundle_id}/dispatch/",
+            body,
+            format="json",
+        )
+
+    def bundles(self):
+        self.auth(self.admin)
+        resp = self.client.get(f"/api/orders/{self.order.pk}/bundles/")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        return resp.data
+
+    def reload_order(self):
+        self.order.refresh_from_db()
+        return self.order
+
+    # -- hand-packed metres become a bundle --------------------------------
+
+    def test_roll_less_pack_creates_a_sealed_implicit_bundle(self):
+        """Typing a figure still puts the cloth in a box, so a box is recorded."""
+        resp = self.pack_line(metres="60")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertIsNotNone(resp.data["bundle_id"])
+
+        bundle = PackingBundle.objects.get(pk=resp.data["bundle_id"])
+        # Sealed on arrival: there is no half-typed bundle, the metres are final the
+        # moment the request succeeds.
+        self.assertEqual(bundle.status, "SEALED")
+        self.assertIsNotNone(bundle.sealed_at)
+        self.assertIsNone(bundle.dispatched_at)
+
+        allocation = Allocation.objects.get(round_id=resp.data["round"])
+        self.assertEqual(allocation.bundle_id, bundle.pk)
+        self.assertEqual(allocation.metres, Decimal("60"))
+
+        self.line.refresh_from_db()
+        self.assertEqual(self.line.allocated_quantity, Decimal("60"))
+
+    def test_each_pack_makes_its_own_bundle(self):
+        """Two packs are two boxes, because a bundle means "handed over once"."""
+        self.pack_line(metres="30")
+        self.pack_line(metres="20")
+
+        numbers = list(
+            PackingBundle.objects.order_by("number").values_list("number", flat=True)
+        )
+        self.assertEqual(numbers, [1, 2])
+        # Nothing is left hanging outside a bundle, so the panel has nothing stranded
+        # in its "packed without a bundle" list.
+        self.assertEqual(Allocation.objects.filter(bundle__isnull=True).count(), 0)
+        self.assertEqual(RollAllocation.objects.filter(bundle__isnull=True).count(), 0)
+
+    def test_implicit_bundle_serialises_its_metres_without_a_roll(self):
+        """A box of cloth that was never rolled lists its metres and no roll number."""
+        self.pack_line(metres="45")
+        bundle = self.bundles()[0]
+
+        self.assertEqual(bundle["status"], "SEALED")
+        self.assertEqual(bundle["roll_count"], 0)
+        self.assertFalse(bundle["is_roll_based"])
+        self.assertEqual(bundle["piece_count"], 1)
+        self.assertEqual(bundle["total_metres"], "45.000")
+
+        piece = bundle["rolls"][0]
+        self.assertIsNone(piece["roll"])
+        self.assertEqual(piece["roll_number"], "")
+        self.assertEqual(piece["metres"], "45.000")
+        self.assertEqual(piece["fabric_name"], self.fabric.name)
+
+    def test_roll_tracked_pack_keeps_its_roll_numbers(self):
+        """Packing against named rolls still names them on the slip."""
+        from apps.items.rolls import receive_roll
+
+        FabricVariant.objects.filter(pk=self.variant.pk).update(stock_meters=ZERO)
+        roll = receive_roll(self.variant, Decimal("600"))
+        self.variant.refresh_from_db()
+
+        resp = self.pack_line(metres="25", rolls=[{"roll": roll.pk, "metres": "25"}])
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+
+        bundle = self.bundles()[0]
+        self.assertTrue(bundle["is_roll_based"])
+        self.assertEqual(bundle["roll_count"], 1)
+        self.assertEqual(bundle["rolls"][0]["roll_number"], roll.roll_number)
+        # One piece, not two: the allocation is reachable by both links and must not
+        # be counted twice.
+        self.assertEqual(bundle["piece_count"], 1)
+        self.assertEqual(bundle["total_metres"], "25.000")
+
+    # -- one bundle leaving, order honestly part-dispatched ----------------
+
+    def test_dispatching_one_bundle_leaves_the_order_partially_dispatched(self):
+        second = self.add_line(self.order, 100)
+        self.pack_line(line=self.line, metres="100")
+        self.pack_line(line=second, metres="40")
+
+        bundle = PackingBundle.objects.order_by("number").first()
+        resp = self.dispatch_bundle(bundle.pk, transport_company=self.transport.pk)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data["order_status"], "PARTIALLY_DISPATCHED")
+
+        self.assertEqual(self.reload_order().status, "PARTIALLY_DISPATCHED")
+        bundle.refresh_from_db()
+        self.assertIsNotNone(bundle.dispatched_at)
+
+    def test_fully_packed_and_fully_dispatched_becomes_dispatched(self):
+        self.pack_line(metres="100")
+        bundle = PackingBundle.objects.get()
+
+        resp = self.dispatch_bundle(bundle.pk, transport_company=self.transport.pk)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.assertEqual(resp.data["order_status"], "DISPATCHED")
+
+        order = self.reload_order()
+        self.assertEqual(order.status, "DISPATCHED")
+        self.assertIsNotNone(order.dispatched_at)
+
+    def test_unpacked_line_keeps_the_order_partially_dispatched(self):
+        """Every box gone is not the same as everything gone."""
+        self.pack_line(metres="40")
+        bundle = PackingBundle.objects.get()
+
+        resp = self.dispatch_bundle(bundle.pk, transport_company=self.transport.pk)
+        self.assertEqual(resp.data["order_status"], "PARTIALLY_DISPATCHED")
+        self.assertEqual(self.reload_order().status, "PARTIALLY_DISPATCHED")
+
+    def test_a_part_dispatched_order_can_still_be_packed(self):
+        """Part of the order went out; the rest is still being filled."""
+        second = self.add_line(self.order, 100)
+        self.pack_line(line=self.line, metres="100")
+        bundle = PackingBundle.objects.order_by("number").first()
+        self.dispatch_bundle(bundle.pk, transport_company=self.transport.pk)
+
+        resp = self.pack_line(line=second, metres="30")
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        second.refresh_from_db()
+        self.assertEqual(second.allocated_quantity, Decimal("30"))
+        self.assertEqual(self.reload_order().status, "PARTIALLY_DISPATCHED")
+
+    def test_cancelled_bundle_does_not_hold_up_full_dispatch(self):
+        """A box that was given back never went anywhere, so it is not outstanding."""
+        from apps.items.rolls import receive_roll
+
+        # A scanned, cancellable bundle on the roll-tracked colour...
+        FabricVariant.objects.filter(pk=self.variant.pk).update(stock_meters=ZERO)
+        roll = receive_roll(self.variant, Decimal("600"))
+        self.variant.refresh_from_db()
+
+        self.auth(self.admin)
+        opened = self.client.post(
+            f"/api/orders/{self.order.pk}/bundles/create/", {}, format="json"
+        )
+        self.assertEqual(opened.status_code, status.HTTP_201_CREATED, opened.data)
+        scan = self.client.post(
+            f"/api/orders/{self.order.pk}/bundles/{opened.data['bundle']['id']}/scan/",
+            {"roll": roll.pk},
+            format="json",
+        )
+        self.assertEqual(scan.status_code, status.HTTP_201_CREATED, scan.data)
+        cancel = self.client.post(
+            f"/api/orders/{self.order.pk}/bundles/{opened.data['bundle']['id']}/cancel/",
+            {},
+            format="json",
+        )
+        self.assertEqual(cancel.status_code, status.HTTP_200_OK, cancel.data)
+
+        # Both lines are then packed for real: the scanned line from the roll it came
+        # off, the roll-less line by hand. Only the cancelled bundle is left behind.
+        again = self.pack_line(
+            line=self.line, metres="100", rolls=[{"roll": roll.pk, "metres": "100"}]
+        )
+        self.assertEqual(again.status_code, status.HTTP_200_OK, again.data)
+
+        plain_fabric = Fabric.objects.create(
+            name="Linen 200 GSM", price_per_meter=Decimal("14.00")
+        )
+        plain_variant = FabricVariant.objects.create(
+            fabric=plain_fabric, display_order="Ivory", stock_meters=Decimal("500")
+        )
+        line = self.add_line(self.order, 100, variant=plain_variant)
+        by_hand = self.pack_line(line=line, metres="100")
+        self.assertEqual(by_hand.status_code, status.HTTP_200_OK, by_hand.data)
+
+        for bundle in PackingBundle.objects.filter(
+            dispatched_at__isnull=True
+        ).exclude(status="CANCELLED"):
+            resp = self.dispatch_bundle(
+                bundle.pk, transport_company=self.transport.pk
+            )
+            self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+
+        self.assertEqual(resp.data["order_status"], "DISPATCHED")
+        self.reload_order()
+        self.assertEqual(self.order.status, "DISPATCHED")
+
+    def test_a_bundle_emptied_by_a_reversed_round_does_not_block_dispatch(self):
+        """A hand-packed box whose round was cancelled holds nothing outstanding."""
+        first = self.pack_line(metres="40")
+        self.assertEqual(first.status_code, status.HTTP_200_OK, first.data)
+
+        # Reverse that round through the packing history, the way a mistake is undone.
+        self.auth(self.admin)
+        cancel = self.client.post(
+            f"/api/orders/packing-rounds/{first.data['round']}/cancel/", {}, format="json"
+        )
+        self.assertEqual(cancel.status_code, status.HTTP_200_OK, cancel.data)
+
+        self.pack_line(metres="100")
+        second = PackingBundle.objects.order_by("number").last()
+        resp = self.dispatch_bundle(second.pk, transport_company=self.transport.pk)
+        self.assertEqual(resp.data["order_status"], "DISPATCHED")
+
+    def test_dispatch_writes_an_order_log(self):
+        self.pack_line(metres="100")
+        bundle = PackingBundle.objects.get()
+        self.dispatch_bundle(bundle.pk, transport_company=self.transport.pk)
+
+        log = OrderLog.objects.filter(
+            order=self.order, action="DISPATCHED"
+        ).latest("id")
+        self.assertEqual(log.details["bundle"], bundle.code)
+        self.assertEqual(log.details["transport"], "VRL Logistics")
+
+    # -- guards ------------------------------------------------------------
+
+    def test_open_bundle_cannot_be_dispatched(self):
+        """An open box is still being filled; dispatching it would promise too much."""
+        self.auth(self.admin)
+        created = self.client.post(
+            f"/api/orders/{self.order.pk}/bundles/create/", {}, format="json"
+        )
+        self.assertEqual(created.status_code, status.HTTP_201_CREATED, created.data)
+        bundle_id = created.data["bundle"]["id"]
+
+        resp = self.dispatch_bundle(bundle_id, transport_company=self.transport.pk)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("not sealed", resp.data["error"])
+        self.assertEqual(self.reload_order().status, "PENDING")
+
+    def test_a_bundle_cannot_be_dispatched_twice(self):
+        self.pack_line(metres="100")
+        bundle = PackingBundle.objects.get()
+        self.dispatch_bundle(bundle.pk, transport_company=self.transport.pk)
+
+        resp = self.dispatch_bundle(bundle.pk)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already been dispatched", resp.data["error"])
+
+    def test_dispatch_requires_a_transport_on_the_first_bundle(self):
+        self.pack_line(metres="100")
+        bundle = PackingBundle.objects.get()
+
+        resp = self.dispatch_bundle(bundle.pk)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("no transport yet", resp.data["error"])
+        bundle.refresh_from_db()
+        self.assertIsNone(bundle.dispatched_at)
+
+    def test_transport_is_reused_and_cannot_be_swapped(self):
+        """The transport is one decision for the order, not a per-truck choice."""
+        second = self.add_line(self.order, 100)
+        third = self.add_line(self.order, 100)
+        self.pack_line(line=self.line, metres="100")
+        self.pack_line(line=second, metres="100")
+        first, other = PackingBundle.objects.order_by("number")[:2]
+
+        self.dispatch_bundle(first.pk, transport_company=self.transport.pk)
+
+        # Naming the same transport again is simply accepted -- the order already
+        # knows it, so the caller is not asked anything.
+        resp = self.dispatch_bundle(other.pk, transport_company=self.transport.pk)
+        self.assertEqual(resp.status_code, status.HTTP_200_OK, resp.data)
+        self.reload_order()
+        self.assertEqual(self.order.transport_company_id, self.transport.pk)
+
+        # A different one is refused rather than rewriting where the first box went.
+        self.pack_line(line=third, metres="100")
+        last = PackingBundle.objects.order_by("number").last()
+        resp = self.dispatch_bundle(last.pk, transport_company=self.other_transport.pk)
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST)
+        self.assertIn("already going on", resp.data["error"])
+        self.reload_order()
+        self.assertEqual(self.order.transport_company_id, self.transport.pk)
+        last.refresh_from_db()
+        self.assertIsNone(last.dispatched_at)
+
+    # -- there is no whole-order dispatch ---------------------------------
+
+    def test_there_is_no_whole_order_dispatch_endpoint(self):
+        """A dispatch is a box leaving, so the order itself has nothing to dispatch.
+
+        The old endpoint is gone rather than deprecated: leaving it in place would
+        offer a second way of claiming cloth has gone out, and the two would not
+        agree on what a partly dispatched order means.
+        """
+        self.pack_line(metres="100")
+        self.auth(self.admin)
+        resp = self.client.post(
+            f"/api/orders/{self.order.pk}/dispatch/",
+            {"transport_company": self.transport.pk},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, status.HTTP_404_NOT_FOUND)
+        # Nothing was claimed on the way past: the box is still waiting and the
+        # order is still short.
+        self.assertEqual(
+            PackingBundle.objects.filter(dispatched_at__isnull=True).count(), 1
+        )
+        self.assertEqual(self.reload_order().status, "PACKED")
+
+    # -- deleting an order that is only partly out of the door ------------
+
+    def test_deleting_a_part_dispatched_order_returns_only_the_undispatched_cloth(self):
+        """A box on a truck stays gone; the one on the shelf comes back."""
+        second = self.add_line(self.order, 100)
+        shipped = self.pack_line(line=self.line, metres="100")
+        waiting = self.pack_line(line=second, metres="100")
+        self.assertEqual(shipped.status_code, status.HTTP_200_OK, shipped.data)
+        self.assertEqual(waiting.status_code, status.HTTP_200_OK, waiting.data)
+
+        gone, here = PackingBundle.objects.order_by("number")
+        self.dispatch_bundle(gone.pk, transport_company=self.transport.pk)
+        self.assertEqual(self.reload_order().status, "PARTIALLY_DISPATCHED")
+
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2200.000"))
+
+        self.auth(self.admin)
+        resp = self.client.delete(f"/api/orders/{self.order.pk}/")
+        self.assertEqual(resp.status_code, status.HTTP_204_NO_CONTENT, resp.data)
+
+        # Only the 100 m that was still on the shelf came back.
+        self.variant.refresh_from_db()
+        self.assertEqual(self.variant.stock_meters, Decimal("2300.000"))
+
+        log = OrderLog.objects.filter(action="ORDER_DELETED").latest("id")
+        self.assertEqual(log.details["metres_returned_to_stock"], "100.000")
+        self.assertEqual(log.details["bundles_dispatched"], 1)
+
 

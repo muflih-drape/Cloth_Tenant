@@ -18,7 +18,7 @@ scanned roll must belong to a bundle and a bundle is an order-level thing.
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
-from django.db.models import F
+from django.db.models import F, Max
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from drf_spectacular.utils import extend_schema
@@ -43,7 +43,14 @@ from apps.orders.allocation import (
     outstanding_lines,
     sync_order_after_allocation,
 )
-from apps.orders.models import Allocation, Order, OrderItem, PackingRound
+from apps.orders.models import (
+    Allocation,
+    Order,
+    OrderItem,
+    PackingBundle,
+    PackingRound,
+    RollAllocation,
+)
 from apps.orders.serializers import (
     MIN_ORDER_METERS,
     AllocationSerializer,
@@ -114,7 +121,6 @@ def _serialise_plan(plan, variant=None):
 
 def _roll_usage(packing_round):
     """The roll-level records behind a confirmed round, for the response body."""
-    from apps.orders.models import RollAllocation
 
     entries = RollAllocation.objects.filter(
         allocation__round=packing_round
@@ -515,6 +521,38 @@ def _apply_plan(packing_round, stored, user, note=""):
     return packing_round
 
 
+def _create_implicit_bundle(order, user):
+    """Wrap a hand-packed line in a bundle that is finished the moment it is born.
+
+    Packing a line by typing a figure rather than scanning it still puts the cloth
+    in a box, so it still has to be a bundle -- otherwise dispatch, which works in
+    bundles, would have nothing to send for a colour the warehouse does not track in
+    rolls. The bundle is created already ``SEALED``: there is no partial state to
+    work through, because the metres are entered in one go and are final the moment
+    the request succeeds. That is what makes it *implicit* -- the user never names
+    or opens it, it simply exists as the thing these metres left in.
+
+    One action makes one bundle. A bundle here means "one box, handed over once",
+    and a single typed figure is exactly that; grouping several clicks into a shared
+    box would need to guess where one box ends and the next begins, which is not a
+    decision this should be making on the warehouse's behalf.
+
+    Numbering is taken under the order lock by the caller, matching
+    ``create_bundle``, so a hand pack and a scanned bundle cannot claim the same
+    number at the same moment.
+    """
+    highest = (
+        PackingBundle.objects.filter(order=order).aggregate(top=Max("number")).get("top")
+    )
+    return PackingBundle.objects.create(
+        order=order,
+        number=(highest or 0) + 1,
+        status="SEALED",
+        sealed_at=timezone.now(),
+        created_by=user,
+    )
+
+
 @extend_schema(
     methods=["POST"],
     summary="Pack a single order line straight from the order page",
@@ -534,11 +572,16 @@ def pack_line(request, order_id, item_id):
     history. The note says where it came from, so a single-line pack is
     distinguishable from a board round after the fact.
 
-    Unlike placing an order, this really does take cloth off the roll, so a
-    figure the warehouse cannot cover is refused rather than reported. That is
-    the *only* limit: the admin may enter less than the line still owes (leaving
+Unlike placing an order, this really does take cloth off the roll, so a
+    figure the warehouse cannot cover is refused rather than reported. That is the
+    *only* limit: the admin may enter less than the line still owes (leaving
     the remainder owed) or more than it owes (a roll is cut whole, and rounding it
     up is deliberate). Either way exactly the metres entered come off the roll.
+
+    The metres also leave in a bundle. Whatever the cloth was packed against, this
+    is a box handed over once, so it is sealed into an implicit bundle for dispatch
+    to act on -- for a roll-tracked colour the named rolls are linked to that bundle
+    as well, so the packing slip still names the roll each metre came off.
     """
     order = get_object_or_404(Order, pk=order_id)
     line = get_object_or_404(
@@ -573,6 +616,7 @@ def pack_line(request, order_id, item_id):
         ]
     note = f"Packed directly from order #{order.pk}"
 
+    bundle = None
     try:
         with transaction.atomic():
             # Re-read the roll under a lock: a round confirmed from the packing
@@ -604,6 +648,20 @@ def pack_line(request, order_id, item_id):
             # Moves the stock, writes the allocation, promotes the order and logs
             # it. Deliberately the only writer of stock_meters on this path.
             _apply_plan(packing_round, plan, request.user)
+
+            # Everything this call just packed belongs to one box. Taken under the
+            # order lock so the bundle number cannot collide with a bundle being
+            # opened at the same moment.
+            locked_order = Order.objects.select_for_update().get(pk=order.pk)
+            bundle = _create_implicit_bundle(locked_order, request.user)
+            packed = Allocation.objects.filter(round=packing_round)
+            packed.update(bundle=bundle)
+            # A named roll keeps its own link so the slip can name it; without this
+            # the metres would reach the bundle through the allocation alone and the
+            # roll numbers would be lost.
+            RollAllocation.objects.filter(
+                allocation__round=packing_round, is_reversed=False
+            ).update(bundle=bundle)
     except ValueError as exc:
         return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -626,6 +684,8 @@ def pack_line(request, order_id, item_id):
             "item": OrderItemSerializer(line).data,
             "stock_meters": str(locked_variant.stock_meters),
             "rolls": _roll_usage(packing_round),
+            "bundle_id": bundle.pk if bundle is not None else None,
+            "bundle_code": bundle.code if bundle is not None else None,
         }
     )
 

@@ -37,6 +37,14 @@ const statusConfig: Record<
     text: "text-blue-700",
     label: "Packed",
   },
+  // Between packed and dispatched: some sealed bundles have gone on a truck and
+  // others have not, so the badge sits deliberately between the two rather than
+  // claiming the order is finished.
+  PARTIALLY_DISPATCHED: {
+    bg: "bg-teal-100",
+    text: "text-teal-700",
+    label: "Partly dispatched",
+  },
   DISPATCHED: {
     bg: "bg-green-100",
     text: "text-green-700",

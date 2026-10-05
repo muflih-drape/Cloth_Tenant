@@ -7,7 +7,10 @@ interface MetresSelectorProps {
     /** Held as a string so a half-metre cut is never rounded away mid-typing. */
     metres: string;
     onChange: (metres: string) => void;
+    /** Physically in the warehouse. Becomes available stock as orders claim it. */
     onHandMetres: number;
+    /** Not already promised to another order. May be negative. */
+    availableMetres: number;
     isEditMode?: boolean;
 }
 
@@ -22,10 +25,21 @@ export default function MetresSelector({
     metres,
     onChange,
     onHandMetres,
+    availableMetres,
     isEditMode,
 }: MetresSelectorProps) {
     const requested = toMeters(metres);
-    const oversubscribed = requested > onHandMetres;
+    /**
+     * Warn against what is left rather than what is on the shelf.
+     *
+     * Stock on hand is what the warehouse holds; availability is what is still
+     * unclaimed, so it is the figure that says whether this order can actually be
+     * filled. Two orders can each ask for more than remains and both be flagged,
+     * which is the point -- packing decides who gets cloth, not this screen. So
+     * this stays a note and never blocks the line.
+     */
+    const oversubscribed = requested > availableMetres;
+    const availableNegative = availableMetres < 0;
 
     return (
         <div>
@@ -40,11 +54,21 @@ export default function MetresSelector({
             )}
 
             <div className="mb-4 bg-white p-6 rounded-[32px] border border-gray-100 shadow-sm">
-                <div className="flex items-center justify-between">
+                <div className="flex items-start justify-between gap-4">
                     <h3 className="font-bold text-gray-900">Metres needed</h3>
-                    <span className="text-xs text-gray-400 font-medium">
-                        {formatMeters(onHandMetres)} m on hand
-                    </span>
+                    <div className="text-right">
+                        <p
+                            className={`text-xs font-bold ${
+                                availableNegative ? "text-red-600" : "text-gray-700"
+                            }`}
+                            data-testid="available-metres"
+                        >
+                            {formatMeters(availableMetres)} m available
+                        </p>
+                        <p className="text-[11px] text-gray-400 font-medium">
+                            On hand: {formatMeters(onHandMetres)} m
+                        </p>
+                    </div>
                 </div>
 
                 <div className="mt-4 flex items-center justify-between gap-4">
@@ -95,10 +119,22 @@ export default function MetresSelector({
                 <div className="mb-6 p-4 bg-amber-50 border border-amber-100 rounded-2xl flex items-start gap-3 text-amber-600">
                     <AlertTriangle size={18} className="shrink-0 mt-0.5" />
                     <p className="text-xs font-bold uppercase tracking-wider leading-relaxed">
-                        More than we hold ({formatMeters(requested)} m asked,{" "}
-                        {formatMeters(onHandMetres)} m on hand). The order can
-                        still go ahead — packing will allocate what is available
-                        and the rest stays owed.
+                        {availableNegative ? (
+                            <>
+                                Already oversold by{" "}
+                                {formatMeters(Math.abs(availableMetres))} m against
+                                existing orders. Adding{" "}
+                                {formatMeters(requested)} m takes it further.
+                            </>
+                        ) : (
+                            <>
+                                More than is free ({formatMeters(requested)} m
+                                asked, {formatMeters(availableMetres)} m
+                                available). The order can still go ahead — packing
+                                will allocate what is available and the rest
+                                stays owed.
+                            </>
+                        )}
                     </p>
                 </div>
             )}

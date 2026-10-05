@@ -73,7 +73,10 @@ export default function AgentOrderList({
             search: debouncedSearch,
             status:
               pageOrderStatus === "PROCESSING"
-                ? ["PENDING", "PACKED", "DRAFT"]
+                // Still being worked on. PARTIALLY_DISPATCHED is in here because
+                // such an order still owes cloth and still has sealed bundles
+                // waiting to go out, so an agent may well need to see it.
+                ? ["PENDING", "PACKED", "DRAFT", "PARTIALLY_DISPATCHED"]
                 : ["DISPATCHED"],
             customer: selectedCustomer !== "all" ? selectedCustomer : undefined,
           });

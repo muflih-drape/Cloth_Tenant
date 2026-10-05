@@ -40,8 +40,14 @@ export default function OrderDetailItems({
     }
   };
 
+  // A partly dispatched order is still live work: bundles have gone out, but the
+// order can still owe cloth and can still have sealed bundles waiting in the
+// warehouse. Only a fully dispatched order is out of reach.
   const isEditable =
-    status === "DRAFT" || status === "PENDING" || status === "PACKED";
+    status === "DRAFT" ||
+    status === "PENDING" ||
+    status === "PACKED" ||
+    status === "PARTIALLY_DISPATCHED";
 
   return (
     <>

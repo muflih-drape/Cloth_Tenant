@@ -135,14 +135,10 @@ export interface PlaceOrderResponse {
   notice: string | null;
 }
 
-export interface DispatchResponse {
-  message?: string;
-  id?: number;
-  status?: OrderStatus;
-  error?: string;
-  unallocated_lines?: ShortfallLine[];
-  hint?: string;
-}
+/**
+ * No longer used: dispatch is done one sealed bundle at a time, so its answer is
+ * `BundleDispatchResponse` below. There is no whole-order dispatch to answer for.
+ */
 
 export interface OrderRegisterRequest {
   customer: number;
@@ -313,6 +309,16 @@ export interface PackLineResponse {
   item: OrderItem;
   stock_meters: string;
   rolls?: RollHistoryEntry[];
+  /**
+   * The sealed bundle these metres were packed into.
+   *
+   * Packing a line always puts the cloth in a box, so it can be dispatched like any
+   * other bundle. There is no state to work through first, so this bundle is created
+   * already sealed.
+   */
+  bundle_id: number | null;
+  /** Its human-readable code, for a confirmation the user can read back. */
+  bundle_code: string | null;
 }
 
 /**
@@ -323,14 +329,28 @@ export interface PackLineResponse {
 export type PackingBundleStatus = "OPEN" | "SEALED" | "CANCELLED";
 
 /**
- * One roll sitting in a bundle, with the order line it was cut for and the money
- * on that line. `rate_per_meter` is the rate agreed for this customer, snapshotted
- * onto the line, so a slip printed today matches the invoice for the same cloth.
+ * One piece of cloth sitting in a bundle, with the order line it was packed for and
+ * the money on that line. `rate_per_meter` is the rate agreed for this customer,
+ * snapshotted onto the line, so a slip printed today matches the invoice for the
+ * same cloth.
+ *
+ * A piece is either a scanned roll or metres a warehouse worker typed in for a
+ * colour the warehouse does not track in rolls. Both arrive here in the same shape
+ * so the panel and the slip can treat a bundle the same way either way it was
+ * filled: `roll` and `roll_number` are null/empty for a hand-packed piece, because
+ * there was no roll for it to come off.
  */
 export interface PackingBundleRoll {
-  /** Primary key of the RollAllocation -- what "Remove from bundle" names. */
+  /**
+   * What "Remove from bundle" names: the RollAllocation for a scanned roll, or the
+   * Allocation for a hand-packed piece, which has no RollAllocation of its own.
+   */
   id: number;
-  roll: number;
+  /** Always the Allocation row behind this piece, whatever kind it is. */
+  allocation_id: number;
+  /** Null for a hand-packed piece. */
+  roll: number | null;
+  /** Empty for a hand-packed piece -- the slip leaves that cell blank. */
   roll_number: string;
   colour: string;
   fabric: string;
@@ -357,13 +377,28 @@ export interface PackingBundle {
   status: PackingBundleStatus;
   created_at: string;
   sealed_at: string | null;
+  /**
+   * When this sealed bundle went out on a truck, or null while it is still here.
+   *
+   * Dispatch is tracked here rather than as a status of its own, so a dispatched
+   * bundle stays the sealed bundle whose slip was printed -- which is the record you
+   * most want to keep able to reprint once the truck has gone.
+   */
+  dispatched_at: string | null;
+  is_dispatched: boolean;
   created_by: string | null;
   order: number;
   order_number: number;
   customer: string;
   customer_address: string;
+  /** Every piece in the box, scanned rolls first, then hand-packed metres. */
   rolls: PackingBundleRoll[];
+  /** How many of those pieces came off a real roll. Zero for a hand-packed box. */
   roll_count: number;
+  /** How many pieces the box holds altogether. */
+  piece_count: number;
+  /** False when the box holds only metres that were never rolled. */
+  is_roll_based: boolean;
   total_metres: string;
   total_value: string;
 }
@@ -386,6 +421,17 @@ export interface ScanIntoBundleResponse {
 export interface BundleMutationResponse {
   message: string;
   order_status?: OrderStatus;
+  bundle: PackingBundle;
+}
+
+/**
+ * The answer to sending one bundle out. `order_status` is always present here --
+ * unlike a seal or a cancel, dispatch always moves the order somewhere, or says why
+ * it did not.
+ */
+export interface BundleDispatchResponse {
+  message: string;
+  order_status: OrderStatus;
   bundle: PackingBundle;
 }
 

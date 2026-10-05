@@ -1,8 +1,8 @@
 import type {
   AddOrderItemRequest,
+  BundleDispatchResponse,
   BundleMutationResponse,
   CreatePackingBundleResponse,
-  DispatchResponse,
   MergeOrderItemsRequest,
   OrderAllResponse,
   OrderRegisterRequest,
@@ -197,23 +197,6 @@ export const orderApi = {
     return api
       .post<PlaceOrderResponse>(`/api/orders/${id}/place-order/`, data)
       .then((r) => r.data);
-  },
-
-  /**
-   * Ship an order. Rejected while any line is unallocated, unless
-   * `allow_partial` is set -- which then also requires a `shortfall_reason`,
-   * because shipping short is a decision someone has to own.
-   */
-  dispatchOrder(
-    id: number,
-    data?: {
-      transport_company?: number | null;
-      lr_number?: string;
-      allow_partial?: boolean;
-      shortfall_reason?: string;
-    },
-  ): Promise<DispatchResponse> {
-    return api.post<DispatchResponse>(`/api/orders/${id}/dispatch/`, data).then((r) => r.data);
   },
 
   /**
@@ -467,6 +450,28 @@ export const packingApi = {
       .post<BundleMutationResponse>(
         `/api/orders/${orderId}/bundles/${bundleId}/cancel/`,
         {},
+      )
+      .then((r) => r.data);
+  },
+
+  /**
+   * Send one sealed bundle out. This is the unit of dispatch: a finished box of cloth
+   * is the smallest thing that can honestly be called shipped, and one truck may take
+   * the first two boxes and come back for the third.
+   *
+   * `transport_company` is only needed for the first bundle to leave on an order --
+   * the transport is chosen once and reused, so a later bundle carrying a different
+   * one is refused rather than quietly rewriting where the earlier boxes went.
+   */
+  dispatchBundle(
+    orderId: number,
+    bundleId: number,
+    data?: { transport_company?: number | null },
+  ): Promise<BundleDispatchResponse> {
+    return api
+      .post<BundleDispatchResponse>(
+        `/api/orders/${orderId}/bundles/${bundleId}/dispatch/`,
+        data ?? {},
       )
       .then((r) => r.data);
   },
