@@ -29,15 +29,15 @@ describe("buildFabricPayload", () => {
 
   it("sends the rolls alongside the opening figure", () => {
     // The figure is still sent, because it is the same field for a roll-less
-    // colour. The API ignores it when rolls are present, which is what stops the
-    // two being added together.
+    // colour. The API adds the two together and records the figure as a roll of
+    // its own, so both count.
     const payload = buildFabricPayload(common, [
-      colour({ rolls: [{ meters: "500", note: "" }, { meters: "450", note: "" }] }),
+      colour({ rolls: [{ meters: "500" }, { meters: "450" }] }),
     ]);
     expect(payload.variants[0].stock_meters).toBe("1000");
     expect(payload.variants[0].rolls).toEqual([
-      { meters: "500", note: "" },
-      { meters: "450", note: "" },
+      { meters: "500" },
+      { meters: "450" },
     ]);
   });
 
@@ -53,7 +53,7 @@ describe("buildFabricPayload", () => {
 
   it("keeps each colour's own rolls to itself", () => {
     const payload = buildFabricPayload(common, [
-      colour({ displayOrder: "Natural", rolls: [{ meters: "500", note: "" }] }),
+      colour({ displayOrder: "Natural", rolls: [{ meters: "500" }] }),
       colour({ displayOrder: "Ivory", stockMeters: "750" }),
     ]);
     expect(payload.variants[0].rolls).toHaveLength(1);
@@ -64,12 +64,12 @@ describe("buildFabricPayload", () => {
 
 describe("fabricToFormData with rolls", () => {
   it("writes one bracketed pair of keys per roll", () => {
-    // This is the multipart shape the Django serializer's ListField parses.
+    // This is the multipart shape the Django serializer's roll field parses.
     const form = fabricToFormData(
       buildFabricPayload(common, [
         colour({
           stockMeters: "1000",
-          rolls: [{ meters: "500", note: "" }, { meters: "450", note: "" }],
+          rolls: [{ meters: "500" }, { meters: "450" }],
         }),
       ]),
     );
@@ -80,21 +80,39 @@ describe("fabricToFormData with rolls", () => {
     expect(form.get("variants[0]rolls[0][note]")).toBeNull();
   });
 
+  it("writes one key per roll for a row entered as 100 m five times over", () => {
+    // The dialog expands a "100 m x5" row into five entries before they get here,
+    // so the wire shape is the same one row per roll has always been.
+    const form = fabricToFormData(
+      buildFabricPayload(common, [
+        colour({
+          stockMeters: "1000",
+          rolls: Array(5).fill({ meters: "100" }),
+        }),
+      ]),
+    );
+
+    expect(form.get("variants[0]stock_meters")).toBe("1000");
+    for (let i = 0; i < 5; i++) {
+      expect(form.get(`variants[0]rolls[${i}][meters]`)).toBe("100");
+    }
+    expect(form.get("variants[0]rolls[5][meters]")).toBeNull();
+  });
+
   it("indexes each colour's rolls separately", () => {
     const form = fabricToFormData(
       buildFabricPayload(common, [
-        colour({ displayOrder: "Natural", rolls: [{ meters: "500", note: "" }] }),
+        colour({ displayOrder: "Natural", rolls: [{ meters: "500" }] }),
         colour({
           displayOrder: "Ivory",
           stockMeters: "0",
-          rolls: [{ meters: "300", note: "bin 2" }],
+          rolls: [{ meters: "300" }],
         }),
       ]),
     );
 
     expect(form.get("variants[0]rolls[0][meters]")).toBe("500");
     expect(form.get("variants[1]rolls[0][meters]")).toBe("300");
-    expect(form.get("variants[1]rolls[0][note]")).toBe("bin 2");
   });
 
   it("adds no roll keys for a roll-less colour", () => {

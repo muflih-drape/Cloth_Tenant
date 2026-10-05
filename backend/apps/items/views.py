@@ -639,7 +639,6 @@ class FabricVariantViewSet(ModelViewSet):
                 serializer.validated_data["meters"],
                 roll_number=serializer.validated_data.get("roll_number"),
                 note=serializer.validated_data.get("note", ""),
-                created_by=request.user,
             )
         except RollError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)
@@ -668,7 +667,6 @@ class FabricVariantViewSet(ModelViewSet):
             created, total, variant = receive_rolls(
                 variant,
                 serializer.validated_data["rolls"],
-                created_by=request.user,
             )
         except RollError as exc:
             return Response({"error": str(exc)}, status=status.HTTP_400_BAD_REQUEST)

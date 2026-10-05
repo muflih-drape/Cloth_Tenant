@@ -232,11 +232,11 @@ export interface CustomerRequirementResponse {
 /**
  * One roll the admin is receiving on the create screen. Structurally the same as
  * `RollDraft` in `components/items/receiveRollsDialog`, declared here so the
- * types stay free of component imports.
+ * types stay free of component imports. A delivery is recorded by its lengths
+ * alone, so there is no note to carry.
  */
 export interface VariantRollDraft {
   meters: string;
-  note: string;
 }
 
 export interface ColorVariant {

@@ -2,7 +2,6 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
-  AlertTriangle,
   ChevronDown,
   ChevronUp,
   History,
@@ -16,11 +15,15 @@ import {
 import { rollApi } from "@/lib/api/item";
 import { toastError, toastSuccess } from "@/lib/toast";
 import { formatMeters } from "@/types/item";
-import type { FabricRoll, RollHistoryEntry, VariantRollsResponse } from "@/types/item";
-import ReceiveRollsDialog, { type RollDraft } from "./receiveRollsDialog";
+import type {
+  FabricRoll,
+  RollHistoryEntry,
+  VariantRollDraft,
+  VariantRollsResponse,
+} from "@/types/item";
+import ReceiveRollsDialog from "./receiveRollsDialog";
 import RollLabelDialog from "./rollLabelDialog";
 import RollSummary from "./rollSummary";
-import { Modal, ModalButton } from "@/components/ui/custom/Modals";
 
 interface Props {
   variantId: number;
@@ -60,16 +63,6 @@ export default function PhysicalRollsPanel({
   const [shownVariant, setShownVariant] = useState<number | null>(null);
   const [expanded, setExpanded] = useState(false);
   const [receiveOpen, setReceiveOpen] = useState(false);
-  /**
-   * A delivery waiting on the admin's answer to "this replaces your opening
-   * figure?". Held rather than sent straight away, because the first roll onto a
-   * colour that was created with a plain metre figure makes the stock drop from
-   * that figure to the roll total -- correct, but not something to do silently.
-   */
-  const [pendingReplace, setPendingReplace] = useState<{
-    drafts: RollDraft[];
-    untracked: number;
-  } | null>(null);
   const [historyFor, setHistoryFor] = useState<FabricRoll | null>(null);
   const [labelFor, setLabelFor] = useState<FabricRoll | null>(null);
   const [adjusting, setAdjusting] = useState<number | null>(null);
@@ -96,12 +89,12 @@ export default function PhysicalRollsPanel({
 
   useEffect(() => {
     let cancelled = false;
-fetchRolls()
-        .then((rolls) => {
-          if (cancelled) return;
-          setData(rolls);
-          notifyStock.current?.(rolls.stock_meters, rolls.roll_count);
-        })
+    fetchRolls()
+      .then((rolls) => {
+        if (cancelled) return;
+        setData(rolls);
+        notifyStock.current?.(rolls.stock_meters, rolls.roll_count);
+      })
       .catch((e) => {
         if (!cancelled) toastError("Failed to load rolls", e);
       })
@@ -126,12 +119,9 @@ fetchRolls()
     }
   };
 
-  const submitReceive = async (drafts: RollDraft[]) => {
+  const submitReceive = async (drafts: VariantRollDraft[]) => {
     if (drafts.length === 1) {
-      await rollApi.receive(variantId, {
-        meters: drafts[0].meters,
-        ...(drafts[0].note ? { note: drafts[0].note } : {}),
-      });
+      await rollApi.receive(variantId, { meters: drafts[0].meters });
       toastSuccess(`Received ${formatMeters(drafts[0].meters)} m`);
     } else {
       const result = await rollApi.bulkReceive(variantId, drafts);
@@ -143,38 +133,16 @@ fetchRolls()
   };
 
   /**
-   * A colour created with a plain metre figure has stock that belongs to no roll.
-   * Its first real roll replaces that figure -- adding them would count the same
-   * cloth twice -- so the swap is confirmed first. Once a colour has a roll this
-   * is never reached again: receiving then genuinely adds stock, as always.
+   * Receiving always adds. A colour opened with a plain metre figure keeps it --
+   * the API records that figure as a roll of its own, so it can still be cut and
+   * still counts towards the roll total.
    */
-  const handleReceive = async (drafts: RollDraft[]) => {
-    const untracked =
-      data && data.roll_count === 0 ? Number(data.stock_meters) || 0 : 0;
-
-    if (untracked > 0) {
-      setPendingReplace({ drafts, untracked });
-      return;
-    }
-
+  const handleReceive = async (drafts: VariantRollDraft[]) => {
     try {
       await submitReceive(drafts);
     } catch (e) {
       // Re-throw so the dialog can show the message beside the rows it came from.
       throw e;
-    }
-  };
-
-  /** The confirmed answer to the warning above. */
-  const confirmReplace = async () => {
-    const job = pendingReplace;
-    setPendingReplace(null);
-    if (!job) return;
-    try {
-      await submitReceive(job.drafts);
-    } catch (e) {
-      // The receive dialog has already closed, so this one is reported as a toast.
-      toastError("Could not receive these rolls", e);
     }
   };
 
@@ -271,9 +239,9 @@ fetchRolls()
                 >
                   <div className="flex items-center gap-2">
                     <RollSummary roll={roll} />
-                  <button
-                    type="button"
-                    onClick={() => setHistoryFor(roll)}
+                    <button
+                      type="button"
+                      onClick={() => setHistoryFor(roll)}
                       className="p-1.5 rounded-lg text-gray-400 hover:text-primary hover:bg-primary/5 transition-colors"
                       aria-label={`History for ${roll.roll_number}`}
                       title="History"
@@ -366,34 +334,8 @@ fetchRolls()
         open={receiveOpen}
         onClose={() => setReceiveOpen(false)}
         onConfirm={handleReceive}
-        label={`${label} (${data.display_order || "unlabelled"})`}
+        label={label}
       />
-
-      {pendingReplace && (
-        <Modal
-          icon={<AlertTriangle size={18} className="text-amber-600" />}
-          iconBg="bg-amber-100"
-          title="Replace untracked stock?"
-          description={
-            `This colour currently has ${formatMeters(String(pendingReplace.untracked))} m ` +
-            "of stock that is not tracked on any roll. Adding a physical roll makes " +
-            "its stock roll-tracked, and the rolls become the total — so that " +
-            `${formatMeters(String(pendingReplace.untracked))} m will no longer be counted. ` +
-            "Continue?"
-          }
-          onClose={() => setPendingReplace(null)}
-          actions={
-            <>
-              <ModalButton variant="ghost" onClick={() => setPendingReplace(null)}>
-                Cancel
-              </ModalButton>
-              <ModalButton variant="primary" onClick={confirmReplace}>
-                Replace stock
-              </ModalButton>
-            </>
-          }
-        />
-      )}
 
       {historyFor && (
         <RollHistoryDialog

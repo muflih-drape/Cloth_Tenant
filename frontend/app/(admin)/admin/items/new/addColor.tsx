@@ -9,12 +9,10 @@ import StockFlowButton from "@/components/ui/custom/stockFlowButton";
 import CropModal from "./cropModal";
 import CommonDetailsBadge from "./commonDetailsBadge";
 import { ColorVariant, FabricDetails } from "@/types/item";
-import { formatMeters } from "@/types/item";
+import { formatMeters, roundMetres, toMeters } from "@/types/item";
 import { Modal, ModalButton } from "@/components/ui/custom/Modals";
 import { normalizeImageFile } from "@/lib/image-utils";
-import ReceiveRollsDialog, {
-  type RollDraft,
-} from "@/components/items/receiveRollsDialog";
+import ReceiveRollsDialog from "@/components/items/receiveRollsDialog";
 import { Package, Plus } from "lucide-react";
 
 interface Props {
@@ -57,6 +55,8 @@ export default function Step2AddColor({
     return sum + (Number.isFinite(metres) ? metres : 0);
   }, 0);
   const hasRolls = rolls.length > 0;
+  /** Opening figure plus the rolls: what this colour will hold once saved. */
+  const combinedTotal = roundMetres(rollTotal + toMeters(stockInput));
 
   const galleryRef = useRef<HTMLInputElement>(null);
   const cameraRef = useRef<HTMLInputElement>(null);
@@ -248,11 +248,12 @@ export default function Step2AddColor({
             {stockError ? (
               <p className="mt-1.5 text-xs text-red-600">{stockError}</p>
             ) : hasRolls ? (
-              // Once rolls exist they are the stock, so the figure above is not
-              // added on top of them. Said plainly, because the two can differ.
+              // Both count: the figure is the cloth already on hand and the rolls
+              // are the shipment, so the total is the two added together.
               <p className="mt-1.5 text-xs text-gray-400">
-                Ignored while this colour has rolls: its stock will be the{" "}
-                {formatMeters(String(rollTotal))} m they hold.
+                Added to the {formatMeters(String(rollTotal))} m on these rolls:{" "}
+                {formatMeters(String(combinedTotal))} m on hand. The figure is kept
+                as a roll of its own, so it can still be cut.
               </p>
             ) : (
               <p className="mt-1.5 text-xs text-gray-400">
@@ -283,7 +284,6 @@ export default function Step2AddColor({
                           className="text-[11px] text-gray-500 truncate"
                         >
                           Roll {i + 1}: {formatMeters(roll.meters)} m
-                          {roll.note ? ` · ${roll.note}` : ""}
                         </li>
                       ))}
                     </ul>
@@ -331,12 +331,12 @@ export default function Step2AddColor({
       <ReceiveRollsDialog
         open={rollsOpen}
         onClose={() => setRollsOpen(false)}
-        onConfirm={async (drafts: RollDraft[]) => {
+        onConfirm={async (drafts) => {
           set("rolls", drafts);
         }}
-        // A whole delivery is received by length only, so a note box here could
-        // not be saved. Hidden rather than quietly discarded.
-        showNote={false}
+        // Reseeded from what is already typed in, so reopening the dialog to
+        // correct the third roll does not start from a blank sheet.
+        initialRolls={rolls}
         label={`${common.name} — ${variant.displayOrder || `Colour #${variantIndex}`}`}
       />
 

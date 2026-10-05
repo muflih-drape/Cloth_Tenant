@@ -30,6 +30,7 @@ from rest_framework import status
 from apps.items.models import Fabric, FabricRoll, FabricVariant, StockMovement
 from apps.items.rolls import (
     MAX_ROLLS_FOR_EXACT_FIT,
+    OPENING_STOCK_NOTE,
     RollError,
     adjust_roll,
     is_roll_tracked,
@@ -219,14 +220,16 @@ class RollReceiptTests(RollTestBase):
         self.assertTrue(roll_invariant_holds(self.tracked))
 
 
-class FirstRollReplacesOpeningStockTests(RollTestBase):
-    """The one transition where receiving a roll takes stock away.
+class ReceivingAddsToOpeningStockTests(RollTestBase):
+    """A colour's opening figure is cloth already on hand, so a roll adds to it.
 
-    A colour created with a plain metre figure has stock belonging to no roll. Its
-    first real roll has to *replace* that figure -- the rolls become the total, and
-    adding them would count the same cloth twice (1000 untracked + a 100 m roll =
-    1100 m that does not exist). After that first roll the rule is the ordinary
-    one again: receiving adds.
+    A colour created with a plain metre figure holds that much cloth. Receiving a
+    roll is another delivery on top of it, so the figure is never wiped: 1000 m
+    opened plus a 100 m roll is 1100 m on hand, and receiving again adds again.
+
+    A figure belonging to no roll would be metres packing cannot cut, so the first
+    receive converts it into a roll noted ``Opening stock`` -- which keeps the
+    module's invariant true from the moment the colour gains a roll.
     """
 
     def untracked_colour(self, metres="1000"):
@@ -239,105 +242,100 @@ class FirstRollReplacesOpeningStockTests(RollTestBase):
         self.assertFalse(is_roll_tracked(variant))
         return variant
 
-    def test_first_roll_replaces_the_opening_figure_rather_than_adding_to_it(self):
+    def test_the_first_roll_adds_to_the_opening_figure(self):
         variant = self.untracked_colour("1000")
 
         self.receive(D("100"), variant=variant)
 
         variant.refresh_from_db()
-        # 100, not 1100: the untracked 1000 m is gone, not stacked on top of.
-        self.assertEqual(variant.stock_meters, D("100.000"))
+        self.assertEqual(variant.stock_meters, D("1100.000"))
         self.assertTrue(is_roll_tracked(variant))
         self.assert_in_step(variant)
 
-    def test_the_first_roll_satisfies_the_invariant_the_old_total_broke(self):
-        variant = self.untracked_colour("1000")
-        self.receive(D("100"), variant=variant)
-
-        # Before the fix the total would have been 1100 against 100 m of rolls,
-        # which is exactly the drift the invariant exists to catch.
-        variant.refresh_from_db()
-        self.assertEqual(
-            variant.stock_meters,
-            sum(
-                FabricRoll.objects.filter(variant=variant).values_list(
-                    "remaining_meters", flat=True
-                ),
-                ZERO,
-            ),
-        )
-
-    def test_the_discarded_quantity_is_recorded_as_a_stock_movement(self):
+    def test_the_figure_becomes_a_roll_of_its_own(self):
+        # Otherwise the figure is metres on the total that no roll holds, so
+        # packing can never cut them.
         variant = self.untracked_colour("1000")
 
         self.receive(D("100"), variant=variant)
 
-        # Without a record, stock dropping 1000 -> 100 looks like cloth vanishing.
-        movement = StockMovement.objects.get(variant=variant)
-        self.assertEqual(movement.reason, StockMovement.OPENING_FIGURE_DISCARDED)
-        self.assertEqual(movement.metres, D("-1000.000"))
-        self.assertEqual(movement.stock_before, D("1000.000"))
-        self.assertEqual(movement.stock_after, D("100.000"))
+        rolls = list(FabricRoll.objects.filter(variant=variant).order_by("id"))
+        self.assertEqual(len(rolls), 2)
+        self.assertEqual(rolls[0].note, OPENING_STOCK_NOTE)
+        self.assertEqual(rolls[0].original_meters, D("1000.000"))
+        self.assertEqual(rolls[0].remaining_meters, D("1000.000"))
+        self.assertTrue(rolls[0].is_active)
 
-    def test_a_bulk_first_delivery_is_recorded_once_for_the_whole_delivery(self):
+    def test_the_first_roll_does_not_lose_the_figure_silently(self):
+        # The bug this replaced: the typed figure was overwritten and, because the
+        # colour was born at zero, no audit row was written either.
         variant = self.untracked_colour("1000")
 
-        receive_rolls(variant, [D("500"), D("450")], created_by=self.admin_user)
+        self.receive(D("100"), variant=variant)
 
         variant.refresh_from_db()
-        self.assertEqual(variant.stock_meters, D("950.000"))
-        self.assert_in_step(variant)
-        movement = StockMovement.objects.get(variant=variant)
-        self.assertEqual(movement.stock_before, D("1000.000"))
-        self.assertEqual(movement.stock_after, D("950.000"))
-        self.assertEqual(movement.created_by, self.admin_user)
+        self.assertNotEqual(variant.stock_meters, D("100.000"))
+        self.assertNotEqual(variant.stock_meters, D("0.000"))
 
-    def test_a_second_roll_adds_normally_and_records_nothing(self):
+    def test_a_bulk_first_delivery_adds_to_the_figure(self):
+        variant = self.untracked_colour("1000")
+
+        receive_rolls(variant, [D("500"), D("450")])
+
+        variant.refresh_from_db()
+        self.assertEqual(variant.stock_meters, D("1950.000"))
+
+    def test_a_second_roll_adds_normally(self):
         variant = self.untracked_colour("1000")
         self.receive(D("100"), variant=variant)
 
         self.receive(D("250"), variant=variant)
 
         variant.refresh_from_db()
-        # Ordinary additive behaviour: 100 from the first roll, plus 250 more.
-        self.assertEqual(variant.stock_meters, D("350.000"))
+        self.assertEqual(variant.stock_meters, D("1350.000"))
         self.assert_in_step(variant)
-        # The transition happened once. It is not repeated on every receive.
-        self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 1)
 
-    def test_later_receives_never_write_another_movement(self):
+    def test_later_receives_keep_adding(self):
         variant = self.untracked_colour("1000")
         self.receive(D("100"), variant=variant)
         self.receive(D("250"), variant=variant)
         receive_rolls(variant, [D("10"), D("20")])
 
         variant.refresh_from_db()
-        self.assertEqual(variant.stock_meters, D("380.000"))
-        self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 1)
+        self.assertEqual(variant.stock_meters, D("1380.000"))
+        self.assert_in_step(variant)
 
-    def test_a_colour_opened_at_zero_records_no_movement(self):
-        # Nothing to discard, so there is nothing to explain away.
+    def test_a_colour_opened_at_zero_is_unaffected(self):
         variant = self.untracked_colour("0")
 
         self.receive(D("100"), variant=variant)
 
         variant.refresh_from_db()
         self.assertEqual(variant.stock_meters, D("100.000"))
+        self.assert_in_step(variant)
+
+    def test_nothing_is_written_to_the_stock_movement_log(self):
+        # A receive that only ever adds has no drop to explain, so the audit table
+        # stays empty rather than gaining a movement per delivery.
+        variant = self.untracked_colour("1000")
+
+        self.receive(D("100"), variant=variant)
+        receive_rolls(variant, [D("10"), D("20")])
+
         self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 0)
 
-    def test_the_transition_survives_a_failed_receive_being_rolled_back(self):
+    def test_a_refused_delivery_leaves_the_figure_untouched(self):
         variant = self.untracked_colour("1000")
 
         with self.assertRaises(RollError):
             receive_rolls(variant, [D("100"), "not a number"])
 
-        # A refused delivery must not leave the opening figure discarded.
         variant.refresh_from_db()
         self.assertEqual(variant.stock_meters, D("1000.000"))
         self.assertFalse(is_roll_tracked(variant))
         self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 0)
 
-    def test_the_api_reports_the_replacement_not_an_inflated_total(self):
+    def test_the_api_reports_the_summed_total(self):
         variant = self.untracked_colour("1000")
         self.auth()
 
@@ -348,14 +346,15 @@ class FirstRollReplacesOpeningStockTests(RollTestBase):
         )
 
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
-        self.assertEqual(resp.data["stock_meters"], "100.000")
-        self.assertEqual(resp.data["roll_stock_meters"], "100.000")
-        self.assertEqual(resp.data["roll_count"], 1)
+        self.assertEqual(resp.data["stock_meters"], "1100.000")
+        # The figure is a roll now, so the roll total and the stock agree: the
+        # opening 1000 plus the 100 just received.
+        self.assertEqual(resp.data["roll_stock_meters"], "1100.000")
+        self.assertEqual(resp.data["roll_count"], 2)
         self.assertTrue(resp.data["is_roll_tracked"])
 
-    def test_creating_a_colour_on_its_rolls_is_untouched_by_this(self):
-        """The create form starts such a colour at zero, so there is nothing to
-        discard: the roll sum is the whole stock and no movement is written."""
+    def test_creating_a_colour_on_its_rolls_keeps_the_opening_figure(self):
+        """The create form sends both, so both count."""
         self.auth()
         resp = self.client.post(
             "/api/items/",
@@ -377,9 +376,43 @@ class FirstRollReplacesOpeningStockTests(RollTestBase):
         self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
         created = Fabric.objects.get(name="Cotton Lawn")
         variant = created.variants.get(display_order="Natural")
-        # Still the roll sum, exactly as before: 950 and not 1950.
-        self.assertEqual(variant.stock_meters, D("950.000"))
+        # 1000 + 950: the opening figure survives, held as a roll of its own so the
+        # invariant holds and packing can cut it.
+        self.assertEqual(variant.stock_meters, D("1950.000"))
+        self.assert_in_step(variant)
+        rolls = list(FabricRoll.objects.filter(variant=variant).order_by("id"))
+        self.assertEqual(len(rolls), 3)
+        self.assertEqual(rolls[0].note, OPENING_STOCK_NOTE)
+        self.assertEqual(rolls[0].original_meters, D("1000.000"))
+        self.assertEqual([r.original_meters for r in rolls[1:]], [D("500"), D("450")])
         self.assertEqual(StockMovement.objects.filter(variant=variant).count(), 0)
+
+    def test_creating_a_colour_with_no_figure_just_gets_its_rolls(self):
+        self.auth()
+        resp = self.client.post(
+            "/api/items/",
+            {
+                "name": "Cotton Lawn",
+                "description": "Light lawn",
+                "price_per_meter": "180.00",
+                "variants": [
+                    {
+                        "display_order": "Natural",
+                        "stock_meters": "0",
+                        "rolls": [{"meters": "500"}, {"meters": "450"}],
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        variant = Fabric.objects.get(name="Cotton Lawn").variants.get(
+            display_order="Natural"
+        )
+        # No figure to keep, so no extra roll is invented for it.
+        self.assertEqual(variant.stock_meters, D("950.000"))
+        self.assertEqual(FabricRoll.objects.filter(variant=variant).count(), 2)
 
 
 class RollAdjustmentTests(RollTestBase):

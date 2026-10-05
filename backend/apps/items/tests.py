@@ -29,7 +29,12 @@ from apps.items.services import (
     purge_archived_fabrics,
     sync_out_of_stock,
 )
-from apps.items.rolls import is_roll_tracked, move_variant_stock, roll_stock
+from apps.items.rolls import (
+    OPENING_STOCK_NOTE,
+    is_roll_tracked,
+    move_variant_stock,
+    roll_stock,
+)
 from apps.items.tasks import purge_archived_fabrics_task
 from apps.orders.models import Order, OrderItem
 
@@ -851,10 +856,10 @@ class FabricVariantWriteTests(FabricTestBase):
 class CreateWithRollsTests(FabricTestBase):
     """Creating a colour on its physical rolls.
 
-    A colour can arrive on named rolls instead of a typed metre figure. The rolls
-    are then the stock -- the warehouse total is their sum and packing cuts from
-    them -- so the opening figure must not also be applied on top of them, and the
-    two are deliberately not required to agree.
+    A colour can arrive on named rolls instead of a typed metre figure, or on both:
+    a figure for the cloth already on hand and rolls for what came with the
+    shipment. Both count. The figure is recorded as a roll of its own so the
+    colour's total is still the sum of its rolls, which is what packing cuts from.
     """
 
     def create_fabric(self, variants, name="Cotton Lawn"):
@@ -886,9 +891,10 @@ class CreateWithRollsTests(FabricTestBase):
         self.assertEqual(FabricRoll.objects.count(), 0)
         self.assertFalse(is_roll_tracked(natural))
 
-    def test_rolls_replace_the_opening_quantity_when_they_disagree(self):
-        # Typed 1000, rolls add up to 950. The rolls are what is physically on
-        # hand, so 950 -- not 1950 (the double count) and not 1000 (the figure).
+    def test_rolls_add_to_the_opening_quantity(self):
+        # Typed 1000, rolls add up to 950. The figure is the cloth already on hand
+        # and the rolls are the shipment on top of it, so 1950 -- not 950 (the
+        # figure silently dropped) and not 0.
         fabric, _ = self.create_fabric(
             [
                 {
@@ -903,22 +909,25 @@ class CreateWithRollsTests(FabricTestBase):
         )
 
         natural = fabric.variants.get(display_order="Natural")
-        self.assertEqual(natural.stock_meters, Decimal("950.000"))
-        self.assertEqual(roll_stock(natural), Decimal("950.000"))
+        self.assertEqual(natural.stock_meters, Decimal("1950.000"))
+        self.assertEqual(roll_stock(natural), Decimal("1950.000"))
         self.assertTrue(is_roll_tracked(natural))
-        rolls = list(
-            FabricRoll.objects.filter(variant=natural).order_by("created_at", "id")
-        )
-        self.assertEqual(len(rolls), 2)
+        rolls = list(FabricRoll.objects.filter(variant=natural).order_by("id"))
+        self.assertEqual(len(rolls), 3)
+        # The figure leads, marked so the warehouse can see which cloth it is.
+        self.assertEqual(rolls[0].note, OPENING_STOCK_NOTE)
+        self.assertEqual(rolls[0].remaining_meters, Decimal("1000.000"))
+        # The shipment keeps its own order and its own note.
         self.assertEqual(
-            [r.remaining_meters for r in rolls],
+            [r.remaining_meters for r in rolls[1:]],
             [Decimal("500.000"), Decimal("450.000")],
         )
+        self.assertEqual(rolls[1].note, "mill roll")
 
-    def test_matching_totals_produce_one_stock_adjustment_not_two(self):
-        # The figures agree here, so a double count would be invisible in the
-        # final number -- but it would still show up as two movements in the
-        # warehouse's stock history. Exactly one adjustment must happen.
+    def test_the_whole_delivery_is_one_stock_movement(self):
+        # Opening figure plus rolls, in one request. It has to land as a single
+        # adjustment: two would show up as two movements in the warehouse's stock
+        # history for one delivery.
         with patch(
             "apps.items.rolls.move_variant_stock", wraps=move_variant_stock
         ) as moved:
@@ -936,9 +945,9 @@ class CreateWithRollsTests(FabricTestBase):
             )
 
         natural = fabric.variants.get(display_order="Natural")
-        self.assertEqual(natural.stock_meters, Decimal("1000.000"))
-        # One call, for the roll total, and it is additive on a variant that
-        # started at zero -- so the typed 1000 never entered the arithmetic.
+        self.assertEqual(natural.stock_meters, Decimal("2000.000"))
+        # One call, for the delivery, added to the figure the variant was created
+        # holding -- so neither the figure nor the rolls are adjusted separately.
         self.assertEqual(moved.call_count, 1)
         self.assertEqual(moved.call_args.args[1], Decimal("1000.000"))
 
@@ -965,10 +974,11 @@ class CreateWithRollsTests(FabricTestBase):
 
         natural = fabric.variants.get(display_order="Natural")
         ivory = fabric.variants.get(display_order="Ivory")
-        self.assertEqual(natural.stock_meters, Decimal("500.000"))
+        # Its own 1000 plus its own roll, and the roll-less colour untouched.
+        self.assertEqual(natural.stock_meters, Decimal("1500.000"))
         self.assertEqual(ivory.stock_meters, Decimal("750.000"))
         self.assertFalse(is_roll_tracked(ivory))
-        self.assertEqual(FabricRoll.objects.count(), 1)
+        self.assertEqual(FabricRoll.objects.count(), 2)
 
     def test_a_bad_roll_length_is_refused_and_creates_nothing(self):
         self.auth()
@@ -994,7 +1004,7 @@ class CreateWithRollsTests(FabricTestBase):
         self.assertFalse(Fabric.objects.filter(name="Broken").exists())
         self.assertEqual(FabricRoll.objects.count(), 0)
 
-    def test_created_rolls_show_the_roll_sum_through_the_api(self):
+    def test_created_rolls_report_the_whole_delivery_through_the_api(self):
         fabric, _ = self.create_fabric(
             [{"display_order": "Natural", "stock_meters": "1000",
               "rolls": [{"meters": "950"}]}]
@@ -1006,7 +1016,199 @@ class CreateWithRollsTests(FabricTestBase):
 
         natural = detail.data["variants"][0]
         self.assertEqual(natural["display_order"], "Natural")
-        self.assertEqual(natural["stock_meters"], "950.000")
-        self.assertEqual(natural["roll_stock_meters"], "950.000")
-        self.assertEqual(natural["roll_count"], 1)
+        self.assertEqual(natural["stock_meters"], "1950.000")
+        # The opening figure is a roll now, so the roll total and the stock agree.
+        self.assertEqual(natural["roll_stock_meters"], "1950.000")
+        self.assertEqual(natural["roll_count"], 2)
         self.assertTrue(natural["is_roll_tracked"])
+
+
+class CreateWithRollsOverMultipartTests(FabricTestBase):
+    """Creating a colour on its rolls from the form the browser actually sends.
+
+    The browser cannot send a nested object, so the rolls go up as indexed form
+    fields (``variants[0]rolls[0][meters]``) and DRF hands them back with the
+    brackets still on. Nothing matched, every roll arrived empty, and a create
+    that had filled the warehouse in was refused with "Roll 1: Enter how many
+    metres this roll holds." Both spellings of the body are covered here, because
+    the app sends the flat one and API clients send the bracketed one.
+    """
+
+    def create_multipart(self, variant_fields, name="Cotton Lawn"):
+        self.auth()
+        payload = {
+            "name": name,
+            "description": "",
+            "price_per_meter": "180.00",
+        }
+        payload.update(variant_fields)
+        resp = self.client.post("/api/items/", payload, format="multipart")
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        return Fabric.objects.get(name=name), resp
+
+    def test_flat_form_keys_create_the_rolls(self):
+        fabric, _ = self.create_multipart(
+            {
+                "variants[0]display_order": "Natural",
+                "variants[0]stock_meters": "0",
+                "variants[0]rolls[0][meters]": "500",
+                "variants[0]rolls[1][meters]": "450",
+            }
+        )
+
+        natural = fabric.variants.get(display_order="Natural")
+        self.assertEqual(natural.stock_meters, Decimal("950.000"))
+        self.assertEqual(roll_stock(natural), Decimal("950.000"))
+        self.assertTrue(is_roll_tracked(natural))
+        self.assertEqual(
+            [r.remaining_meters for r in natural.rolls.order_by("id")],
+            [Decimal("500.000"), Decimal("450.000")],
+        )
+
+    def test_bracketed_form_keys_create_the_rolls(self):
+        fabric, _ = self.create_multipart(
+            {
+                "variants[0][display_order]": "Natural",
+                "variants[0][stock_meters]": "0",
+                "variants[0][rolls][0][meters]": "500",
+                "variants[0][rolls][1][meters]": "450",
+            },
+            name="Bracketed Lawn",
+        )
+
+        natural = fabric.variants.get(display_order="Natural")
+        self.assertEqual(natural.stock_meters, Decimal("950.000"))
+        self.assertEqual(roll_stock(natural), Decimal("950.000"))
+
+    def test_an_opening_figure_survives_alongside_the_rolls(self):
+        # The reported bug: a figure typed on the create screen came back as zero
+        # once rolls were added to the same colour.
+        fabric, _ = self.create_multipart(
+            {
+                "variants[0]display_order": "Natural",
+                "variants[0]stock_meters": "1000",
+                "variants[0]rolls[0][meters]": "500",
+                "variants[0]rolls[1][meters]": "450",
+            },
+            name="Stocked Lawn",
+        )
+
+        natural = fabric.variants.get(display_order="Natural")
+        self.assertEqual(natural.stock_meters, Decimal("1950.000"))
+        # Held as a roll, so the figure is still cuttable and the total is still
+        # the sum of the rolls.
+        self.assertEqual(roll_stock(natural), Decimal("1950.000"))
+        self.assertEqual(natural.rolls.count(), 3)
+        self.assertEqual(
+            natural.rolls.filter(note=OPENING_STOCK_NOTE).count(), 1
+        )
+
+    def test_a_note_key_does_not_disturb_the_roll(self):
+        # The API accepts a note beside a length. Whether a note is stored is
+        # the receive service's business, but its presence must not cost the
+        # roll its metres.
+        fabric, _ = self.create_multipart(
+            {
+                "variants[0]display_order": "Natural",
+                "variants[0]stock_meters": "0",
+                "variants[0]rolls[0][meters]": "500",
+                "variants[0]rolls[0][note]": "mill roll",
+            },
+            name="Noted Lawn",
+        )
+
+        natural = fabric.variants.get(display_order="Natural")
+        self.assertEqual(roll_stock(natural), Decimal("500.000"))
+
+    def test_a_colour_still_gets_a_colour_image(self):
+        # The colour row is parsed at the same time as its rolls, so an upload
+        # riding on the same request is the obvious thing to lose.
+        fabric, _ = self.create_multipart(
+            {
+                "variants[0]display_order": "Natural",
+                "variants[0]stock_meters": "0",
+                "variants[0]rolls[0][meters]": "500",
+                "variants[0]image": make_image(),
+            },
+            name="Illustrated Lawn",
+        )
+
+        natural = fabric.variants.get(display_order="Natural")
+        self.assertTrue(natural.image)
+        self.assertEqual(roll_stock(natural), Decimal("500.000"))
+
+    def test_two_colours_keep_their_own_rolls(self):
+        fabric, _ = self.create_multipart(
+            {
+                "variants[0]display_order": "Natural",
+                "variants[0]stock_meters": "0",
+                "variants[0]rolls[0][meters]": "500",
+                "variants[1]display_order": "Ivory",
+                "variants[1]stock_meters": "0",
+                "variants[1]rolls[0][meters]": "300",
+            },
+            name="Two Lawns",
+        )
+
+        natural = fabric.variants.get(display_order="Natural")
+        ivory = fabric.variants.get(display_order="Ivory")
+        self.assertEqual(roll_stock(natural), Decimal("500.000"))
+        self.assertEqual(roll_stock(ivory), Decimal("300.000"))
+        self.assertEqual(ivory.stock_meters, Decimal("300.000"))
+
+    def test_a_blank_description_is_accepted(self):
+        # The form always sends a description field, empty when the admin skipped
+        # it, and an empty string is a description rather than a missing one.
+        fabric, _ = self.create_multipart(
+            {
+                "variants[0]display_order": "Natural",
+                "variants[0]stock_meters": "1000",
+            },
+            name="Undescribed Lawn",
+        )
+        self.assertEqual(fabric.description, "")
+
+    def test_a_blank_roll_length_is_refused_with_a_sentence(self):
+        self.auth()
+        resp = self.client.post(
+            "/api/items/",
+            {
+                "name": "Blank Roll",
+                "price_per_meter": "180.00",
+                "variants[0]display_order": "Natural",
+                "variants[0]stock_meters": "1000",
+                "variants[0]rolls[0][meters]": "",
+            },
+            format="multipart",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_400_BAD_REQUEST, resp.data)
+        self.assertIn(
+            "Enter how many metres this roll holds", str(resp.data["rolls"])
+        )
+        self.assertFalse(Fabric.objects.filter(name="Blank Roll").exists())
+        self.assertEqual(FabricRoll.objects.count(), 0)
+
+    def test_json_bodies_are_read_as_before(self):
+        self.auth()
+        resp = self.client.post(
+            "/api/items/",
+            {
+                "name": "Json Lawn",
+                "description": "",
+                "price_per_meter": "180.00",
+                "variants": [
+                    {
+                        "display_order": "Natural",
+                        "stock_meters": "1000",
+                        "rolls": [{"meters": "500"}, {"meters": "450"}],
+                    }
+                ],
+            },
+            format="json",
+        )
+
+        self.assertEqual(resp.status_code, status.HTTP_201_CREATED, resp.data)
+        natural = Fabric.objects.get(name="Json Lawn").variants.get()
+        # Same rule as the form path: the figure is kept, as its own roll.
+        self.assertEqual(roll_stock(natural), Decimal("1950.000"))

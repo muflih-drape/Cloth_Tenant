@@ -168,15 +168,14 @@ describe("PhysicalRollsPanel", () => {
     await expand();
     await userEvent.click(screen.getByRole("button", { name: /receive rolls/i }));
     await userEvent.type(screen.getByLabelText("Roll 1 metres"), "30");
-    await userEvent.click(screen.getByRole("button", { name: /add another roll/i }));
+    await userEvent.click(screen.getByRole("button", { name: /add another length/i }));
     await userEvent.type(screen.getByLabelText("Roll 2 metres"), "50");
-    await userEvent.type(screen.getByLabelText("Roll 2 note"), "reorder");
     await userEvent.click(screen.getByRole("button", { name: /^Receive$/i }));
 
     await waitFor(() =>
       expect(bulkReceive).toHaveBeenCalledWith(7, [
-        { meters: "30", note: "" },
-        { meters: "50", note: "reorder" },
+        { meters: "30" },
+        { meters: "50" },
       ]),
     );
     expect(receive).not.toHaveBeenCalled();
@@ -372,23 +371,10 @@ describe("PhysicalRollsPanel first roll on untracked stock", () => {
     await userEvent.click(screen.getByRole("button", { name: /^Receive$/i }));
   }
 
-  it("warns that the untracked quantity will stop counting, and sends nothing yet", async () => {
-    getForVariant.mockResolvedValue(untracked());
-    render(<PhysicalRollsPanel variantId={7} label="Cotton Cambric" />);
-
-    await startReceive();
-    await submitDraft("100");
-
-    expect(await screen.findByText(/Replace untracked stock\?/i)).toBeTruthy();
-    expect(screen.getByText(/1000 m of stock that is not tracked/i)).toBeTruthy();
-    expect(screen.getByText(/will no longer be counted/i)).toBeTruthy();
-    // Nothing has been received yet: the warning is the thing being answered.
-    expect(receive).not.toHaveBeenCalled();
-    expect(bulkReceive).not.toHaveBeenCalled();
-  });
-
-  it("receives the roll once the admin confirms", async () => {
-    getForVariant.mockResolvedValue(untracked());
+  it("adds to the opening figure instead of replacing it", async () => {
+    // The figure is cloth already on hand, so a roll is a further delivery on top
+    // of it. The API records the figure as a roll of its own, so it still counts
+    // and can still be cut -- there is nothing to confirm and nothing to lose.
     receive.mockResolvedValue({
       ...rollsResponse(),
       roll: rollsResponse().rolls[0],
@@ -396,33 +382,52 @@ describe("PhysicalRollsPanel first roll on untracked stock", () => {
     // The panel reloads after receiving, and now has its first roll.
     getForVariant
       .mockResolvedValueOnce(untracked())
-      .mockResolvedValueOnce(rollsResponse({ roll_count: 1, stock_meters: "100.000" }));
+      .mockResolvedValueOnce(rollsResponse({ roll_count: 1, stock_meters: "1100.000" }));
     render(<PhysicalRollsPanel variantId={7} label="Cotton Cambric" />);
 
     await startReceive();
     await submitDraft("100");
-    await userEvent.click(
-      await screen.findByRole("button", { name: /replace stock/i }),
-    );
 
     await waitFor(() => expect(receive).toHaveBeenCalledWith(7, { meters: "100" }));
+    expect(screen.queryByText(/Replace untracked stock\?/i)).toBeNull();
+    expect(screen.queryByText(/will no longer be counted/i)).toBeNull();
   });
 
-  it("sends nothing when the warning is dismissed", async () => {
-    getForVariant.mockResolvedValue(untracked());
+  it("receives a multi-roll delivery onto an untracked colour in one request", async () => {
+    bulkReceive.mockResolvedValue({
+      ...rollsResponse(),
+      created: 5,
+      total_meters: "500.000",
+      stock_meters: "1500.000",
+      rolls: [],
+    } as never);
+    getForVariant
+      .mockResolvedValueOnce(untracked())
+      .mockResolvedValueOnce(
+        rollsResponse({ roll_count: 5, stock_meters: "1500.000" }),
+      );
     render(<PhysicalRollsPanel variantId={7} label="Cotton Cambric" />);
 
     await startReceive();
-    await submitDraft("100");
-    await userEvent.click(await screen.findByRole("button", { name: /^Cancel$/i }));
+    // "100 m, five of them" is one row, and the count is expanded before sending.
+    await userEvent.type(screen.getByLabelText("Roll 1 metres"), "100");
+    await userEvent.clear(screen.getByLabelText("Roll 1 count"));
+    await userEvent.type(screen.getByLabelText("Roll 1 count"), "5");
+    await userEvent.click(screen.getByRole("button", { name: /^Receive$/i }));
 
+    await waitFor(() =>
+      expect(bulkReceive).toHaveBeenCalledWith(7, [
+        { meters: "100" },
+        { meters: "100" },
+        { meters: "100" },
+        { meters: "100" },
+        { meters: "100" },
+      ]),
+    );
     expect(receive).not.toHaveBeenCalled();
-    expect(bulkReceive).not.toHaveBeenCalled();
   });
 
-  it("does not warn once the colour already has a roll", async () => {
-    // Second roll on: stock is roll-derived and receiving genuinely adds, so the
-    // warning would be a lie.
+  it("adds to a colour that already has a roll", async () => {
     receive.mockResolvedValue({
       ...rollsResponse(),
       roll: rollsResponse().rolls[0],
@@ -437,10 +442,9 @@ describe("PhysicalRollsPanel first roll on untracked stock", () => {
     await waitFor(() =>
       expect(receive).toHaveBeenCalledWith(7, { meters: "35" }),
     );
-    expect(screen.queryByText(/Replace untracked stock\?/i)).toBeNull();
   });
 
-  it("does not warn for a colour whose opening figure is zero", async () => {
+  it("receives onto a colour whose opening figure is zero", async () => {
     getForVariant.mockResolvedValue(untracked({ stock_meters: "0.000" }));
     receive.mockResolvedValue({
       ...rollsResponse(),
@@ -454,14 +458,16 @@ describe("PhysicalRollsPanel first roll on untracked stock", () => {
     await waitFor(() =>
       expect(receive).toHaveBeenCalledWith(7, { meters: "100" }),
     );
-    expect(screen.queryByText(/Replace untracked stock\?/i)).toBeNull();
   });
 
   it("reports the new roll's count up so the badge above cannot go stale", async () => {
     const onStockChanged = vi.fn();
     getForVariant
       .mockResolvedValueOnce(untracked())
-      .mockResolvedValueOnce(rollsResponse({ roll_count: 1, stock_meters: "100.000" }));
+      // The figure's own roll plus the one received, and both sets of metres.
+      .mockResolvedValueOnce(
+        rollsResponse({ roll_count: 2, stock_meters: "1100.000" }),
+      );
     receive.mockResolvedValue({
       ...rollsResponse(),
       roll: rollsResponse().rolls[0],
@@ -476,13 +482,10 @@ describe("PhysicalRollsPanel first roll on untracked stock", () => {
 
     await startReceive();
     await submitDraft("100");
-    await userEvent.click(
-      await screen.findByRole("button", { name: /replace stock/i }),
-    );
 
-    // The pair that keeps the badge and the panel agreeing: 100 m on one roll.
+    // The pair that keeps the badge and the panel agreeing: 1100 m over 2 rolls.
     await waitFor(() =>
-      expect(onStockChanged).toHaveBeenLastCalledWith("100.000", 1),
+      expect(onStockChanged).toHaveBeenLastCalledWith("1100.000", 2),
     );
   });
 

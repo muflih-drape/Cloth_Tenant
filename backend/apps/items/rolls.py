@@ -34,7 +34,7 @@ from django.db import IntegrityError, transaction
 from django.db.models import Max, Sum
 from django.utils import timezone
 
-from .models import FabricRoll, FabricVariant, StockMovement
+from .models import FabricRoll, FabricVariant
 from .services import sync_out_of_stock
 
 logger = logging.getLogger(__name__)
@@ -49,6 +49,10 @@ MIN_ROLL_METERS = Decimal("0.001")
 MAX_METERS = Decimal("99999999999.999")
 
 ROLL_NUMBER_PREFIX = "R-"
+
+#: Marks the roll a colour's pre-roll metre figure is recorded as, so the cloth
+#: that was already on hand is still visible as a roll in the warehouse.
+OPENING_STOCK_NOTE = "Opening stock"
 
 
 class RollError(ValueError):
@@ -236,56 +240,38 @@ def move_variant_stock(variant, delta):
 # --------------------------------------------------------------------------- #
 
 
-def untracked_stock_for_rolls(variant):
-    """The plain metre figure a first roll would have to replace, or zero.
+def record_opening_stock_roll(variant):
+    """Give a colour's pre-roll metre figure a roll of its own.
 
-    A colour with no roll rows keeps the original single-figure stock model: a
-    number typed in at creation that belongs to no particular cloth. The moment a
-    real roll arrives, the total has to be the sum of the rolls, so that figure is
-    discarded rather than added on top of them -- otherwise a colour opened at
-    1000 m and then given a 100 m roll would show 1100 m of cloth it does not
-    have.
+    A colour created with a plain metre figure holds cloth belonging to no roll.
+    Receiving is additive, so that figure stays in the total -- and a figure that
+    is in the total but on no roll breaks this module's invariant and, worse, is
+    metres packing cannot cut: every cut is planned against rolls.
 
-    Once a colour has even one roll row this is always zero, so every later
-    receive is a genuine addition. Read before the first roll is written, since
-    after it the colour is roll-tracked.
+    So the figure is turned into a roll, noted as the opening stock, on the same
+    transaction and under the same lock as the delivery that triggered it. The
+    caller is adding the delivery's metres on top afterwards, which is what makes
+    the colour's total right rather than merely consistent.
+
+    Returns the figure's size, or zero when there is nothing to convert: no rolls
+    yet is the only case that does any work, so this is a no-op for every later
+    receive. Caller holds the variant lock and the transaction.
     """
     if variant.rolls.exists():
         return ZERO
-    return Decimal(str(variant.stock_meters or ZERO))
 
-
-def discard_untracked_stock(variant, received_meters, *, created_by=None):
-    """Replace a colour's opening figure with the rolls just received.
-
-    Called only for the zero-rolls-to-first-roll transition. Writes the drop to
-    :class:`~apps.items.models.StockMovement` and returns how many metres to take
-    off the receive, so the receive still lands as a single net movement rather
-    than a "drop the opening figure, then add the roll" pair.
-    """
-    untracked = untracked_stock_for_rolls(variant)
-    if untracked <= ZERO:
+    opening = Decimal(str(variant.stock_meters or ZERO))
+    if opening <= ZERO:
         return ZERO
 
-    StockMovement.objects.create(
-        variant=variant,
-        metres=-untracked,
-        stock_before=untracked,
-        stock_after=received_meters,
-        reason=StockMovement.OPENING_FIGURE_DISCARDED,
-        created_by=created_by,
-    )
-    logger.warning(
-        "Discarded %s m of untracked opening stock on variant %s (%s / %s): "
-        "its first roll makes the stock roll-tracked, and the rolls hold %s m. "
-        "Recorded as a stock movement.",
-        untracked,
+    _create_roll(variant, opening, None, OPENING_STOCK_NOTE)
+    logger.info(
+        "Recorded %s m of opening stock on variant %s as its own roll, so it can "
+        "be cut and stays part of the roll total.",
+        opening,
         variant.pk,
-        variant.fabric.name,
-        variant.display_order or "unlabelled",
-        received_meters,
     )
-    return untracked
+    return opening
 
 
 def next_roll_number():
@@ -332,24 +318,24 @@ def clean_meters(raw, field="meters"):
     return metres
 
 
-def receive_roll(variant, metres, *, roll_number=None, note="", created_by=None):
+def receive_roll(variant, metres, *, roll_number=None, note=""):
     """Receive one physical roll, adding its metres to the colour's stock.
 
     The roll and the variant total move together inside one transaction and
     under the variant's row lock, so a colour can never show metres on its rolls
     that the warehouse total does not have (or the other way round).
 
-    The exception is a colour's very first roll: its stock was a plain opening
-    figure belonging to no roll, so that figure is replaced rather than added to
-    (see :func:`discard_untracked_stock`).
+    A roll only ever adds. A colour opened with a plain metre figure keeps that
+    figure: the first delivery converts it into a roll of its own so it can be
+    cut and counted, then adds the new metres on top.
     """
     metres = clean_meters(metres)
 
     with transaction.atomic():
         locked = lock_variant(variant)
-        discarded = discard_untracked_stock(locked, metres, created_by=created_by)
+        record_opening_stock_roll(locked)
         roll = _create_roll(locked, metres, roll_number, note)
-        move_variant_stock(locked, metres - discarded)
+        move_variant_stock(locked, metres)
         logger.info(
             "Received roll %s: %s m of variant %s (stock now %s)",
             roll.roll_number,
@@ -403,20 +389,25 @@ def _insert_roll(variant, roll_number, metres, note):
     )
 
 
-def receive_rolls(variant, lengths, *, created_by=None):
+def receive_rolls(variant, lengths):
     """Receive a whole factory shipment as several rolls, atomically.
 
     Every roll is created and every metre added in one transaction, so a bad
     figure halfway down a delivery leaves the warehouse exactly as it was.
 
-    As with a single roll, a colour's very first delivery replaces its plain
-    opening figure instead of adding to it.
+    As with a single roll, a delivery only adds to what the colour already holds.
+    An entry may carry a note, which is kept on the roll it describes.
     """
     parsed = []
     for index, raw in enumerate(lengths or [], start=1):
         metres = raw.get("meters") if isinstance(raw, dict) else raw
         try:
-            parsed.append(clean_meters(metres, field=f"rolls[{index - 1}].meters"))
+            parsed.append(
+                (
+                    clean_meters(metres, field=f"rolls[{index - 1}].meters"),
+                    (raw.get("note") if isinstance(raw, dict) else None) or "",
+                )
+            )
         except RollError as exc:
             raise RollError(f"Roll {index}: {exc}")
 
@@ -425,13 +416,13 @@ def receive_rolls(variant, lengths, *, created_by=None):
 
     with transaction.atomic():
         locked = lock_variant(variant)
-        total = sum(parsed, ZERO)
-        discarded = discard_untracked_stock(locked, total, created_by=created_by)
+        record_opening_stock_roll(locked)
+        total = sum((metres for metres, _ in parsed), ZERO)
         created = []
-        for metres in parsed:
-            roll = _create_roll(locked, metres)
+        for metres, note in parsed:
+            roll = _create_roll(locked, metres, None, note)
             created.append(roll)
-        move_variant_stock(locked, total - discarded)
+        move_variant_stock(locked, total)
 
     for roll in created:
         roll.refresh_from_db()

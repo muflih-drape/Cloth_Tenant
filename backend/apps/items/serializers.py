@@ -1,3 +1,4 @@
+import re
 import uuid
 from datetime import timedelta
 from decimal import Decimal
@@ -8,13 +9,16 @@ from django.core.files.base import ContentFile
 from django.db import transaction
 from django.db.models import Sum
 from django.utils import timezone
+from django.utils.datastructures import MultiValueDict
 from PIL import Image
 from rest_framework import serializers
+from rest_framework.utils import html
 
 from .models import Fabric, FabricRoll, FabricVariant
 from .rolls import (
     MAX_METERS,
     MIN_ROLL_METERS,
+    OPENING_STOCK_NOTE,
     RollError,
     clean_meters,
     is_roll_tracked,
@@ -172,6 +176,68 @@ def _roll_lengths(roll_drafts):
     return lengths
 
 
+#: One bracketed segment at the front of a form field name: ``[rolls]`` in
+#: ``[rolls][0][meters]``.
+_FORM_SEGMENT = re.compile(r"^\[([^\[\]]+)\]")
+
+
+def _unwrap_form_keys(raw):
+    """Strip the brackets from the front of a form-encoded record's keys.
+
+    A multipart body has to spell out its indexes, and DRF's HTML-form handling
+    hands each record of a nested list back with those brackets still on:
+    ``'[meters]'`` for a roll, ``'[display_order]'`` for a colour, and
+    ``'[rolls][0][meters]'`` once a colour's rolls are involved. No serializer
+    field is named that way, so the values were arriving empty. Unwrapping the
+    leading segment turns ``[rolls][0][meters]`` back into ``rolls[0][meters]``,
+    which is what both multipart conventions reduce to.
+    """
+    return MultiValueDict(
+        {_FORM_SEGMENT.sub(r"\1", key, count=1): raw.getlist(key) for key in raw.keys()}
+    )
+
+
+class FormRollListField(serializers.ListField):
+    """A colour's incoming rolls, read from JSON or from either form convention.
+
+    Each roll is handed on as a plain dict rather than the form mapping DRF
+    returns, because ``DictField`` reads a ``MultiValueDict`` through
+    ``parse_html_dict`` and finds nothing under a bracketed key -- which is how a
+    create reported "Roll 1: Enter how many metres this roll holds" for rolls the
+    browser had actually sent.
+    """
+
+    def get_value(self, dictionary):
+        value = super().get_value(dictionary)
+        if not isinstance(value, list) or not html.is_html_input(dictionary):
+            return value
+        rolls = []
+        for raw in value:
+            if not html.is_html_input(raw):
+                rolls.append(raw)
+                continue
+            unwrapped = _unwrap_form_keys(raw)
+            rolls.append({key: unwrapped.get(key) for key in unwrapped.keys()})
+        return rolls
+
+
+class FormVariantListSerializer(serializers.ListSerializer):
+    """The colour list, read from either form convention.
+
+    Colours stay form mappings here on purpose: their rolls live two levels down,
+    and only ``parse_html_list`` can still find them in one of these.
+    """
+
+    def get_value(self, dictionary):
+        value = super().get_value(dictionary)
+        if not isinstance(value, list) or not html.is_html_input(dictionary):
+            return value
+        return [
+            _unwrap_form_keys(raw) if html.is_html_input(raw) else raw
+            for raw in value
+        ]
+
+
 class FabricVariantRequestSerializer(serializers.Serializer):
     id = serializers.IntegerField(required=False)
     image = serializers.FileField(required=False)
@@ -186,7 +252,7 @@ class FabricVariantRequestSerializer(serializers.Serializer):
         allow_null=True,
         help_text="Stock in metres; applied on create and on edit.",
     )
-    rolls = serializers.ListField(
+    rolls = FormRollListField(
         child=serializers.DictField(),
         required=False,
         allow_empty=True,
@@ -195,18 +261,18 @@ class FabricVariantRequestSerializer(serializers.Serializer):
         write_only=True,
         help_text=(
             "Physical rolls this colour arrives on, one entry per roll with a "
-            "'meters' figure and an optional 'note'. When any roll is given, the "
-            "rolls are the colour's stock and 'stock_meters' is not applied on "
-            "top of them."
+            "'meters' figure and an optional 'note'. Rolls add to the colour's "
+            "stock rather than replacing it, so a 'stock_meters' figure sent "
+            "alongside them is kept as well and recorded as a roll of its own."
         ),
     )
 
 
 class CreateFabricSerializer(serializers.Serializer):
     name = serializers.CharField(max_length=100)
-    description = serializers.CharField(required=False, default="")
+    description = serializers.CharField(required=False, allow_blank=True, default="")
     price_per_meter = serializers.DecimalField(max_digits=10, decimal_places=2)
-    variants = FabricVariantRequestSerializer(many=True)
+    variants = FormVariantListSerializer(child=FabricVariantRequestSerializer())
 
     def validate_price_per_meter(self, value):
         if value <= 0:
@@ -242,21 +308,20 @@ class CreateFabricSerializer(serializers.Serializer):
         stock = variant_data.pop("stock_meters", None) or 0
         display_order = variant_data.pop("display_order", None) or None
 
-        # Rolls are the opening stock whenever any are given: the colour starts at
-        # zero and ``receive_rolls`` builds the total from the rolls, so the typed
-        # opening figure is never added on top of them. The two are deliberately
-        # not required to agree -- if they differ, the rolls are what is on hand.
-        initial_stock = ZERO if roll_drafts else stock
-
+        lengths = _roll_lengths(roll_drafts or [])
+        # An opening figure and rolls are two separate deliveries of cloth, so both
+        # count. The figure is kept on the variant and ``receive_rolls`` turns it
+        # into a roll of its own, because the colour's total is the sum of its rolls
+        # and packing can only cut metres some roll holds.
         variant = FabricVariant.objects.create(
             fabric=fabric,
             qr_code=uuid.uuid4(),
             display_order=display_order,
-            stock_meters=initial_stock,
+            stock_meters=stock,
         )
-        if roll_drafts:
+        if lengths:
             try:
-                receive_rolls(variant, _roll_lengths(roll_drafts))
+                receive_rolls(variant, lengths)
             except RollError as exc:
                 raise serializers.ValidationError({"rolls": [str(exc)]})
         if image_file:
